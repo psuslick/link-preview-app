@@ -2,10 +2,16 @@ import express from "express";
 import axios from "axios";
 import * as cheerio from "cheerio";
 import cors from "cors";
+import dotenv from "dotenv";
+
+dotenv.config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+const PORT = process.env.PORT || 4000;
+const USER_AGENT = process.env.USER_AGENT;
 
 app.post("/scrape", async (req, res) => {
   const { url } = req.body;
@@ -13,7 +19,7 @@ app.post("/scrape", async (req, res) => {
   try {
     const { data: html } = await axios.get(url, {
       headers: {
-        "User-Agent": "Mozilla/5.0"
+        "User-Agent": USER_AGENT
       }
     });
 
@@ -32,18 +38,10 @@ app.post("/scrape", async (req, res) => {
       $("title").text() ||
       null;
 
-    res.json({
-      url,
-      title,
-      thumbnail
-    });
+    res.json({ url, title, thumbnail });
   } catch (err) {
-    res.json({
-      url,
-      title: null,
-      thumbnail: null
-    });
+    res.json({ url, title: null, thumbnail: null });
   }
 });
 
-app.listen(4000, () => console.log("Scraper running on port 4000"));
+app.listen(PORT, () => console.log(`Scraper running on port ${PORT}`));
