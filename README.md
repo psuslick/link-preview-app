@@ -1,3 +1,10 @@
+chmod +x install.sh
+./install.sh
+
+
+powershell -ExecutionPolicy Bypass -File install.ps1
+
+
 Thumbnail Preview Scraper
 A lightweight full-stack project that generates Bing-style thumbnail previews for any URL. The backend scrapes metadata (OpenGraph, Twitter Cards, VideoObject) and the frontend displays a clean, responsive grid of thumbnails.
 Features
