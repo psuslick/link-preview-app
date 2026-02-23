@@ -1,72 +1,70 @@
 import { useEffect, useState } from "react";
-import axios from "axios";
 
 export default function VideoGrid({ videos }) {
-  const [items, setItems] = useState([]);
+  const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
 
-  const API_URL = import.meta.env.VITE_API_URL;
-
   useEffect(() => {
-    const fetchAll = async () => {
+    if (!videos || videos.length === 0) {
+      setResults([]);
+      return;
+    }
+
+    const fetchData = async () => {
       setLoading(true);
 
-      try {
-        const results = await Promise.all(
-          videos.map(async (url) => {
-            try {
-              const res = await axios.post(`${API_URL}/scrape`, { url });
-              return {
-                url,
-                title: res.data.title,
-                thumbnail: res.data.thumbnail,
-                error: false
-              };
-            } catch (err) {
-              return {
-                url,
-                title: null,
-                thumbnail: null,
-                error: true
-              };
-            }
-          })
-        );
+      const newResults = await Promise.all(
+        videos.map(async (url) => {
+          if (!url || url.trim() === "") {
+            return { url, title: null, thumbnail: null, error: true };
+          }
 
-        setItems(results);
-      } finally {
-        setLoading(false);
-      }
+          try {
+            const res = await fetch("http://localhost:4000/scrape", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ url }),
+            });
+
+            if (!res.ok) {
+              return { url, title: null, thumbnail: null, error: true };
+            }
+
+            const data = await res.json();
+            return { ...data, error: false };
+          } catch (err) {
+            return { url, title: null, thumbnail: null, error: true };
+          }
+        })
+      );
+
+      setResults(newResults);
+      setLoading(false);
     };
 
-    if (videos.length > 0) {
-      fetchAll();
-    } else {
-      setItems([]);
-    }
-  }, [videos, API_URL]);
+    fetchData();
+  }, [videos]);
 
   return (
     <div className="video-grid">
-      {loading && <div className="loading">Fetching thumbnails…</div>}
+      {loading && <p>Fetching previews…</p>}
 
-      {items.map((item, i) => (
-        <div
-          key={i}
-          className="video-tile"
-          onClick={() => window.open(item.url, "_blank")}
-        >
-          {item.thumbnail ? (
-            <img src={item.thumbnail} alt={item.title || "Thumbnail"} />
-          ) : (
-            <div className="unsupported">
-              {item.error ? "Error loading" : "No thumbnail found"}
+      {results.map((item, idx) => (
+        <div key={idx} className="video-tile">
+          {item.error || !item.thumbnail ? (
+            <div className="error-box">
+              <p>Error loading</p>
             </div>
+          ) : (
+            <img
+              src={item.thumbnail}
+              alt={item.title || "Video thumbnail"}
+              className="thumbnail"
+              onClick={() => window.open(item.url, "_blank")}
+            />
           )}
 
-          <div className="title">
-            {item.title || "Untitled"}
-          </div>
+          <p className="video-title">{item.title || "No title found"}</p>
         </div>
       ))}
     </div>

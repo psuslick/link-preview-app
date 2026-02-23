@@ -62,3 +62,19 @@ h1 {
   text-align: center;
   color: #a00;
 }
+
+/* New */
+
+.button-row {
+  display: flex;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.test-btn {
+  background: #555;
+}
+
+.test-btn:hover {
+  background: #333;
+}
