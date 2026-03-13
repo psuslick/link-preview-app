@@ -1,68 +1,44 @@
-import React, { useState } from "react";
-import PreviewGrid from "./components/PreviewGrid";
+import { useState } from "react";
+import { fetchPreviewBatch } from "./api.js";
+import PreviewGrid from "./components/PreviewGrid.jsx";
 
 export default function App() {
-  const [urls, setUrls] = useState("");
+  const [input, setInput] = useState("");
+  const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [previews, setPreviews] = useState([]);
 
-  const handleSubmit = async (e) => {
+  async function handleSubmit(e) {
     e.preventDefault();
-    setLoading(true);
-    setPreviews([]);
-
-    const list = urls
+    const urls = input
       .split("\n")
-      .map((u) => u.trim())
+      .map(u => u.trim())
       .filter(Boolean);
 
-    const results = [];
+    if (urls.length === 0) return;
 
-    for (const url of list) {
-      try {
-        const res = await fetch("/api/screenshot", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url })
-        });
-
-        const data = await res.json();
-
-        if (data.success) {
-          results.push({ url, screenshot: data.screenshot });
-        } else {
-          results.push({ url, screenshot: null });
-        }
-      } catch {
-        results.push({ url, screenshot: null });
-      }
-    }
-
-    setPreviews(results);
+    setLoading(true);
+    const data = await fetchPreviewBatch(urls);
+    setResults(data.results || []);
     setLoading(false);
-  };
+  }
 
   return (
-    <div style={{ padding: 20 }}>
-      <h1>Video Screenshot Preview</h1>
+    <div className="app">
+      <h1>Hybrid Link Preview Generator</h1>
 
       <form onSubmit={handleSubmit}>
         <textarea
-          value={urls}
-          onChange={(e) => setUrls(e.target.value)}
           placeholder="Enter one URL per line"
-          rows={6}
-          style={{ width: "100%", marginBottom: 12 }}
+          value={input}
+          onChange={e => setInput(e.target.value)}
         />
 
         <button type="submit" disabled={loading}>
-          {loading ? "Processing..." : "Generate Previews"}
+          {loading ? "Loading..." : "Generate Previews"}
         </button>
       </form>
 
-      {loading && <p>Generating screenshots…</p>}
-
-      <PreviewGrid items={previews.filter((p) => p.screenshot)} />
+      <PreviewGrid results={results} />
     </div>
   );
 }
