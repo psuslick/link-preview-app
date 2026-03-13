@@ -63,3 +63,23 @@ Thumbs.db
 
 # Coverage
 coverage/
+
+# Prevent accidental persistence of scraped content
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.mp4
+*.json
+*.txt
+
+# Prevent accidental screenshot or metadata dumps
+screenshots/
+cache/
+tmp/
+temp/
+logs/
+
+# Playwright artifacts
+playwright-report/
+test-results/

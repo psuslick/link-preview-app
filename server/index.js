@@ -1,7 +1,14 @@
+// Privacy guard — must load first
+import "./privacyGuard.js";
+
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { chromium } from "playwright";
+
+// Screenshot routes
+import screenshotRoute from "./routes/screenshot.js";
+import screenshotBatchRoute from "./routes/screenshotBatch.js";
 
 dotenv.config();
 
@@ -11,16 +18,20 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 4000;
 
-// Health check route
+// Health check
 app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-// Universal Playwright scraper with stealth + safe URL handling
+// Screenshot endpoints
+app.use("/api/screenshot", screenshotRoute);
+app.use("/api/screenshot/batch", screenshotBatchRoute);
+
+// Universal metadata scraper (your original /scrape route)
 app.post("/scrape", async (req, res) => {
   const { url } = req.body;
 
-  // Prevent undefined or empty URLs from breaking Playwright
+  // Prevent undefined or empty URLs
   if (!url || typeof url !== "string" || url.trim() === "") {
     return res.json({ url: null, title: null, thumbnail: null });
   }
@@ -45,13 +56,11 @@ app.post("/scrape", async (req, res) => {
 
     const page = await context.newPage();
 
-    // Avoid networkidle — many sites never reach it due to bot detection
     await page.goto(url, {
       waitUntil: "domcontentloaded",
       timeout: 45000
     });
 
-    // Give JS time to inject metadata
     await page.waitForTimeout(1500);
 
     const data = await page.evaluate(() => {
@@ -79,11 +88,14 @@ app.post("/scrape", async (req, res) => {
 
     res.json({ url, ...data });
   } catch (err) {
-    console.error("Scrape error:", err);
+    console.error("Scrape error:", err.message);
     res.json({ url, title: null, thumbnail: null });
   } finally {
     if (browser) await browser.close();
   }
 });
 
-app.listen(PORT, () => console.log(`Scraper running on port ${PORT}`));
+// Start server
+app.listen(PORT, () => {
+  console.log(`Scraper running on port ${PORT}`);
+});

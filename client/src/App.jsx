@@ -1,58 +1,68 @@
-import { useState } from "react";
-import VideoGrid from "./components/VideoGrid";
-import "./App.css";
+import React, { useState } from "react";
+import PreviewGrid from "./components/PreviewGrid";
 
 export default function App() {
-  const [input, setInput] = useState("");
-  const [videos, setVideos] = useState([]);
+  const [urls, setUrls] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [previews, setPreviews] = useState([]);
 
-  const handleProcess = () => {
-    const links = input
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    setPreviews([]);
+
+    const list = urls
       .split("\n")
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0);
+      .map((u) => u.trim())
+      .filter(Boolean);
 
-    setVideos(links);
-  };
+    const results = [];
 
-const testConnection = async () => {
-  try {
-    const res = await fetch(`${import.meta.env.VITE_API_URL}/health`);
+    for (const url of list) {
+      try {
+        const res = await fetch("/api/screenshot", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url })
+        });
 
-    if (!res.ok) {
-      alert("❌ Backend responded, but with an error status.");
-      return;
+        const data = await res.json();
+
+        if (data.success) {
+          results.push({ url, screenshot: data.screenshot });
+        } else {
+          results.push({ url, screenshot: null });
+        }
+      } catch {
+        results.push({ url, screenshot: null });
+      }
     }
 
-    alert("✅ Backend connection successful!");
-  } catch (err) {
-    alert("❌ Cannot reach backend. Check if the server is running.");
-  }
-};
-
+    setPreviews(results);
+    setLoading(false);
+  };
 
   return (
-    <div className="app">
-      <h1>Video Preview Grid</h1>
+    <div style={{ padding: 20 }}>
+      <h1>Video Screenshot Preview</h1>
 
-      <textarea
-        className="input-box"
-        placeholder="Paste video links here, one per line..."
-        value={input}
-        onChange={(e) => setInput(e.target.value)}
-      />
+      <form onSubmit={handleSubmit}>
+        <textarea
+          value={urls}
+          onChange={(e) => setUrls(e.target.value)}
+          placeholder="Enter one URL per line"
+          rows={6}
+          style={{ width: "100%", marginBottom: 12 }}
+        />
 
-      <div className="button-row">
-        <button className="process-btn" onClick={handleProcess}>
-          Generate Previews
+        <button type="submit" disabled={loading}>
+          {loading ? "Processing..." : "Generate Previews"}
         </button>
+      </form>
 
-        <button className="process-btn test-btn" onClick={testConnection}>
-          Test Connection
-        </button>
-      </div>
+      {loading && <p>Generating screenshots…</p>}
 
-      <VideoGrid videos={videos} />
+      <PreviewGrid items={previews.filter((p) => p.screenshot)} />
     </div>
   );
 }
