@@ -44,18 +44,14 @@ function deriveGenericThumbnail(url) {
 }
 
 function App() {
-  const [url, setUrl] = useState("");
+  const [inputText, setInputText] = useState("");
   const [previews, setPreviews] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [importSummary, setImportSummary] = useState(null);
 
   const API_URL = "http://localhost:3000/api/preview";
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    if (!url.trim()) return;
-
-    setLoading(true);
-
+  async function fetchPreview(url) {
     const start = performance.now();
     let diagnostics = {
       requestUrl: url,
@@ -109,13 +105,12 @@ function App() {
       setPreviews((prev) => [
         {
           ...json,
+          url,
           diagnostics,
           compatibility
         },
         ...prev
       ]);
-
-      setUrl("");
     } catch (error) {
       const end = performance.now();
 
@@ -136,8 +131,46 @@ function App() {
         ...prev
       ]);
     }
+  }
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!inputText.trim()) return;
+
+    // Split into lines, trim, remove empties
+    const urls = inputText
+      .split("\n")
+      .map((u) => u.trim())
+      .filter((u) => u.length > 0);
+
+    // Normalize existing URLs
+    const existing = new Set(
+      previews.map((p) => p.url?.toLowerCase().trim()).filter(Boolean)
+    );
+
+    // Filter new URLs
+    const newUrls = urls.filter((u) => !existing.has(u.toLowerCase()));
+
+    const summary = {
+      added: newUrls.length,
+      skipped: urls.length - newUrls.length
+    };
+
+    setImportSummary(summary);
+
+    if (newUrls.length === 0) {
+      setInputText("");
+      return;
+    }
+
+    setLoading(true);
+
+    for (const url of newUrls) {
+      await fetchPreview(url);
+    }
 
     setLoading(false);
+    setInputText("");
   };
 
   return (
@@ -145,16 +178,22 @@ function App() {
       <h1>Hybrid Link Preview Engine</h1>
 
       <form onSubmit={handleSubmit} className="input-form">
-        <input
-          type="text"
-          placeholder="Enter a URL..."
-          value={url}
-          onChange={(e) => setUrl(e.target.value)}
+        <textarea
+          placeholder="Enter one URL per line..."
+          value={inputText}
+          onChange={(e) => setInputText(e.target.value)}
+          className="multi-input"
         />
         <button type="submit" disabled={loading}>
           {loading ? "Loading..." : "Preview"}
         </button>
       </form>
+
+      {importSummary && (
+        <div className="import-summary">
+          Added {importSummary.added} new links, skipped {importSummary.skipped} duplicates
+        </div>
+      )}
 
       <div className="preview-grid">
         {previews.map((preview, index) => {
