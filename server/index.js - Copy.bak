@@ -1,0 +1,115 @@
+import express from "express";
+import cors from "cors";
+import fetch from "node-fetch";
+import * as cheerio from "cheerio";
+import { URL as NodeURL } from "url";
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(cors());
+app.use(express.json());
+
+function resolveUrl(base, relative) {
+  try {
+    return new NodeURL(relative, base).href;
+  } catch {
+    return relative;
+  }
+}
+
+app.get("/api/preview", async (req, res) => {
+  const { url } = req.query;
+
+  if (!url) {
+    return res.status(400).json({ error: "Missing url parameter" });
+  }
+
+  console.log("[PREVIEW] Fetching:", url);
+
+  try {
+    const response = await fetch(url, {
+      redirect: "follow",
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9"
+      }
+    });
+
+    console.log("[PREVIEW] Status:", response.status);
+
+    if (!response.ok) {
+      return res.status(502).json({
+        error: "upstream_error",
+        status: response.status,
+        url
+      });
+    }
+
+    const html = await response.text();
+    console.log("[PREVIEW] HTML length:", html.length);
+
+    if (
+      html.includes("enable JavaScript") ||
+      html.includes("Access Denied") ||
+      html.includes("bot detected")
+    ) {
+      console.log("[PREVIEW] Page appears blocked or JS-only.");
+      return res.json({
+        title: null,
+        description: null,
+        image: null,
+        url,
+        blocked: true
+      });
+    }
+
+    const $ = cheerio.load(html);
+
+    const title =
+      $('meta[property="og:title"]').attr("content") ||
+      $('meta[name="twitter:title"]').attr("content") ||
+      $("title").text() ||
+      null;
+
+    const description =
+      $('meta[property="og:description"]').attr("content") ||
+      $('meta[name="twitter:description"]').attr("content") ||
+      $('meta[name="description"]').attr("content") ||
+      null;
+
+    const rawImage =
+      $('meta[property="og:image"]').attr("content") ||
+      $('meta[name="twitter:image"]').attr("content") ||
+      null;
+
+    const image = rawImage ? resolveUrl(url, rawImage) : null;
+
+    const result = {
+      title,
+      description,
+      image,
+      url
+    };
+
+    console.log("[PREVIEW] Result:", {
+      title: result.title,
+      hasImage: !!result.image
+    });
+
+    return res.json(result);
+  } catch (error) {
+    console.error("[PREVIEW] Error:", error);
+    return res.status(500).json({
+      error: "internal_error",
+      message: error.message,
+      url
+    });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Hybrid preview engine listening on port ${PORT}`);
+});
