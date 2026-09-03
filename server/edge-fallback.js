@@ -7,11 +7,12 @@ import path from "node:path";
 import fs from "node:fs/promises";
 
 const targetUrl = process.argv[2];
-const EDGE_TIMEOUT_MS = Math.max(5000, Number(process.argv[3]) || 12000);
+const EDGE_TIMEOUT_MS = Math.max(4000, Number(process.argv[3]) || 7000);
 const GLOBAL_LIMIT = Math.max(1, Number(process.argv[4]) || 8);
 const PER_HOST_LIMIT = Math.max(1, Number(process.argv[5]) || 4);
 const DOM_LIMIT_BYTES = Math.max(256 * 1024, Number(process.argv[6]) || 2 * 1024 * 1024);
 const HTTP_RESOURCE_LIMIT_BYTES = 4 * 1024 * 1024;
+const AUTH_PROFILE_DIR = process.argv[7] || null;
 
 class Semaphore {
   constructor(limit) {
@@ -117,6 +118,35 @@ async function resolvePublicAddress(hostname) {
 
 function isLikelyMediaPath(pathname = "") {
   return /\.(?:mp4|m4v|mov|webm|mkv|avi|mp3|m4a|aac|wav|flac|m3u8|mpd|ts)(?:$|[?#])/i.test(pathname);
+}
+
+
+function detectChallengePage(html = "") {
+  const text = String(html || "");
+  if (!text) return null;
+  const lower = text.toLowerCase();
+  const titleMatch = text.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  const title = (titleMatch?.[1] || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  const titleLower = title.toLowerCase();
+  const strongTitle = [
+    "just a moment",
+    "attention required",
+    "verify you are human",
+    "checking your browser",
+    "security check",
+    "access denied"
+  ].some((needle) => titleLower.includes(needle));
+  const strongBody = [
+    "cf-chl-",
+    "challenge-platform",
+    "cf-turnstile",
+    "enable javascript and cookies to continue",
+    "checking if the site connection is secure",
+    "performing security verification",
+    "verify you are human"
+  ].some((needle) => lower.includes(needle));
+  if (!strongTitle && !strongBody) return null;
+  return { title: title || null, provider: lower.includes("cloudflare") || lower.includes("cf-chl-") ? "cloudflare" : null };
 }
 
 async function findEdgeExecutable() {
@@ -297,7 +327,8 @@ async function run() {
   let profileDir = null;
   let edge = null;
   try {
-    profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "link-preview-edge-helper-"));
+    profileDir = AUTH_PROFILE_DIR || await fs.mkdtemp(path.join(os.tmpdir(), "link-preview-edge-helper-"));
+    if (AUTH_PROFILE_DIR) await fs.mkdir(profileDir, { recursive: true });
     const args = [
       "--headless=new",
       "--disable-gpu",
@@ -317,7 +348,7 @@ async function run() {
       "--proxy-bypass-list=<-loopback>",
       `--user-data-dir=${profileDir}`,
       "--window-size=1280,720",
-      "--virtual-time-budget=6000",
+      "--virtual-time-budget=2500",
       "--dump-dom",
       targetUrl
     ];
@@ -366,7 +397,18 @@ async function run() {
             diagnostic: Buffer.concat(errors).toString("utf8").slice(0, 1000)
           });
         } else {
-          finish({ ok: true, html });
+          const challenge = detectChallengePage(html);
+          if (challenge) {
+            finish({
+              ok: false,
+              error: "edge_challenge_page",
+              challenge: true,
+              challengeTitle: challenge.title,
+              challengeProvider: challenge.provider
+            });
+          } else {
+            finish({ ok: true, html });
+          }
         }
       });
     });
@@ -374,7 +416,7 @@ async function run() {
   } finally {
     await killTree(edge).catch(() => {});
     await proxy.close().catch(() => {});
-    if (profileDir) await fs.rm(profileDir, { recursive: true, force: true }).catch(() => {});
+    if (profileDir && !AUTH_PROFILE_DIR) await fs.rm(profileDir, { recursive: true, force: true }).catch(() => {});
   }
 }
 

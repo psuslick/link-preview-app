@@ -1,9 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { fetchAlternates, fetchPreview, imageProxyUrl } from "./api.js";
+import {
+  authorizationStatus,
+  authorizePreviewHost,
+  compareVideoSamples,
+  fetchAlternates,
+  fetchPreview,
+  imageProxyUrl
+} from "./api.js";
 import "./App.css";
 
 const CLIENT_CONCURRENCY = 12;
 const BROWSER_FALLBACK_CONCURRENCY = 1;
+const FINDER_CONCURRENCY = 2;
 
 function normalizeUrl(raw) {
   try {
@@ -21,37 +29,28 @@ function extractUrls(text) {
     .split(/\s+/)
     .map((value) => value.trim().replace(/^[<\[("']+|[>\])}"',;]+$/g, ""))
     .filter(Boolean);
-
   const seen = new Set();
   const valid = [];
   let invalid = 0;
-
   for (const candidate of candidates) {
     const normalized = normalizeUrl(candidate);
-    if (!normalized) {
-      invalid += 1;
-      continue;
-    }
+    if (!normalized) { invalid += 1; continue; }
     const key = normalized.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
     valid.push(normalized);
   }
-
   return { urls: valid, invalid };
 }
 
 function domainFor(url) {
-  try {
-    return new URL(url).hostname.replace(/^www\./, "");
-  } catch {
-    return "Unknown source";
-  }
+  try { return new URL(url).hostname.replace(/^www\./, ""); }
+  catch { return "Unknown source"; }
 }
 
 function formatDuration(seconds) {
-  if (!Number.isFinite(seconds) || seconds <= 0) return null;
-  const total = Math.round(seconds);
+  if (!Number.isFinite(Number(seconds)) || Number(seconds) <= 0) return null;
+  const total = Math.round(Number(seconds));
   const hours = Math.floor(total / 3600);
   const minutes = Math.floor((total % 3600) / 60);
   const secs = total % 60;
@@ -72,29 +71,21 @@ function LazyThumbnail({ sources, sourceUrl, title }) {
     setCandidateIndex(0);
     setShouldLoad(false);
     if (!candidates.length) return undefined;
-    if (typeof IntersectionObserver === "undefined") {
-      setShouldLoad(true);
-      return undefined;
-    }
-
+    if (typeof IntersectionObserver === "undefined") { setShouldLoad(true); return undefined; }
     const node = holderRef.current;
     if (!node) return undefined;
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((entry) => entry.isIntersecting)) {
-          setShouldLoad(true);
-          observer.disconnect();
-        }
-      },
-      { rootMargin: "700px 0px" }
-    );
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) {
+        setShouldLoad(true);
+        observer.disconnect();
+      }
+    }, { rootMargin: "700px 0px" });
     observer.observe(node);
     return () => observer.disconnect();
   }, [candidates]);
 
   const current = candidates[candidateIndex] || null;
   const exhausted = candidates.length > 0 && candidateIndex >= candidates.length;
-
   return (
     <div className="thumbnail-shell" ref={holderRef}>
       {current && shouldLoad && !exhausted ? (
@@ -110,20 +101,12 @@ function LazyThumbnail({ sources, sourceUrl, title }) {
         />
       ) : (
         <div className="thumbnail-placeholder">
-          <span>
-            {!candidates.length || exhausted
-              ? "Thumbnail unavailable"
-              : shouldLoad
-                ? "Trying alternate thumbnail…"
-                : "Thumbnail queued…"}
-          </span>
+          <span>{!candidates.length || exhausted ? "Thumbnail unavailable" : shouldLoad ? "Trying alternate thumbnail…" : "Thumbnail queued…"}</span>
         </div>
       )}
       <div className="play-mark" aria-hidden="true">▶</div>
       {candidates.length > 1 && candidateIndex < candidates.length && (
-        <div className="thumbnail-candidate-count" title="Thumbnail fallback candidate">
-          {candidateIndex + 1}/{candidates.length}
-        </div>
+        <div className="thumbnail-candidate-count" title="Thumbnail fallback candidate">{candidateIndex + 1}/{candidates.length}</div>
       )}
     </div>
   );
@@ -143,6 +126,73 @@ async function runPool(items, worker, concurrency = CLIENT_CONCURRENCY) {
   await Promise.all(workers);
 }
 
+function FinderResult({ job, candidate, alreadyInList, onAdd, onCompare }) {
+  const candidateDuration = formatDuration(candidate.durationSeconds);
+  const sourceDuration = Number(job.source?.durationSeconds) || 0;
+  const longerBy = sourceDuration && candidate.durationSeconds > sourceDuration
+    ? formatDuration(candidate.durationSeconds - sourceDuration)
+    : null;
+  const comparison = candidate.comparison || null;
+  const relation = comparison?.state === "ready" && comparison.result?.relation
+    ? comparison.result.relation
+    : candidate.relation || "Discovered candidate";
+
+  return (
+    <article className="alternate-result">
+      <div className="alternate-thumb">
+        <LazyThumbnail
+          sources={candidate.images?.length ? candidate.images : candidate.image ? [candidate.image] : []}
+          sourceUrl={candidate.url}
+          title={candidate.title}
+        />
+      </div>
+      <div className="alternate-result-body">
+        <div className="alternate-result-topline">
+          <span className={`relation-badge ${/longer/i.test(relation) ? "longer" : /mirror|same footage/i.test(relation) ? "mirror" : "possible"}`}>{relation}</span>
+          <span className="confidence-badge">{candidate.confidence ?? 0}% rank</span>
+          {candidateDuration && <span className="duration-badge">{candidateDuration}</span>}
+          {longerBy && <span className="longer-by">+{longerBy}</span>}
+        </div>
+        <h3>{candidate.title || candidate.url}</h3>
+        <div className="alternate-domain">{candidate.provider || domainFor(candidate.url)}</div>
+        {(candidate.overlap?.matchedIds?.length > 0 || candidate.overlap?.matchedFilenames?.length > 0 || candidate.evidence?.length > 0) && (
+          <div className="candidate-evidence">
+            {candidate.overlap?.matchedIds?.slice(0, 2).map((value) => <span key={`id-${value}`}>ID match: {value}</span>)}
+            {candidate.overlap?.matchedFilenames?.slice(0, 2).map((value) => <span key={`file-${value}`}>File match: {value}</span>)}
+            {candidate.evidence?.slice(0, 3).map((entry, index) => <span key={`${entry.kind}-${index}`}>{entry.kind}</span>)}
+          </div>
+        )}
+        {candidate.description && <p>{candidate.description}</p>}
+
+        {comparison?.state === "loading" && (
+          <div className="frame-compare-status"><span className="mini-spinner" /> Sampling remote frames…</div>
+        )}
+        {comparison?.state === "failed" && (
+          <div className="frame-compare-status failed-text">Frame comparison: {comparison.error || "failed"}</div>
+        )}
+        {comparison?.state === "ready" && comparison.result && (
+          <div className={`frame-compare-status ${comparison.result.verified ? "verified" : comparison.result.possible ? "possible" : "no-match"}`}>
+            <strong>{comparison.result.relation}</strong>
+            <span>{comparison.result.similarity}% perceptual similarity</span>
+            <span>{comparison.result.sourceFrames} source / {comparison.result.candidateFrames} candidate frames</span>
+            {Number.isFinite(comparison.result.averageDistance) && <span>avg dHash distance {comparison.result.averageDistance}</span>}
+          </div>
+        )}
+
+        <div className="alternate-result-actions">
+          <a href={candidate.url} target="_blank" rel="noopener noreferrer">Open candidate ↗</a>
+          <button type="button" onClick={() => onAdd(candidate)} disabled={candidate.added || alreadyInList}>
+            {candidate.added || alreadyInList ? "Already in list" : "Add to list"}
+          </button>
+          <button type="button" onClick={() => onCompare(candidate)} disabled={comparison?.state === "loading"} title="Best-effort low-resolution perceptual frame comparison. Does not download the complete video.">
+            {comparison?.state === "ready" ? "Compare again" : comparison?.state === "loading" ? "Comparing…" : "Compare samples"}
+          </button>
+        </div>
+      </div>
+    </article>
+  );
+}
+
 function App() {
   const [inputText, setInputText] = useState("");
   const [previews, setPreviews] = useState([]);
@@ -150,13 +200,12 @@ function App() {
   const [processing, setProcessing] = useState(false);
   const [importSummary, setImportSummary] = useState(null);
   const [copyStatus, setCopyStatus] = useState("");
-  const [alternatePanel, setAlternatePanel] = useState(null);
+  const [activeTab, setActiveTab] = useState("previews");
+  const [finderJobs, setFinderJobs] = useState([]);
+  const finderRunningRef = useRef(new Set());
 
   const stats = useMemo(() => {
-    let queued = 0;
-    let loading = 0;
-    let ready = 0;
-    let failed = 0;
+    let queued = 0, loading = 0, ready = 0, failed = 0;
     for (const item of previews) {
       if (item.state === "queued") queued += 1;
       else if (item.state === "loading") loading += 1;
@@ -166,10 +215,23 @@ function App() {
     return { queued, loading, ready, failed, total: previews.length };
   }, [previews]);
 
+  const finderStats = useMemo(() => {
+    const summary = { queued: 0, running: 0, ready: 0, failed: 0, total: finderJobs.length };
+    for (const job of finderJobs) if (Object.prototype.hasOwnProperty.call(summary, job.state)) summary[job.state] += 1;
+    return summary;
+  }, [finderJobs]);
+
   function patchPreview(id, patch) {
-    setPreviews((current) =>
-      current.map((item) => (item.id === id ? { ...item, ...patch } : item))
-    );
+    setPreviews((current) => current.map((item) => item.id === id ? { ...item, ...patch } : item));
+  }
+  function patchFinderJob(id, patch) {
+    setFinderJobs((current) => current.map((job) => job.id === id ? { ...job, ...patch } : job));
+  }
+  function patchFinderCandidate(jobId, candidateUrl, patch) {
+    setFinderJobs((current) => current.map((job) => job.id !== jobId ? job : {
+      ...job,
+      results: (job.results || []).map((candidate) => candidate.url === candidateUrl ? { ...candidate, ...patch } : candidate)
+    }));
   }
 
   async function processItems(items) {
@@ -177,8 +239,6 @@ function App() {
     setProcessing(true);
     const browserFallbackItems = [];
     try {
-      // Fast pass first: let all lightweight/provider previews finish before any
-      // one-at-a-time browser fallbacks can hold up the queue.
       await runPool(items, async (item) => {
         patchPreview(item.id, { state: "loading", error: null });
         const result = await fetchPreview(item.url, { allowBrowserFallback: false });
@@ -189,57 +249,44 @@ function App() {
         });
         if (result.clientOk && result.needsBrowserFallback) browserFallbackItems.push(item);
       });
-
-      // Slow lane second: only sources that actually need a real browser enter it.
       if (browserFallbackItems.length) {
-        await runPool(
-          browserFallbackItems,
-          async (item) => {
-            patchPreview(item.id, { state: "loading", error: null, method: "edge-fallback-queued" });
-            const result = await fetchPreview(item.url, { allowBrowserFallback: true });
-            patchPreview(item.id, {
-              ...result,
-              state: result.clientOk ? "ready" : "failed",
-              error: result.clientOk ? result.error || null : result.error || `HTTP ${result.clientStatus}`
-            });
-          },
-          BROWSER_FALLBACK_CONCURRENCY
-        );
+        await runPool(browserFallbackItems, async (item) => {
+          patchPreview(item.id, { state: "loading", error: null, method: "edge-fallback-queued" });
+          const result = await fetchPreview(item.url, { allowBrowserFallback: true });
+          patchPreview(item.id, {
+            ...result,
+            state: result.clientOk ? "ready" : "failed",
+            error: result.clientOk ? result.error || null : result.error || `HTTP ${result.clientStatus}`
+          });
+        }, BROWSER_FALLBACK_CONCURRENCY);
       }
-    } finally {
-      setProcessing(false);
-    }
+    } finally { setProcessing(false); }
+  }
+
+  async function processSinglePreview(item) {
+    patchPreview(item.id, { state: "loading", error: null, method: "retrying" });
+    const result = await fetchPreview(item.url, { allowBrowserFallback: true });
+    patchPreview(item.id, {
+      ...result,
+      state: result.clientOk ? "ready" : "failed",
+      error: result.clientOk ? result.error || null : result.error || `HTTP ${result.clientStatus}`
+    });
   }
 
   async function handleSubmit(event) {
     event.preventDefault();
     if (processing || !inputText.trim()) return;
-
     const parsed = extractUrls(inputText);
     const existing = new Set(previews.map((item) => item.url.toLowerCase()));
     const newUrls = parsed.urls.filter((url) => !existing.has(url.toLowerCase()));
     const duplicateCount = parsed.urls.length - newUrls.length;
-
     const stamp = Date.now();
     const items = newUrls.map((url, index) => ({
-      id: `${stamp}-${index}`,
-      url,
-      state: "queued",
-      title: null,
-      description: null,
-      image: null,
-      provider: null,
-      method: null,
-      error: null
+      id: `${stamp}-${index}`, url, state: "queued", title: null, description: null,
+      image: null, provider: null, method: null, error: null
     }));
-
-    setImportSummary({
-      added: items.length,
-      duplicates: duplicateCount,
-      invalid: parsed.invalid
-    });
+    setImportSummary({ added: items.length, duplicates: duplicateCount, invalid: parsed.invalid });
     setInputText("");
-
     if (!items.length) return;
     setPreviews((current) => [...current, ...items]);
     await processItems(items);
@@ -248,20 +295,12 @@ function App() {
   function toggleSelected(id) {
     setSelected((current) => {
       const next = new Set(current);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
+      if (next.has(id)) next.delete(id); else next.add(id);
       return next;
     });
   }
-
-  function selectAll() {
-    setSelected(new Set(previews.map((item) => item.id)));
-  }
-
-  function clearSelection() {
-    setSelected(new Set());
-  }
-
+  function selectAll() { setSelected(new Set(previews.map((item) => item.id))); }
+  function clearSelection() { setSelected(new Set()); }
   function invertSelection() {
     setSelected((current) => {
       const next = new Set();
@@ -269,67 +308,55 @@ function App() {
       return next;
     });
   }
-
   async function copySelected() {
     const urls = previews.filter((item) => selected.has(item.id)).map((item) => item.url);
     if (!urls.length) return;
-    try {
-      await navigator.clipboard.writeText(urls.join("\r\n"));
-      setCopyStatus(`Copied ${urls.length} URL${urls.length === 1 ? "" : "s"}`);
-    } catch {
-      setCopyStatus("Clipboard copy failed");
-    }
+    try { await navigator.clipboard.writeText(urls.join("\r\n")); setCopyStatus(`Copied ${urls.length} URL${urls.length === 1 ? "" : "s"}`); }
+    catch { setCopyStatus("Clipboard copy failed"); }
     setTimeout(() => setCopyStatus(""), 2200);
   }
-
   function removeSelected() {
     if (processing || !selected.size) return;
     setPreviews((current) => current.filter((item) => !selected.has(item.id)));
     setSelected(new Set());
   }
-
   function clearAll() {
     if (processing) return;
-    setPreviews([]);
-    setSelected(new Set());
-    setImportSummary(null);
+    setPreviews([]); setSelected(new Set()); setImportSummary(null);
   }
-
   async function retryFailed() {
     if (processing) return;
-    const failed = previews.filter((item) => item.state === "failed");
-    await processItems(failed);
+    await processItems(previews.filter((item) => item.state === "failed"));
   }
 
-  async function findSelectedAlternates() {
-    if (selected.size !== 1) return;
-    const source = previews.find((item) => selected.has(item.id));
-    if (!source) return;
+  function queueSelectedVersionSearches() {
+    const sources = previews.filter((item) => selected.has(item.id));
+    if (!sources.length) return;
+    const now = Date.now();
+    const activeSourceUrls = new Set(
+      finderJobs.filter((job) => ["queued", "running"].includes(job.state)).map((job) => job.source.url.toLowerCase())
+    );
+    const jobs = sources.filter((source) => !activeSourceUrls.has(source.url.toLowerCase())).map((source, index) => ({
+      id: `finder-${now}-${index}-${Math.random().toString(36).slice(2, 7)}`,
+      source: { ...source }, state: "queued", results: [], error: null, queuedAt: Date.now(),
+      note: null, diagnostics: [], queryEvidence: [], candidateCount: 0, evaluatedCount: 0
+    }));
+    if (!jobs.length) { setCopyStatus("Selected videos are already queued/running"); setTimeout(() => setCopyStatus(""), 2200); return; }
+    setFinderJobs((current) => [...jobs, ...current]);
+    setCopyStatus(`Queued ${jobs.length} version search${jobs.length === 1 ? "" : "es"}`);
+    setTimeout(() => setCopyStatus(""), 2200);
+  }
 
-    setAlternatePanel({
-      sourceId: source.id,
-      source,
-      state: "loading",
-      results: [],
-      error: null,
-      note: null,
-      diagnostics: []
-    });
-
-    const result = await fetchAlternates(source);
+  async function executeFinderJob(job) {
+    patchFinderJob(job.id, { state: "running", startedAt: Date.now(), error: null });
+    const result = await fetchAlternates(job.source);
     if (!result.clientOk) {
-      setAlternatePanel((current) => current?.sourceId === source.id ? {
-        ...current,
-        state: "failed",
-        error: result.error || `Search failed (${result.clientStatus || "network"})`
-      } : current);
+      patchFinderJob(job.id, { state: "failed", finishedAt: Date.now(), error: result.error || `Search failed (${result.clientStatus || "network"})`, clientMs: result.clientMs });
       return;
     }
-
-    setAlternatePanel((current) => current?.sourceId === source.id ? {
-      ...current,
-      state: "ready",
-      source: { ...source, ...(result.source || {}) },
+    patchFinderJob(job.id, {
+      state: "ready", finishedAt: Date.now(),
+      source: { ...job.source, ...(result.source || {}) },
       results: Array.isArray(result.results) ? result.results : [],
       note: result.note || null,
       diagnostics: result.searchDiagnostics || [],
@@ -341,39 +368,77 @@ function App() {
       sourceSignals: result.sourceSignals || null,
       tools: result.tools || null,
       queryEvidence: result.queryEvidence || []
-    } : current);
+    });
   }
 
-  function addAlternate(candidate) {
+  useEffect(() => {
+    const openSlots = Math.max(0, FINDER_CONCURRENCY - finderRunningRef.current.size);
+    if (!openSlots) return;
+    const queued = finderJobs.filter((job) => job.state === "queued" && !finderRunningRef.current.has(job.id)).slice(0, openSlots);
+    for (const job of queued) {
+      finderRunningRef.current.add(job.id);
+      executeFinderJob(job).finally(() => {
+        finderRunningRef.current.delete(job.id);
+        setFinderJobs((current) => [...current]);
+      });
+    }
+  }, [finderJobs]);
+
+  function retryFinderJob(job) {
+    patchFinderJob(job.id, { state: "queued", results: [], error: null, diagnostics: [], queryEvidence: [], cached: false });
+  }
+  function removeFinderJob(id) { setFinderJobs((current) => current.filter((job) => job.id !== id)); }
+  function clearCompletedFinderJobs() { setFinderJobs((current) => current.filter((job) => ["queued", "running"].includes(job.state))); }
+
+  function addAlternate(jobId, candidate) {
     const normalized = candidate.url?.toLowerCase();
     if (!normalized) return;
     const existing = previews.find((item) => item.url.toLowerCase() === normalized);
     if (!existing) {
-      const item = {
+      setPreviews((current) => [...current, {
         id: `alternate-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        url: candidate.url,
-        state: "ready",
-        title: candidate.title || null,
-        description: candidate.description || null,
-        image: candidate.image || null,
-        images: candidate.images || (candidate.image ? [candidate.image] : []),
-        provider: candidate.provider || null,
-        durationSeconds: candidate.durationSeconds || null,
-        method: candidate.method || "alternate-search",
-        error: null,
-        alternateRelation: candidate.relation || null,
+        url: candidate.url, state: "ready", title: candidate.title || null, description: candidate.description || null,
+        image: candidate.image || null, images: candidate.images || (candidate.image ? [candidate.image] : []),
+        provider: candidate.provider || null, durationSeconds: candidate.durationSeconds || null,
+        method: candidate.method || "alternate-search", error: null,
+        alternateRelation: candidate.comparison?.result?.relation || candidate.relation || null,
         alternateConfidence: candidate.confidence || null
-      };
-      setPreviews((current) => [...current, item]);
+      }]);
     }
-    setAlternatePanel((current) => current ? {
-      ...current,
-      results: current.results.map((item) => item.url === candidate.url ? { ...item, added: true } : item)
-    } : current);
+    patchFinderCandidate(jobId, candidate.url, { added: true });
   }
 
-  function closeAlternates() {
-    setAlternatePanel(null);
+  async function compareCandidate(job, candidate) {
+    patchFinderCandidate(job.id, candidate.url, { comparison: { state: "loading" } });
+    const result = await compareVideoSamples(job.source.url, candidate.url);
+    if (!result.clientOk || !result.ok) {
+      patchFinderCandidate(job.id, candidate.url, { comparison: { state: "failed", error: result.error || "frame_compare_failed" } });
+      return;
+    }
+    patchFinderCandidate(job.id, candidate.url, { comparison: { state: "ready", result } });
+  }
+
+  async function authorizeSite(preview) {
+    patchPreview(preview.id, { authorizationState: "launching", authorizationMessage: null });
+    const result = await authorizePreviewHost(preview.url);
+    if (!result.clientOk) {
+      patchPreview(preview.id, { authorizationState: "failed", authorizationMessage: result.error || "Unable to open authorization browser" });
+      return;
+    }
+    patchPreview(preview.id, {
+      authorizationState: "authorizing",
+      authorizationMessage: "Complete the site challenge in the Edge window, close that window, then click Retry preview."
+    });
+  }
+
+  async function retryAuthorizedPreview(preview) {
+    const status = await authorizationStatus(preview.url);
+    if (status.clientOk && status.status === "authorizing") {
+      patchPreview(preview.id, { authorizationState: "authorizing", authorizationMessage: "The authorization Edge window is still open. Complete the challenge and close it first." });
+      return;
+    }
+    patchPreview(preview.id, { authorizationState: status.ready ? "ready" : preview.authorizationState, authorizationMessage: status.ready ? "Authorized Sandbox browser profile ready." : preview.authorizationMessage });
+    await processSinglePreview(preview);
   }
 
   function handleCardClick(event, id) {
@@ -386,343 +451,227 @@ function App() {
       <header className="topbar">
         <div>
           <h1>Video Link Preview</h1>
-          <p className="subtitle">Paste hundreds of video links. Preview traffic is queued and rate-limited.</p>
+          <p className="subtitle">Paste hundreds of video links. Preview and version-finder traffic are queued and rate-limited.</p>
         </div>
-        <div className="limit-badge" title="Client preview workers">
-          {CLIENT_CONCURRENCY} fast workers · {BROWSER_FALLBACK_CONCURRENCY} browser fallback
+        <div className="topbar-statuses">
+          <div className="limit-badge">{CLIENT_CONCURRENCY} preview workers · {BROWSER_FALLBACK_CONCURRENCY} browser fallback</div>
+          {finderStats.total > 0 && <div className="limit-badge finder-badge">Finder: {finderStats.running} running · {finderStats.queued} queued</div>}
         </div>
       </header>
 
       <section className="import-panel">
         <form onSubmit={handleSubmit} className="input-form">
-          <textarea
-            placeholder="Paste video URLs here — one per line or separated by whitespace…"
-            value={inputText}
-            onChange={(event) => setInputText(event.target.value)}
-            className="multi-input"
-            disabled={processing}
-          />
-          <button type="submit" className="primary-button" disabled={processing || !inputText.trim()}>
-            {processing ? "Processing…" : "Create previews"}
-          </button>
+          <textarea placeholder="Paste video URLs here — one per line or separated by whitespace…" value={inputText} onChange={(event) => setInputText(event.target.value)} className="multi-input" disabled={processing} />
+          <button type="submit" className="primary-button" disabled={processing || !inputText.trim()}>{processing ? "Processing…" : "Create previews"}</button>
         </form>
-
         {importSummary && (
           <div className="import-summary">
-            <strong>{importSummary.added}</strong> added
-            <span>·</span>
-            <strong>{importSummary.duplicates}</strong> duplicates skipped
-            {importSummary.invalid > 0 && (
-              <>
-                <span>·</span>
-                <strong>{importSummary.invalid}</strong> invalid entries ignored
-              </>
-            )}
+            <strong>{importSummary.added}</strong> added <span>·</span> <strong>{importSummary.duplicates}</strong> duplicates skipped
+            {importSummary.invalid > 0 && <><span>·</span> <strong>{importSummary.invalid}</strong> invalid entries ignored</>}
           </div>
         )}
       </section>
 
-      {previews.length > 0 && (
+      <nav className="workspace-tabs" aria-label="Workspace">
+        <button type="button" className={activeTab === "previews" ? "active" : ""} onClick={() => setActiveTab("previews")}>Previews <span>{previews.length}</span></button>
+        <button type="button" className={activeTab === "finder" ? "active" : ""} onClick={() => setActiveTab("finder")}>
+          Version Finder <span>{finderJobs.length}</span>
+          {(finderStats.running > 0 || finderStats.queued > 0) && <i>{finderStats.running + finderStats.queued}</i>}
+        </button>
+      </nav>
+
+      {copyStatus && <div className="copy-toast workspace-toast">{copyStatus}</div>}
+
+      {activeTab === "previews" && (
         <>
-          <section className="status-strip">
-            <div className="progress-copy">
-              <strong>{stats.ready + stats.failed} / {stats.total}</strong> processed
-              {stats.loading > 0 && <span> · {stats.loading} active</span>}
-              {stats.queued > 0 && <span> · {stats.queued} queued</span>}
-              {stats.failed > 0 && <span className="failed-text"> · {stats.failed} failed</span>}
-            </div>
-            <div className="progress-track" aria-label="Preview processing progress">
-              <div
-                className="progress-fill"
-                style={{ width: `${stats.total ? ((stats.ready + stats.failed) / stats.total) * 100 : 0}%` }}
-              />
-            </div>
-          </section>
+          {previews.length > 0 && (
+            <>
+              <section className="status-strip">
+                <div className="progress-copy">
+                  <strong>{stats.ready + stats.failed} / {stats.total}</strong> processed
+                  {stats.loading > 0 && <span> · {stats.loading} active</span>}
+                  {stats.queued > 0 && <span> · {stats.queued} queued</span>}
+                  {stats.failed > 0 && <span className="failed-text"> · {stats.failed} failed</span>}
+                </div>
+                <div className="progress-track"><div className="progress-fill" style={{ width: `${stats.total ? ((stats.ready + stats.failed) / stats.total) * 100 : 0}%` }} /></div>
+              </section>
 
-          <section className="actionbar">
-            <div className="selection-count">{selected.size} selected</div>
-            <div className="action-buttons">
-              <button type="button" onClick={selectAll}>Select all</button>
-              <button type="button" onClick={clearSelection}>Deselect</button>
-              <button type="button" onClick={invertSelection}>Invert</button>
-              <button type="button" onClick={copySelected} disabled={!selected.size}>Copy selected URLs</button>
-              <button
-                type="button"
-                onClick={findSelectedAlternates}
-                disabled={selected.size !== 1 || processing}
-                title={selected.size === 1 ? "Find mirrors, longer versions, and renamed copies using media evidence" : "Select exactly one video"}
-              >
-                Find versions
-              </button>
-              <button type="button" onClick={removeSelected} disabled={!selected.size || processing}>Remove selected</button>
-              {stats.failed > 0 && (
-                <button type="button" onClick={retryFailed} disabled={processing}>Retry failed</button>
-              )}
-              <button type="button" onClick={clearAll} disabled={processing}>Clear all</button>
-            </div>
-            {copyStatus && <div className="copy-toast">{copyStatus}</div>}
-          </section>
+              <section className="actionbar">
+                <div className="selection-count">{selected.size} selected</div>
+                <div className="action-buttons">
+                  <button type="button" onClick={selectAll}>Select all</button>
+                  <button type="button" onClick={clearSelection}>Deselect</button>
+                  <button type="button" onClick={invertSelection}>Invert</button>
+                  <button type="button" onClick={copySelected} disabled={!selected.size}>Copy selected URLs</button>
+                  <button type="button" onClick={queueSelectedVersionSearches} disabled={!selected.size} title="Queue selected videos for independent background version searches">Queue version search{selected.size > 1 ? ` (${selected.size})` : ""}</button>
+                  <button type="button" onClick={removeSelected} disabled={!selected.size || processing}>Remove selected</button>
+                  {stats.failed > 0 && <button type="button" onClick={retryFailed} disabled={processing}>Retry failed</button>}
+                  <button type="button" onClick={clearAll} disabled={processing}>Clear all</button>
+                </div>
+              </section>
 
-          <section className="preview-grid">
-            {previews.map((preview) => {
-              const isSelected = selected.has(preview.id);
-              const duration = formatDuration(preview.durationSeconds);
-              return (
-                <article
-                  key={preview.id}
-                  className={`preview-card ${isSelected ? "selected" : ""} ${preview.state}`}
-                  onClick={(event) => handleCardClick(event, preview.id)}
-                >
-                  <div className="card-selector">
-                    <input
-                      type="checkbox"
-                      checked={isSelected}
-                      onChange={() => toggleSelected(preview.id)}
-                      aria-label={`Select ${preview.title || preview.url}`}
-                    />
-                  </div>
-
-                  {preview.state === "queued" || preview.state === "loading" ? (
-                    <div className="thumbnail-shell">
-                      <div className="thumbnail-placeholder pulse">
-                        <span>{preview.state === "queued" ? "Queued…" : "Finding video thumbnail…"}</span>
-                      </div>
-                    </div>
-                  ) : (
-                    <LazyThumbnail
-                      sources={preview.images?.length ? preview.images : preview.image ? [preview.image] : []}
-                      sourceUrl={preview.url}
-                      title={preview.title}
-                    />
-                  )}
-
-                  <div className="preview-content">
-                    <div className="meta-row">
-                      <span className="source-domain">{preview.provider || domainFor(preview.url)}</span>
-                      {duration && <span className="duration-badge">{duration}</span>}
-                      {preview.alternateRelation && (
-                        <span className="alternate-source-badge" title={`${preview.alternateConfidence || "?"}% discovery confidence`}>
-                          {preview.alternateRelation}
-                        </span>
+              <section className="preview-grid">
+                {previews.map((preview) => {
+                  const isSelected = selected.has(preview.id);
+                  const duration = formatDuration(preview.durationSeconds);
+                  return (
+                    <article key={preview.id} className={`preview-card ${isSelected ? "selected" : ""} ${preview.state}`} onClick={(event) => handleCardClick(event, preview.id)}>
+                      <div className="card-selector"><input type="checkbox" checked={isSelected} onChange={() => toggleSelected(preview.id)} aria-label={`Select ${preview.title || preview.url}`} /></div>
+                      {preview.state === "queued" || preview.state === "loading" ? (
+                        <div className="thumbnail-shell"><div className="thumbnail-placeholder pulse"><span>{preview.state === "queued" ? "Queued…" : "Finding video thumbnail…"}</span></div></div>
+                      ) : (
+                        <LazyThumbnail sources={preview.images?.length ? preview.images : preview.image ? [preview.image] : []} sourceUrl={preview.url} title={preview.title} />
                       )}
-                      {preview.method && <span className="method-badge">{preview.method}</span>}
-                    </div>
-
-                    <h2>{preview.title || (preview.state === "failed" ? "Preview failed" : "Video preview")}</h2>
-                    {preview.description && <p>{preview.description}</p>}
-                    {preview.warning && preview.state !== "failed" && (
-                      <p className="warning-message">Source restricted lightweight access; fallback was attempted.</p>
-                    )}
-                    {preview.state === "failed" && (
-                      <p className="error-message">{preview.error || "Unable to retrieve preview metadata."}</p>
-                    )}
-
-                    <div className="card-footer">
-                      <a href={preview.url} target="_blank" rel="noopener noreferrer">Open video ↗</a>
-                      <span className="timing">
-                        {Number.isFinite(preview.elapsedMs) ? `${preview.elapsedMs} ms` : ""}
-                        {preview.cached ? " · cache" : ""}
-                      </span>
-                    </div>
-
-                    {(preview.state === "ready" || preview.state === "failed") && (
-                      <details className="diagnostics">
-                        <summary>Diagnostics</summary>
-                        <dl>
-                          <div><dt>Method</dt><dd>{preview.method || "none"}</dd></div>
-                          <div><dt>Backend</dt><dd>{preview.clientStatus || "network error"}</dd></div>
-                          <div><dt>Upstream</dt><dd>{preview.upstreamStatus ?? "—"}</dd></div>
-                          <div><dt>Bytes read</dt><dd>{Number.isFinite(preview.bytesRead) ? preview.bytesRead.toLocaleString() : "—"}</dd></div>
-                          <div><dt>Client time</dt><dd>{Number.isFinite(preview.clientMs) ? `${preview.clientMs} ms` : "—"}</dd></div>
-                          <div><dt>Thumbnails</dt><dd>{preview.images?.length || (preview.image ? 1 : 0)}</dd></div>
-                          <div><dt>HTTP extractor</dt><dd>{preview.extractorStats ? `meta ${preview.extractorStats.meta || 0} · json ${preview.extractorStats.json || 0} · script ${preview.extractorStats.script || 0} · poster ${preview.extractorStats.poster || 0} · dom ${preview.extractorStats.dom || 0}` : "—"}</dd></div>
-                          <div><dt>Edge extractor</dt><dd>{preview.browserExtractorStats ? `meta ${preview.browserExtractorStats.meta || 0} · json ${preview.browserExtractorStats.json || 0} · script ${preview.browserExtractorStats.script || 0} · poster ${preview.browserExtractorStats.poster || 0} · dom ${preview.browserExtractorStats.dom || 0}` : "—"}</dd></div>
-                          <div><dt>Browser fallback</dt><dd>{preview.browserFallback ? "used" : preview.browserFallbackAttempted ? "attempted" : "no"}</dd></div>
-                          <div><dt>Fallback error</dt><dd>{preview.browserFallbackError || "none"}</dd></div>
-                          <div><dt>Client network</dt><dd>{preview.clientNetworkError || "none"}</dd></div>
-                          <div><dt>Warning</dt><dd>{preview.warning || "none"}</dd></div>
-                          <div><dt>Error</dt><dd>{preview.error || "none"}</dd></div>
-                        </dl>
-                      </details>
-                    )}
-                  </div>
-                </article>
-              );
-            })}
-          </section>
+                      <div className="preview-content">
+                        <div className="meta-row">
+                          <span className="source-domain">{preview.provider || domainFor(preview.url)}</span>
+                          {duration && <span className="duration-badge">{duration}</span>}
+                          {preview.alternateRelation && <span className="alternate-source-badge">{preview.alternateRelation}</span>}
+                          {preview.method && <span className="method-badge">{preview.method}</span>}
+                        </div>
+                        <h2>{preview.title || (preview.state === "failed" ? "Preview failed" : "Video preview")}</h2>
+                        {preview.description && <p>{preview.description}</p>}
+                        {preview.challengeDetected && preview.state !== "failed" && (
+                          <div className="challenge-box">
+                            <p className="warning-message">Challenge/interstitial page detected. You can authorize this host interactively inside the Sandbox.</p>
+                            <div className="challenge-actions">
+                              <button type="button" onClick={() => authorizeSite(preview)} disabled={preview.authorizationState === "launching" || preview.authorizationState === "authorizing"}>
+                                {preview.authorizationState === "authorizing" ? "Authorization window open" : "Authorize site"}
+                              </button>
+                              <button type="button" onClick={() => retryAuthorizedPreview(preview)}>Retry preview</button>
+                            </div>
+                            {preview.authorizationMessage && <small>{preview.authorizationMessage}</small>}
+                          </div>
+                        )}
+                        {!preview.challengeDetected && preview.warning && preview.state !== "failed" && <p className="warning-message">Source restricted lightweight access; fallback was attempted.</p>}
+                        {preview.state === "failed" && <p className="error-message">{preview.error || "Unable to retrieve preview metadata."}</p>}
+                        <div className="card-footer">
+                          <a href={preview.url} target="_blank" rel="noopener noreferrer">Open video ↗</a>
+                          <span className="timing">{Number.isFinite(preview.elapsedMs) ? `${preview.elapsedMs} ms` : ""}{preview.cached ? " · cache" : ""}</span>
+                        </div>
+                        {(preview.state === "ready" || preview.state === "failed") && (
+                          <details className="diagnostics">
+                            <summary>Diagnostics</summary>
+                            <dl>
+                              <div><dt>Method</dt><dd>{preview.method || "none"}</dd></div>
+                              <div><dt>Backend</dt><dd>{preview.clientStatus || "network error"}</dd></div>
+                              <div><dt>Upstream</dt><dd>{preview.upstreamStatus ?? "—"}</dd></div>
+                              <div><dt>Bytes read</dt><dd>{Number.isFinite(preview.bytesRead) ? preview.bytesRead.toLocaleString() : "—"}</dd></div>
+                              <div><dt>Client time</dt><dd>{Number.isFinite(preview.clientMs) ? `${preview.clientMs} ms` : "—"}</dd></div>
+                              <div><dt>Thumbnails</dt><dd>{preview.images?.length || (preview.image ? 1 : 0)}</dd></div>
+                              <div><dt>HTTP extractor</dt><dd>{preview.extractorStats ? `meta ${preview.extractorStats.meta || 0} · json ${preview.extractorStats.json || 0} · script ${preview.extractorStats.script || 0} · poster ${preview.extractorStats.poster || 0} · dom ${preview.extractorStats.dom || 0}` : "—"}</dd></div>
+                              <div><dt>Edge extractor</dt><dd>{preview.browserExtractorStats ? `meta ${preview.browserExtractorStats.meta || 0} · json ${preview.browserExtractorStats.json || 0} · script ${preview.browserExtractorStats.script || 0} · poster ${preview.browserExtractorStats.poster || 0} · dom ${preview.browserExtractorStats.dom || 0}` : "—"}</dd></div>
+                              <div><dt>Browser fallback</dt><dd>{preview.browserFallback ? "used" : preview.browserFallbackAttempted ? "attempted" : "no"}</dd></div>
+                              <div><dt>Authorized profile</dt><dd>{preview.authorizedBrowserProfile ? "used" : preview.authorizationState || "no"}</dd></div>
+                              <div><dt>Fallback error</dt><dd>{preview.browserFallbackError || "none"}</dd></div>
+                              <div><dt>Challenge</dt><dd>{preview.challengeDetected ? (preview.challengeProvider || "detected") : "none"}</dd></div>
+                              <div><dt>Fallback skipped</dt><dd>{preview.browserFallbackSkippedReason || "none"}</dd></div>
+                              <div><dt>Client network</dt><dd>{preview.clientNetworkError || "none"}</dd></div>
+                              <div><dt>Warning</dt><dd>{preview.warning || "none"}</dd></div>
+                              <div><dt>Error</dt><dd>{preview.error || "none"}</dd></div>
+                            </dl>
+                          </details>
+                        )}
+                      </div>
+                    </article>
+                  );
+                })}
+              </section>
+            </>
+          )}
+          {!previews.length && <section className="empty-workspace"><strong>No previews yet</strong><p>Paste video URLs above to begin.</p></section>}
         </>
       )}
 
-      {alternatePanel && (
-        <div className="alternate-overlay" role="presentation" onMouseDown={(event) => {
-          if (event.target === event.currentTarget) closeAlternates();
-        }}>
-          <section className="alternate-panel" role="dialog" aria-modal="true" aria-label="Find video versions">
-            <header className="alternate-header">
-              <div>
-                <div className="alternate-kicker">Media-signature version discovery</div>
-                <h2>{alternatePanel.source?.title || "Selected video"}</h2>
-                <p>
-                  Searches the public web using whatever evidence the source exposes: media IDs, file names, embeds, transcript phrases, uploader metadata, duration, and title. Unknown video hosts are not filtered out.
-                </p>
-              </div>
-              <button type="button" className="close-button" onClick={closeAlternates} aria-label="Close alternate search">×</button>
-            </header>
-
-            <div className="alternate-source-summary">
-              <span>{alternatePanel.source?.provider || domainFor(alternatePanel.source?.url || "")}</span>
-              {formatDuration(alternatePanel.source?.durationSeconds) && (
-                <span>{formatDuration(alternatePanel.source.durationSeconds)}</span>
-              )}
-              <a href={alternatePanel.source?.url} target="_blank" rel="noopener noreferrer">Open source ↗</a>
+      {activeTab === "finder" && (
+        <section className="finder-workspace">
+          <header className="finder-workspace-header">
+            <div>
+              <div className="alternate-kicker">Persistent background discovery</div>
+              <h2>Version Finder</h2>
+              <p>Queue several selected videos, switch back to Previews, and keep browsing while searches continue.</p>
             </div>
+            <div className="finder-header-actions">
+              <span>{finderStats.running} running · {finderStats.queued} queued · {finderStats.ready} complete · {finderStats.failed} failed</span>
+              <button type="button" onClick={clearCompletedFinderJobs} disabled={!finderJobs.some((job) => ["ready", "failed"].includes(job.state))}>Clear completed</button>
+            </div>
+          </header>
 
-            {alternatePanel.state === "ready" && (alternatePanel.tools || alternatePanel.sourceSignals) && (
-              <div className="discovery-evidence-strip">
-                <span className={alternatePanel.tools?.installed ? "tool-status ready" : "tool-status missing"}>
-                  Tools: {alternatePanel.tools?.installed ? `ready${alternatePanel.tools?.sourceMode ? ` · ${alternatePanel.tools.sourceMode}` : ""}` : "page-only"}
-                </span>
-                {alternatePanel.tools?.sourceExtractor && <span>Extractor: {alternatePanel.tools.sourceExtractor}</span>}
-                {!!alternatePanel.sourceSignals?.ids?.length && <span>{alternatePanel.sourceSignals.ids.length} media ID{alternatePanel.sourceSignals.ids.length === 1 ? "" : "s"}</span>}
-                {!!alternatePanel.sourceSignals?.filenames?.length && <span>{alternatePanel.sourceSignals.filenames.length} file signature{alternatePanel.sourceSignals.filenames.length === 1 ? "" : "s"}</span>}
-                {alternatePanel.sourceSignals?.transcript && <span>Transcript phrase: {alternatePanel.sourceSignals.transcript.lang || "available"}</span>}
-              </div>
-            )}
+          {!finderJobs.length ? (
+            <div className="alternate-empty">
+              <strong>No version searches queued</strong>
+              <p>Return to Previews, select one or more videos, and click <b>Queue version search</b>.</p>
+            </div>
+          ) : (
+            <div className="finder-job-list">
+              {finderJobs.map((job) => (
+                <article className={`finder-job ${job.state}`} key={job.id}>
+                  <header className="finder-job-header">
+                    <div>
+                      <div className="finder-job-state">{job.state === "queued" ? "Queued" : job.state === "running" ? "Searching…" : job.state === "ready" ? "Complete" : "Failed"}</div>
+                      <h3>{job.source?.title || job.source?.url}</h3>
+                      <div className="alternate-source-summary">
+                        <span>{job.source?.provider || domainFor(job.source?.url || "")}</span>
+                        {formatDuration(job.source?.durationSeconds) && <span>{formatDuration(job.source.durationSeconds)}</span>}
+                        <a href={job.source?.url} target="_blank" rel="noopener noreferrer">Open source ↗</a>
+                      </div>
+                    </div>
+                    <div className="finder-job-actions">
+                      {job.state === "failed" && <button type="button" onClick={() => retryFinderJob(job)}>Retry</button>}
+                      {job.state === "ready" && <button type="button" onClick={() => retryFinderJob(job)}>Search again</button>}
+                      {!(["running"].includes(job.state)) && <button type="button" onClick={() => removeFinderJob(job.id)}>Remove</button>}
+                    </div>
+                  </header>
 
-            {alternatePanel.state === "loading" && (
-              <div className="alternate-loading">
-                <div className="alternate-spinner" />
-                <div>
-                  <strong>Extracting media evidence and searching for versions…</strong>
-                  <p>The finder uses bounded queues and gives unfamiliar public hosts the same inspection path as known providers.</p>
-                </div>
-              </div>
-            )}
+                  {job.state === "queued" && <div className="alternate-loading"><div className="alternate-spinner" /><div><strong>Waiting for a finder worker…</strong><p>Up to {FINDER_CONCURRENCY} version searches run at once.</p></div></div>}
+                  {job.state === "running" && <div className="alternate-loading"><div className="alternate-spinner" /><div><strong>Extracting media evidence and searching broad public indexes…</strong><p>Low-confidence and unknown-host candidates are retained instead of being discarded.</p></div></div>}
+                  {job.state === "failed" && <div className="alternate-empty error-message"><strong>Search failed</strong><p>{job.error || "Version search failed."}</p></div>}
 
-            {alternatePanel.state === "failed" && (
-              <div className="alternate-empty error-message">
-                <strong>Alternate search failed</strong>
-                <p>{alternatePanel.error || "No search results were available."}</p>
-                <button type="button" onClick={findSelectedAlternates}>Try again</button>
-              </div>
-            )}
+                  {job.state === "ready" && (
+                    <>
+                      <div className="alternate-toolbar">
+                        <span>{job.results.length} candidate{job.results.length === 1 ? "" : "s"} shown · {job.candidateCount || 0} discovered · {job.evaluatedCount || 0} evaluated{job.cached ? " · cache" : ""}</span>
+                        <span className="alternate-toolbar-right">{Number.isFinite(job.clientMs) && <span>{job.clientMs} ms</span>}{job.manualSearchUrl && <a href={job.manualSearchUrl} target="_blank" rel="noopener noreferrer">Broader web search ↗</a>}</span>
+                      </div>
 
-            {alternatePanel.state === "ready" && (
-              <>
-                <div className="alternate-toolbar">
-                  <span>
-                    {alternatePanel.results.length} ranked result{alternatePanel.results.length === 1 ? "" : "s"}
-                    {alternatePanel.evaluatedCount ? ` · ${alternatePanel.evaluatedCount} evaluated` : ""}
-                    {alternatePanel.cached ? " · cache" : ""}
-                  </span>
-                  <span className="alternate-toolbar-right">
-                    {Number.isFinite(alternatePanel.clientMs) && <span>{alternatePanel.clientMs} ms</span>}
-                    {alternatePanel.manualSearchUrl && (
-                      <a href={alternatePanel.manualSearchUrl} target="_blank" rel="noopener noreferrer">Broader web search ↗</a>
-                    )}
-                  </span>
-                </div>
-
-                {alternatePanel.results.length ? (
-                  <div className="alternate-results">
-                    {alternatePanel.results.map((candidate) => {
-                      const candidateDuration = formatDuration(candidate.durationSeconds);
-                      const sourceDuration = Number(alternatePanel.source?.durationSeconds) || 0;
-                      const longerBy = sourceDuration && candidate.durationSeconds > sourceDuration
-                        ? formatDuration(candidate.durationSeconds - sourceDuration)
-                        : null;
-                      const alreadyInList = previews.some((item) => item.url.toLowerCase() === candidate.url.toLowerCase());
-                      return (
-                        <article className="alternate-result" key={candidate.url}>
-                          <div className="alternate-thumb">
-                            <LazyThumbnail
-                              sources={candidate.images?.length ? candidate.images : candidate.image ? [candidate.image] : []}
-                              sourceUrl={candidate.url}
-                              title={candidate.title}
+                      {job.results.length ? (
+                        <div className="alternate-results">
+                          {job.results.map((candidate) => (
+                            <FinderResult
+                              key={candidate.url}
+                              job={job}
+                              candidate={candidate}
+                              alreadyInList={previews.some((item) => item.url.toLowerCase() === candidate.url.toLowerCase())}
+                              onAdd={(value) => addAlternate(job.id, value)}
+                              onCompare={(value) => compareCandidate(job, value)}
                             />
-                          </div>
-                          <div className="alternate-result-body">
-                            <div className="alternate-result-topline">
-                              <span className={`relation-badge ${["Likely longer", "Possible longer"].includes(candidate.relation) ? "longer" : candidate.relation === "Likely mirror" ? "mirror" : "possible"}`}>
-                                {candidate.relation}
-                              </span>
-                              <span className="confidence-badge">{candidate.confidence}% confidence</span>
-                              {candidateDuration && <span className="duration-badge">{candidateDuration}</span>}
-                              {longerBy && <span className="longer-by">+{longerBy}</span>}
-                            </div>
-                            <h3>{candidate.title || candidate.url}</h3>
-                            <div className="alternate-domain">{candidate.provider || domainFor(candidate.url)}</div>
-                            {(candidate.overlap?.matchedIds?.length > 0 || candidate.overlap?.matchedFilenames?.length > 0 || candidate.evidence?.length > 0) && (
-                              <div className="candidate-evidence">
-                                {candidate.overlap?.matchedIds?.slice(0, 2).map((value) => <span key={`id-${value}`}>ID match: {value}</span>)}
-                                {candidate.overlap?.matchedFilenames?.slice(0, 2).map((value) => <span key={`file-${value}`}>File match: {value}</span>)}
-                                {candidate.evidence?.slice(0, 2).map((entry, index) => <span key={`${entry.kind}-${index}`}>{entry.kind}</span>)}
-                              </div>
-                            )}
-                            {candidate.description && <p>{candidate.description}</p>}
-                            <div className="alternate-result-actions">
-                              <a href={candidate.url} target="_blank" rel="noopener noreferrer">Open candidate ↗</a>
-                              <button
-                                type="button"
-                                onClick={() => addAlternate(candidate)}
-                                disabled={candidate.added || alreadyInList}
-                              >
-                                {candidate.added || alreadyInList ? "Already in list" : "Add to list"}
-                              </button>
-                            </div>
-                          </div>
-                        </article>
-                      );
-                    })}
-                  </div>
-                ) : (
-                  <div className="alternate-empty">
-                    <strong>No convincing versions found</strong>
-                    <p>Public search indexes may not expose another copy, or this source may not reveal enough stable media/transcript identifiers. Check the discovery diagnostics below.</p>
-                  </div>
-                )}
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="alternate-empty"><strong>No candidates were returned by the public indexes</strong><p>The finder no longer suppresses low-confidence results. If this is empty, check diagnostics: the search engines themselves likely returned zero usable external URLs.</p></div>
+                      )}
 
-                <details className="alternate-diagnostics">
-                  <summary>Search diagnostics</summary>
-                  <p>{alternatePanel.note}</p>
-                  {alternatePanel.tools && (
-                    <div className="alternate-diagnostic-row discovery-tool-row">
-                      <strong>Media tools</strong>
-                      <span>{alternatePanel.tools.installed ? "installed" : "not found"}</span>
-                      <span>{[alternatePanel.tools.ytDlp && "yt-dlp", alternatePanel.tools.deno && "Deno", alternatePanel.tools.ffmpeg && "FFmpeg"].filter(Boolean).join(" · ") || "page probe only"}</span>
-                      <code>{alternatePanel.tools.sourceMode || "—"}{alternatePanel.tools.sourceExtractor ? ` / ${alternatePanel.tools.sourceExtractor}` : ""}</code>
-                    </div>
+                      <details className="alternate-diagnostics">
+                        <summary>Discovery diagnostics</summary>
+                        <p>{job.note}</p>
+                        {job.tools && (
+                          <div className="alternate-diagnostic-row discovery-tool-row">
+                            <strong>Media tools</strong><span>{job.tools.installed ? "installed" : "not found"}</span>
+                            <span>{[job.tools.ytDlp && "yt-dlp", job.tools.deno && "Deno", job.tools.ffmpeg && "FFmpeg"].filter(Boolean).join(" · ") || "page probe only"}</span>
+                            <code>{job.tools.sourceMode || "—"}{job.tools.sourceExtractor ? ` / ${job.tools.sourceExtractor}` : ""}</code>
+                          </div>
+                        )}
+                        {job.sourceSignals?.transcript?.phrase && <div className="alternate-diagnostic-row"><strong>Transcript</strong><span>{job.sourceSignals.transcript.lang || "unknown"}</span><span>{job.sourceSignals.transcript.automatic ? "automatic" : "subtitle"}</span><code>“{job.sourceSignals.transcript.phrase}”</code></div>}
+                        {(job.queryEvidence || []).map((entry, index) => <div className="alternate-diagnostic-row" key={`query-${entry.kind}-${index}`}><strong>{entry.kind}</strong><span>{Math.round((entry.weight || 0) * 100)}% signal</span><span>query</span><code>{entry.query}</code></div>)}
+                        {(job.diagnostics || []).map((entry, index) => <div className="alternate-diagnostic-row" key={`${entry.engine}-${entry.kind}-${index}`}><strong>{entry.engine}</strong><span>{entry.status || "network"}</span><span>{entry.found || 0} results</span><code>{entry.query}</code>{entry.error && <span className="failed-text">{entry.error}</span>}</div>)}
+                      </details>
+                    </>
                   )}
-                  {alternatePanel.sourceSignals?.transcript?.phrase && (
-                    <div className="alternate-diagnostic-row">
-                      <strong>Transcript signal</strong>
-                      <span>{alternatePanel.sourceSignals.transcript.lang || "unknown"}</span>
-                      <span>{alternatePanel.sourceSignals.transcript.automatic ? "automatic" : "subtitle"}</span>
-                      <code>“{alternatePanel.sourceSignals.transcript.phrase}”</code>
-                    </div>
-                  )}
-                  {(alternatePanel.queryEvidence || []).map((entry, index) => (
-                    <div className="alternate-diagnostic-row" key={`query-${entry.kind}-${index}`}>
-                      <strong>{entry.kind}</strong>
-                      <span>{Math.round((entry.weight || 0) * 100)}% signal</span>
-                      <span>query</span>
-                      <code>{entry.query}</code>
-                    </div>
-                  ))}
-                  {(alternatePanel.diagnostics || []).map((entry, index) => (
-                    <div className="alternate-diagnostic-row" key={`${entry.engine}-${index}`}>
-                      <strong>{entry.engine}</strong>
-                      <span>{entry.status || "network"}</span>
-                      <span>{entry.found || 0} results</span>
-                      <code>{entry.query}</code>
-                      {entry.error && <span className="failed-text">{entry.error}</span>}
-                    </div>
-                  ))}
-                </details>
-              </>
-            )}
-          </section>
-        </div>
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
       )}
     </main>
   );

@@ -379,24 +379,24 @@ async function main() {
     attempts.push({ mode: "native", ok: normal.ok, error: normal.error || null, stderr: normal.stderr || null });
     let normalized = normal.ok ? normalizeInfo(normal.info, "native") : null;
 
-    // Never treat an unsupported/unknown provider as terminal. Give the generic extractor a separate chance.
-    if (!normalized || (!normalized.mediaUrls.length && !normalized.id && !normalized.subtitles.length)) {
-      const generic = await runYtDlp(ytDlp, proxy.port, true, deno, ffmpegBin);
-      attempts.push({ mode: "generic", ok: generic.ok, error: generic.error || null, stderr: generic.stderr || null });
-      const genericInfo = generic.ok ? normalizeInfo(generic.info, "generic") : null;
-      if (genericInfo) {
-        if (!normalized) normalized = genericInfo;
-        else {
-          normalized = {
-            ...normalized,
-            genericExtractor: genericInfo.extractor,
-            genericExtractorKey: genericInfo.extractorKey,
-            thumbnails: uniquePublicUrls([normalized.thumbnails, genericInfo.thumbnails]).slice(0, 10),
-            mediaUrls: uniquePublicUrls([normalized.mediaUrls, genericInfo.mediaUrls]).slice(0, 20),
-            subtitles: [...normalized.subtitles, ...genericInfo.subtitles].slice(0, 30),
-            genericId: genericInfo.id || genericInfo.displayId || null
-          };
-        }
+    // Always give the generic extractor a separate chance, even when a dedicated extractor succeeds.
+    // Some dedicated extractors expose only canonical metadata while the generic path reveals embeds,
+    // manifest URLs, or IDs useful for mirror discovery. Generic extraction is additive, not a gate.
+    const generic = await runYtDlp(ytDlp, proxy.port, true, deno, ffmpegBin);
+    attempts.push({ mode: "generic", ok: generic.ok, error: generic.error || null, stderr: generic.stderr || null });
+    const genericInfo = generic.ok ? normalizeInfo(generic.info, "generic") : null;
+    if (genericInfo) {
+      if (!normalized) normalized = genericInfo;
+      else {
+        normalized = {
+          ...normalized,
+          genericExtractor: genericInfo.extractor,
+          genericExtractorKey: genericInfo.extractorKey,
+          thumbnails: uniquePublicUrls([normalized.thumbnails, genericInfo.thumbnails]).slice(0, 14),
+          mediaUrls: uniquePublicUrls([normalized.mediaUrls, genericInfo.mediaUrls]).slice(0, 32),
+          subtitles: [...normalized.subtitles, ...genericInfo.subtitles].slice(0, 40),
+          genericId: genericInfo.id || genericInfo.displayId || null
+        };
       }
     }
 

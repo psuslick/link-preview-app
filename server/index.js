@@ -34,8 +34,8 @@ const CACHE_MAX_ENTRIES = 1500;
 // Alternate/mirror discovery is intentionally small and user-triggered. It reuses
 // the same bounded network stack as previews instead of becoming a second crawler.
 const ALTERNATE_SEARCH_TIMEOUT_MS = 8000;
-const ALTERNATE_SEARCH_MAX_RESULTS = 12;
-const ALTERNATE_CANDIDATE_PREVIEW_LIMIT = 12;
+const ALTERNATE_SEARCH_MAX_RESULTS = 30;
+const ALTERNATE_CANDIDATE_PREVIEW_LIMIT = 36;
 const ALTERNATE_CANDIDATE_CONCURRENCY = 3;
 const ALTERNATE_CACHE_TTL_MS = 10 * 60 * 1000;
 const ALTERNATE_CACHE_MAX_ENTRIES = 100;
@@ -43,7 +43,8 @@ const ALTERNATE_CACHE_MAX_ENTRIES = 100;
 // Browser fallback is deliberately much narrower than metadata fetching.
 const BROWSER_FALLBACK_LIMIT = 1;
 const BROWSER_PROXY_NETWORK_LIMIT = 8;
-const BROWSER_FALLBACK_TIMEOUT_MS = 12_000;
+const BROWSER_FALLBACK_TIMEOUT_MS = 7_000;
+const BROWSER_CHALLENGE_COOLDOWN_MS = 10 * 60 * 1000;
 const BROWSER_DOM_LIMIT_BYTES = 2 * 1024 * 1024;
 const BROWSER_HTTP_RESOURCE_LIMIT_BYTES = 4 * 1024 * 1024;
 
@@ -76,10 +77,13 @@ class Semaphore {
 const globalNetwork = new Semaphore(GLOBAL_NETWORK_LIMIT);
 const imageNetwork = new Semaphore(IMAGE_NETWORK_LIMIT);
 const browserFallback = new Semaphore(BROWSER_FALLBACK_LIMIT);
+const frameCompare = new Semaphore(1);
 const hostSemaphores = new Map();
 const hostThrottleState = new Map();
 const previewCache = new Map();
 const alternateCache = new Map();
+const browserChallengeHosts = new Map();
+const authorizedBrowserProfiles = new Map();
 
 function getHostSemaphore(hostname) {
   const key = hostname.toLowerCase();
@@ -823,6 +827,82 @@ function cacheSet(key, value) {
   while (previewCache.size > CACHE_MAX_ENTRIES) previewCache.delete(previewCache.keys().next().value);
 }
 
+function detectChallengePage(html = "", status = null) {
+  const text = String(html || "");
+  if (!text) return null;
+  const lower = text.toLowerCase();
+  const titleMatch = text.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  const title = (titleMatch?.[1] || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  const titleLower = title.toLowerCase();
+  const strongTitle = [
+    "just a moment",
+    "attention required",
+    "verify you are human",
+    "checking your browser",
+    "security check"
+  ].some((needle) => titleLower.includes(needle));
+  const strongBody = [
+    "cf-chl-",
+    "challenge-platform",
+    "cf-turnstile",
+    "enable javascript and cookies to continue",
+    "checking if the site connection is secure",
+    "performing security verification",
+    "verify you are human"
+  ].some((needle) => lower.includes(needle));
+  const accessDenied = titleLower.includes("access denied") && Number(status) >= 400;
+  if (!strongTitle && !strongBody && !accessDenied) return null;
+  return {
+    title: title || null,
+    provider: lower.includes("cloudflare") || lower.includes("cf-chl-") ? "cloudflare" : null
+  };
+}
+
+function challengeCircuitFor(rawUrl) {
+  try {
+    const host = new URL(rawUrl).hostname.toLowerCase();
+    const until = browserChallengeHosts.get(host) || 0;
+    if (until <= Date.now()) { browserChallengeHosts.delete(host); return null; }
+    return { host, until };
+  } catch { return null; }
+}
+
+function markChallengeCircuit(rawUrl) {
+  try {
+    const host = new URL(rawUrl).hostname.toLowerCase();
+    browserChallengeHosts.set(host, Date.now() + BROWSER_CHALLENGE_COOLDOWN_MS);
+  } catch {}
+}
+
+function authorizationHost(rawUrl) {
+  try { return new URL(rawUrl).hostname.toLowerCase(); } catch { return null; }
+}
+
+function authorizationEntryFor(rawUrl) {
+  const host = authorizationHost(rawUrl);
+  return host ? authorizedBrowserProfiles.get(host) || null : null;
+}
+
+function authorizationProfileFor(rawUrl) {
+  const entry = authorizationEntryFor(rawUrl);
+  return entry?.status === "ready" ? entry.path : null;
+}
+
+async function ensureAuthorizationProfile(rawUrl) {
+  const host = authorizationHost(rawUrl);
+  if (!host) throw new Error("invalid_url");
+  const existing = authorizedBrowserProfiles.get(host);
+  if (existing) return existing;
+  const safeHost = host.replace(/[^a-z0-9._-]+/gi, "_").slice(0, 120);
+  const root = path.join(os.tmpdir(), "link-preview-authorized-edge");
+  await fs.mkdir(root, { recursive: true });
+  const profile = path.join(root, safeHost);
+  await fs.mkdir(profile, { recursive: true });
+  const entry = { path: profile, status: "idle", startedAt: null, finishedAt: null };
+  authorizedBrowserProfiles.set(host, entry);
+  return entry;
+}
+
 function mergeMetadata(primary, secondary, pageUrl) {
   const images = uniqueUrls([primary?.images || [], primary?.image, secondary?.images || [], secondary?.image], pageUrl);
   return {
@@ -858,10 +938,23 @@ function isLikelyMediaPath(pathname = "") {
 
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const EDGE_HELPER_PATH = path.join(SERVER_DIR, "edge-fallback.js");
+const EDGE_AUTH_HELPER_PATH = path.join(SERVER_DIR, "edge-authorize.js");
+const FRAME_COMPARE_HELPER_PATH = path.join(SERVER_DIR, "media-frame-compare.js");
 
 async function renderMetadataWithEdge(targetUrl) {
+  const authProfile = authorizationProfileFor(targetUrl);
+  const openCircuit = challengeCircuitFor(targetUrl);
+  if (openCircuit && !authProfile) {
+    return { ok: false, error: "edge_challenge_circuit_open", challenge: true };
+  }
+
   const release = await browserFallback.acquire();
   try {
+    const activeProfile = authorizationProfileFor(targetUrl);
+    const recheckCircuit = challengeCircuitFor(targetUrl);
+    if (recheckCircuit && !activeProfile) {
+      return { ok: false, error: "edge_challenge_circuit_open", challenge: true };
+    }
     const helperResult = await new Promise((resolve) => {
       const child = spawn(
         process.execPath,
@@ -871,7 +964,8 @@ async function renderMetadataWithEdge(targetUrl) {
           String(BROWSER_FALLBACK_TIMEOUT_MS),
           String(BROWSER_PROXY_NETWORK_LIMIT),
           String(PER_HOST_NETWORK_LIMIT),
-          String(BROWSER_DOM_LIMIT_BYTES)
+          String(BROWSER_DOM_LIMIT_BYTES),
+          activeProfile || ""
         ],
         { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] }
       );
@@ -939,7 +1033,10 @@ async function renderMetadataWithEdge(targetUrl) {
             finish({
               ok: false,
               error: parsed.error || `edge_helper_exit_${code ?? "unknown"}`,
-              diagnostic: parsed.diagnostic || Buffer.concat(stderr).toString("utf8").slice(0, 1000)
+              diagnostic: parsed.diagnostic || Buffer.concat(stderr).toString("utf8").slice(0, 1000),
+              challenge: Boolean(parsed.challenge),
+              challengeTitle: parsed.challengeTitle || null,
+              challengeProvider: parsed.challengeProvider || null
             });
             return;
           }
@@ -954,7 +1051,10 @@ async function renderMetadataWithEdge(targetUrl) {
       });
     });
 
-    if (!helperResult.ok) return helperResult;
+    if (!helperResult.ok) {
+      if (helperResult.challenge) markChallengeCircuit(targetUrl);
+      return helperResult;
+    }
     const html = String(helperResult.html || "");
     if (!html.trim()) return { ok: false, error: "edge_empty_dom" };
     const metadata = extractHtmlMetadata(html, targetUrl);
@@ -1032,7 +1132,9 @@ async function createPreview(rawUrl, { allowBrowserFallback = true } = {}) {
   }
 
   const htmlResult = await fetchBounded(targetUrl, { kind: "html" });
-  const httpMetadata = htmlResult.ok
+  const httpChallenge = detectChallengePage(htmlResult.text, htmlResult.status);
+  if (httpChallenge) markChallengeCircuit(targetUrl);
+  const httpMetadata = htmlResult.ok && !httpChallenge
     ? extractHtmlMetadata(htmlResult.text, htmlResult.finalUrl || targetUrl)
     : null;
   let metadata = httpMetadata || {
@@ -1063,9 +1165,14 @@ async function createPreview(rawUrl, { allowBrowserFallback = true } = {}) {
   let browserError = null;
   let browserDiagnostic = null;
   let browserExtractorStats = null;
+  let browserChallenge = false;
 
   const restrictedStatus = [401, 403, 405, 406, 418].includes(htmlResult.status);
-  const needsBrowserFallback = restrictedStatus || (htmlResult.ok && !metadata.image);
+  const authorizedProfile = authorizationProfileFor(targetUrl);
+  const needsBrowserFallback = Boolean(
+    (httpChallenge && authorizedProfile) ||
+    (!httpChallenge && (restrictedStatus || (htmlResult.ok && !metadata.image)))
+  );
   const shouldTryBrowser = allowBrowserFallback && needsBrowserFallback;
 
   if (shouldTryBrowser) {
@@ -1084,6 +1191,7 @@ async function createPreview(rawUrl, { allowBrowserFallback = true } = {}) {
     } else {
       browserError = browser.error || "edge_fallback_failed";
       browserDiagnostic = browser.diagnostic || null;
+      browserChallenge = Boolean(browser.challenge);
     }
   }
 
@@ -1094,11 +1202,13 @@ async function createPreview(rawUrl, { allowBrowserFallback = true } = {}) {
   }
 
   const images = uniqueUrls([metadata.images, metadata.image], targetUrl);
-  const warning = !htmlResult.ok
-    ? htmlResult.error || `upstream_status_${htmlResult.status}`
-    : browserError && !images.length
-      ? browserError
-      : null;
+  const warning = httpChallenge && !usedBrowserFallback
+    ? "challenge_page_detected"
+    : !htmlResult.ok
+      ? htmlResult.error || `upstream_status_${htmlResult.status}`
+      : browserError && !images.length
+        ? browserError
+        : null;
 
   const value = {
     url: targetUrl,
@@ -1122,10 +1232,14 @@ async function createPreview(rawUrl, { allowBrowserFallback = true } = {}) {
     elapsedMs: Date.now() - started,
     cached: false,
     warning,
+    authorizedBrowserProfile: Boolean(authorizedProfile),
     browserFallback: usedBrowserFallback,
     browserFallbackAttempted,
     browserFallbackError: browserError,
     browserFallbackDiagnostic: browserDiagnostic,
+    challengeDetected: Boolean((httpChallenge && !usedBrowserFallback) || browserChallenge),
+    challengeProvider: httpChallenge?.provider || null,
+    browserFallbackSkippedReason: httpChallenge && !authorizedProfile ? "challenge_page_detected" : null,
     needsBrowserFallback: needsBrowserFallback && !allowBrowserFallback,
     extractorStats: httpMetadata?.extractorStats || null,
     browserExtractorStats
@@ -1271,6 +1385,22 @@ function parseDuckDuckGoResults(html) {
     seen.add(key);
     results.push({ url, searchTitle: title || null, snippet: snippet || null, engine: "DuckDuckGo" });
   });
+  // Search markup changes occasionally. Preserve recall by accepting any external public
+  // result link when the structured result selector yields little or nothing.
+  if (results.length < 3) {
+    $("a[href]").each((_, element) => {
+      if (results.length >= 30) return false;
+      const anchor = $(element);
+      const title = anchor.text().replace(/\s+/g, " ").trim();
+      if (title.length < 3) return;
+      const url = unwrapSearchResultHref(anchor.attr("href"), "https://html.duckduckgo.com/html/");
+      if (!url) return;
+      const key = canonicalDiscoveryUrl(url).toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+      results.push({ url, searchTitle: title || null, snippet: null, engine: "DuckDuckGo" });
+    });
+  }
   return results;
 }
 
@@ -1289,7 +1419,54 @@ function parseBingResults(html) {
     seen.add(key);
     results.push({ url, searchTitle: title || null, snippet: snippet || null, engine: "Bing" });
   });
+  if (results.length < 3) {
+    $("a[href]").each((_, element) => {
+      if (results.length >= 30) return false;
+      const anchor = $(element);
+      const title = anchor.text().replace(/\s+/g, " ").trim();
+      if (title.length < 3) return;
+      const url = unwrapSearchResultHref(anchor.attr("href"), "https://www.bing.com/search");
+      if (!url) return;
+      const key = canonicalDiscoveryUrl(url).toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+      results.push({ url, searchTitle: title || null, snippet: null, engine: "Bing" });
+    });
+  }
   return results;
+}
+
+function parseMojeekResults(html) {
+  const $ = cheerio.load(html || "");
+  const results = [];
+  const seen = new Set();
+  $("a[href]").each((_, element) => {
+    if (results.length >= 30) return false;
+    const anchor = $(element);
+    const title = anchor.text().replace(/\s+/g, " ").trim();
+    if (title.length < 3) return;
+    let url;
+    try {
+      url = new URL(anchor.attr("href"), "https://www.mojeek.com/search");
+      const host = url.hostname.toLowerCase().replace(/^www\./, "");
+      if (host === "mojeek.com" || host.endsWith(".mojeek.com")) return;
+      url = validateUrl(url.toString());
+    } catch { return; }
+    const key = canonicalDiscoveryUrl(url.toString()).toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    const parent = anchor.closest("li,article,div");
+    const snippet = parent.find("p").first().text().replace(/\s+/g, " ").trim();
+    results.push({ url: url.toString(), searchTitle: title || null, snippet: snippet || null, engine: "Mojeek" });
+  });
+  return results;
+}
+
+async function searchMojeek(query) {
+  const url = `https://www.mojeek.com/search?q=${encodeURIComponent(query)}&hp=minimal&autocomp=0`;
+  const response = await fetchBounded(url, { kind: "search", timeoutMs: ALTERNATE_SEARCH_TIMEOUT_MS, retries: 1 });
+  if (!response.ok) return { ok: false, status: response.status, results: [], error: response.error || `search_status_${response.status}` };
+  return { ok: true, status: response.status, results: parseMojeekResults(response.text) };
 }
 
 async function searchDuckDuckGo(query) {
@@ -1334,9 +1511,10 @@ function normalizeSignal(value) {
 
 function signalIdCandidate(value) {
   const cleaned = String(value || "").trim().replace(/^['"]|['"]$/g, "");
-  if (cleaned.length < 5 || cleaned.length > 64) return null;
-  if (/^(?:https?|www|video|videos|watch|embed|player|media|stream|master|index|playlist|manifest)$/i.test(cleaned)) return null;
-  if (!/[a-z]/i.test(cleaned) || !/\d/.test(cleaned)) return null;
+  if (cleaned.length < 4 || cleaned.length > 96) return null;
+  if (/^(?:https?|www|video|videos|watch|embed|player|media|stream|master|index|playlist|manifest|assets?|static|content|uploads?)$/i.test(cleaned)) return null;
+  if (!/[a-z0-9]/i.test(cleaned)) return null;
+  if (/^[0-9]{1,3}$/.test(cleaned)) return null;
   return cleaned;
 }
 
@@ -1508,7 +1686,7 @@ async function transcriptPhraseFromTool(toolResult) {
 
 const MEDIA_TOOL_HELPER_PATH = path.join(SERVER_DIR, "media-tool-probe.js");
 const MEDIA_TOOL_TIMEOUT_MS = 16_000;
-const MEDIA_TOOL_CANDIDATE_LIMIT = 6;
+const MEDIA_TOOL_CANDIDATE_LIMIT = 10;
 const MEDIA_TOOL_CANDIDATE_CONCURRENCY = 2;
 
 async function findToolsDir() {
@@ -1568,6 +1746,72 @@ async function runMediaToolProbe(targetUrl, toolsDir) {
   });
 }
 
+async function launchAuthorizationBrowser(targetUrl) {
+  const normalized = validateUrl(targetUrl).toString();
+  const host = authorizationHost(normalized);
+  const entry = await ensureAuthorizationProfile(normalized);
+  if (entry.status === "authorizing") {
+    return { ok: true, host, status: "authorizing", alreadyOpen: true };
+  }
+  entry.status = "authorizing";
+  entry.startedAt = Date.now();
+  entry.finishedAt = null;
+  const child = spawn(process.execPath, [EDGE_AUTH_HELPER_PATH, normalized, entry.path], {
+    windowsHide: false,
+    detached: false,
+    stdio: "ignore"
+  });
+  child.unref();
+  child.once("error", () => {
+    entry.status = "failed";
+    entry.finishedAt = Date.now();
+  });
+  child.once("close", (code) => {
+    entry.status = code === 0 ? "ready" : "failed";
+    entry.finishedAt = Date.now();
+    if (code === 0 && host) browserChallengeHosts.delete(host);
+  });
+  return { ok: true, host, status: "authorizing", alreadyOpen: false };
+}
+
+async function runFrameComparison(sourceUrl, candidateUrl) {
+  const toolsDir = await findToolsDir();
+  if (!toolsDir) return { ok: false, error: "tools_not_installed" };
+  const release = await frameCompare.acquire();
+  try {
+    return await new Promise((resolve) => {
+      const child = spawn(process.execPath, [
+        FRAME_COMPARE_HELPER_PATH,
+        validateUrl(sourceUrl).toString(),
+        validateUrl(candidateUrl).toString(),
+        toolsDir,
+        "45000"
+      ], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+      const stdout = [];
+      const stderr = [];
+      let outBytes = 0;
+      let errBytes = 0;
+      let settled = false;
+      const finish = (value) => { if (settled) return; settled = true; clearTimeout(timer); resolve(value); };
+      const terminate = () => {
+        if (process.platform === "win32" && child.pid) spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+        else child.kill("SIGKILL");
+      };
+      const timer = setTimeout(() => { terminate(); finish({ ok: false, error: "frame_compare_helper_timeout" }); }, 52000);
+      child.stdout.on("data", (chunk) => { outBytes += chunk.length; if (outBytes <= 1024 * 1024) stdout.push(chunk); });
+      child.stderr.on("data", (chunk) => { errBytes += chunk.length; if (errBytes <= 64 * 1024) stderr.push(chunk); });
+      child.once("error", (error) => finish({ ok: false, error: error.message }));
+      child.once("close", () => {
+        if (settled) return;
+        try { finish(JSON.parse(Buffer.concat(stdout).toString("utf8"))); }
+        catch { finish({ ok: false, error: "invalid_frame_compare_response", diagnostic: Buffer.concat(stderr).toString("utf8").slice(-1500) }); }
+      });
+    });
+  } finally {
+    release();
+  }
+}
+
 async function probePublicPageSignals(targetUrl) {
   const response = await fetchBounded(targetUrl, { kind: "media-page", timeoutMs: 8000, retries: 1 });
   if (!response.ok) return { ok: false, status: response.status, error: response.error || `status_${response.status}`, metadata: null, signals: { ids: [], filenames: [], mediaUrls: [], embedUrls: [] } };
@@ -1605,16 +1849,26 @@ function buildDiscoveryQueries(source, signals, transcript) {
   };
   const title = cleanSearchTitle(source.title);
   if (transcript?.phrase) add("transcript", `"${transcript.phrase.replace(/"/g, " ")}"`, 1.0, transcript.phrase);
-  for (const id of (signals.ids || []).slice(0, 2)) add("media-id", `"${id}" video`, 0.98, id);
-  for (const filename of (signals.filenames || []).slice(0, 2)) add("media-filename", `"${filename}"`, 0.94, filename);
+  for (const id of (signals.ids || []).slice(0, 4)) {
+    add("media-id", `"${String(id).replace(/"/g, " ")}"`, 0.98, id);
+    add("media-id-video", `"${String(id).replace(/"/g, " ")}" video`, 0.94, id);
+  }
+  for (const filename of (signals.filenames || []).slice(0, 4)) add("media-filename", `"${String(filename).replace(/"/g, " ")}"`, 0.94, filename);
   const descriptionPhrase = distinctivePhrase(source.description, 9);
   if (descriptionPhrase) add("description", `"${descriptionPhrase.replace(/"/g, " ")}"`, 0.82, descriptionPhrase);
   if (source.uploader && title) add("uploader-title", `"${String(source.uploader).replace(/"/g, " ")}" "${title.replace(/"/g, " ")}"`, 0.86, source.uploader);
   if (title) {
-    add("title", `"${title.replace(/"/g, " ")}" video`, 0.74, title);
-    add("longer-title", `"${title.replace(/"/g, " ")}" full complete extended uncut`, 0.7, title);
+    add("title-exact", `"${title.replace(/"/g, " ")}"`, 0.78, title);
+    add("title-video", `"${title.replace(/"/g, " ")}" video`, 0.74, title);
+    add("longer-title", `"${title.replace(/"/g, " ")}" full complete extended uncut`, 0.70, title);
   }
-  return queries.slice(0, 6);
+  try {
+    const sourceUrl = new URL(source.url);
+    const pathBits = sourceUrl.pathname.split("/").filter(Boolean).map((part) => decodeURIComponent(part).replace(/\.[a-z0-9]{2,6}$/i, "")).filter((part) => part.length >= 4);
+    for (const bit of pathBits.slice(-2)) add("url-path", `"${bit.replace(/"/g, " ")}"`, 0.55, bit);
+    if (!queries.length) add("url-fallback", `"${sourceUrl.hostname}${sourceUrl.pathname}"`, 0.35, sourceUrl.pathname);
+  } catch {}
+  return queries.slice(0, 10);
 }
 
 function classifyEvidenceAlternate(source, candidate, similarity, overlap, evidenceWeight) {
@@ -1706,16 +1960,25 @@ async function findAlternates({ url, title, description, provider, durationSecon
     }
   };
 
-  for (const querySpec of queries) {
+  for (let queryIndex = 0; queryIndex < queries.length; queryIndex += 1) {
+    const querySpec = queries[queryIndex];
     const ddg = await searchDuckDuckGo(querySpec.query);
     searchDiagnostics.push({ engine: "DuckDuckGo", kind: querySpec.kind, query: querySpec.query, status: ddg.status || 0, error: ddg.error || null, found: ddg.results.length });
     addResults(ddg.results, querySpec);
-    if (!ddg.ok || ddg.results.length < 2) {
+
+    // For the strongest evidence queries, search both engines even when the first succeeds.
+    // This deliberately favors recall: obscure mirrors often exist in only one public index.
+    if (queryIndex < 5 || !ddg.ok || ddg.results.length < 3) {
       const bing = await searchBing(querySpec.query);
       searchDiagnostics.push({ engine: "Bing", kind: querySpec.kind, query: querySpec.query, status: bing.status || 0, error: bing.error || null, found: bing.results.length });
       addResults(bing.results, querySpec);
     }
-    if (gatheredMap.size >= 36) break;
+    if (queryIndex < 4 || gatheredMap.size < 8) {
+      const mojeek = await searchMojeek(querySpec.query);
+      searchDiagnostics.push({ engine: "Mojeek", kind: querySpec.kind, query: querySpec.query, status: mojeek.status || 0, error: mojeek.error || null, found: mojeek.results.length });
+      addResults(mojeek.results, querySpec);
+    }
+    if (gatheredMap.size >= 80) break;
   }
 
   const gathered = [...gatheredMap.values()];
@@ -1726,7 +1989,7 @@ async function findAlternates({ url, title, description, provider, durationSecon
       return { ...item, evidenceWeight, searchSimilarity, initialScore: evidenceWeight * 60 + searchSimilarity * 30 + Math.min(10, item.evidence.length * 2) };
     })
     .sort((a, b) => b.initialScore - a.initialScore)
-    .slice(0, 18);
+    .slice(0, ALTERNATE_CANDIDATE_PREVIEW_LIMIT);
 
   const basicCandidates = await runLimited(prioritized, ALTERNATE_CANDIDATE_CONCURRENCY, async (item) => {
     const page = await probePublicPageSignals(item.url);
@@ -1788,7 +2051,6 @@ async function findAlternates({ url, title, description, provider, durationSecon
   const results = candidates
     .filter(Boolean)
     .filter((candidate) => canonicalDiscoveryUrl(candidate.url).toLowerCase() !== sourceKey)
-    .filter((candidate) => candidate.confidence >= 28)
     .sort((a, b) => {
       const rank = (value) => value === "Likely longer" ? 5 : value === "Likely mirror" ? 4 : value === "Possible longer" ? 3 : value === "Possible match" ? 2 : 1;
       return rank(b.relation) - rank(a.relation) || b.confidence - a.confidence || b.overlap.score - a.overlap.score;
@@ -1823,7 +2085,7 @@ async function findAlternates({ url, title, description, provider, durationSecon
     manualSearchUrl: queries[0] ? `https://duckduckgo.com/?q=${encodeURIComponent(queries[0].query)}` : null,
     cached: false,
     note: toolsDir
-      ? "Discovery is host-agnostic: yt-dlp native and forced-generic extraction, raw page/embed/media identifiers, optional subtitle phrases, and general web search are combined. Unknown hosts are not rejected. Results are evidence-ranked; frame-level identity verification is not yet performed."
+      ? "Discovery is host-agnostic: yt-dlp native and forced-generic extraction, raw page/embed/media identifiers, optional subtitle phrases, and general web search are combined. Unknown hosts are not rejected. Results are evidence-ranked; low-confidence candidates are retained instead of rejected. Frame comparison is available on demand for individual candidates."
       : "Portable media tools were not found, so discovery used host-agnostic page/media signatures and general web search only. Install the Link Preview tools package for yt-dlp generic extraction and subtitle-assisted discovery."
   };
   alternateCacheSet(cacheKey, value);
@@ -1895,7 +2157,7 @@ app.use(express.json({ limit: "1mb" }));
 app.get("/api/status", (_req, res) => {
   res.json({
     ok: true,
-    version: "2.2.1",
+    version: "2.4.0",
     limits: {
       globalNetwork: GLOBAL_NETWORK_LIMIT,
       perHostNetwork: PER_HOST_NETWORK_LIMIT,
@@ -1969,6 +2231,47 @@ app.get("/api/image", async (req, res) => {
   }
 });
 
+app.post("/api/authorize-host", async (req, res) => {
+  const targetUrl = req.body?.url;
+  if (!targetUrl || typeof targetUrl !== "string") return res.status(400).json({ error: "missing_url" });
+  try {
+    const result = await launchAuthorizationBrowser(targetUrl.trim());
+    return res.json({
+      ...result,
+      note: "A visible Edge window was opened inside Windows Sandbox through the public-network safety proxy. Complete the site's challenge, then close that Edge window. The profile remains only for this Sandbox session."
+    });
+  } catch (error) {
+    return res.status(400).json({ error: error?.message || "authorization_launch_failed" });
+  }
+});
+
+app.get("/api/authorization-status", (req, res) => {
+  const targetUrl = req.query.url;
+  if (!targetUrl || typeof targetUrl !== "string") return res.status(400).json({ error: "missing_url" });
+  try {
+    validateUrl(targetUrl);
+    const host = authorizationHost(targetUrl);
+    const entry = authorizationEntryFor(targetUrl);
+    return res.json({ host, status: entry?.status || "none", ready: entry?.status === "ready" });
+  } catch (error) {
+    return res.status(400).json({ error: error?.message || "authorization_status_failed" });
+  }
+});
+
+app.post("/api/compare-video", async (req, res) => {
+  const sourceUrl = req.body?.sourceUrl;
+  const candidateUrl = req.body?.candidateUrl;
+  if (!sourceUrl || !candidateUrl || typeof sourceUrl !== "string" || typeof candidateUrl !== "string") {
+    return res.status(400).json({ error: "missing_compare_url" });
+  }
+  try {
+    const result = await runFrameComparison(sourceUrl.trim(), candidateUrl.trim());
+    return res.status(result.ok ? 200 : 422).json(result);
+  } catch (error) {
+    return res.status(400).json({ error: error?.message || "frame_compare_failed" });
+  }
+});
+
 app.post("/api/alternates", async (req, res) => {
   const sourceUrl = req.body?.url;
   if (!sourceUrl || typeof sourceUrl !== "string") return res.status(400).json({ error: "missing_url" });
@@ -1999,7 +2302,7 @@ app.get("/api/preview", previewHandler);
 app.post("/api/preview", previewHandler);
 
 app.listen(PORT, "127.0.0.1", () => {
-  console.log(`Video preview engine v2.2.1 listening on http://127.0.0.1:${PORT}`);
+  console.log(`Video preview engine v2.4.0 listening on http://127.0.0.1:${PORT}`);
   console.log(`Network limits: ${GLOBAL_NETWORK_LIMIT} global / ${PER_HOST_NETWORK_LIMIT} per host.`);
   console.log(`Edge fallback: ${BROWSER_FALLBACK_LIMIT} isolated helper worker; helper proxy limit ${BROWSER_PROXY_NETWORK_LIMIT}.`);
 });
