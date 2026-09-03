@@ -223,6 +223,9 @@ function FinderResult({ job, candidate, alreadyInList, onAdd, onCompare, privacy
             {!candidate.strongIdentity && " · not identity evidence"}
           </div>
         )}
+        {candidate.subject && (
+          <div className="search-support-note">Subject relevance: {Math.round((candidate.subject.score || 0) * 100)}%{candidate.subject.matched?.length ? ` · anchors: ${candidate.subject.matched.slice(0, 5).join(", ")}` : ""}</div>
+        )}
         {candidate.description && <p>{candidate.description}</p>}
 
         {comparison?.state === "loading" && (
@@ -304,7 +307,8 @@ function App() {
   function patchFinderCandidate(jobId, candidateUrl, patch) {
     setFinderJobs((current) => current.map((job) => job.id !== jobId ? job : {
       ...job,
-      results: (job.results || []).map((candidate) => candidate.url === candidateUrl ? { ...candidate, ...patch } : candidate)
+      results: (job.results || []).map((candidate) => candidate.url === candidateUrl ? { ...candidate, ...patch } : candidate),
+      lowRelevanceResults: (job.lowRelevanceResults || []).map((candidate) => candidate.url === candidateUrl ? { ...candidate, ...patch } : candidate)
     }));
   }
 
@@ -414,7 +418,7 @@ function App() {
     );
     const jobs = sources.filter((source) => !activeSourceUrls.has(source.url.toLowerCase())).map((source, index) => ({
       id: `finder-${now}-${index}-${Math.random().toString(36).slice(2, 7)}`,
-      source: { ...source }, privacy: { ...privacy }, state: "queued", results: [], error: null, queuedAt: Date.now(),
+      source: { ...source }, privacy: { ...privacy }, state: "queued", results: [], lowRelevanceResults: [], error: null, queuedAt: Date.now(),
       note: null, diagnostics: [], queryEvidence: [], candidateCount: 0, rawDiscovered: [], rawDiscoveredCount: 0, evaluatedCount: 0, toolEvaluatedCount: 0, batchCompareState: "idle", batchCompareProgress: null
     }));
     if (!jobs.length) { setCopyStatus("Selected videos are already queued/running"); setTimeout(() => setCopyStatus(""), 2200); return; }
@@ -434,6 +438,7 @@ function App() {
       state: "ready", finishedAt: Date.now(),
       source: { ...job.source, ...(result.source || {}) },
       results: Array.isArray(result.results) ? result.results : [],
+      lowRelevanceResults: Array.isArray(result.lowRelevanceResults) ? result.lowRelevanceResults : [],
       note: result.note || null,
       diagnostics: result.searchDiagnostics || [],
       candidateCount: result.candidateCount || 0,
@@ -466,7 +471,7 @@ function App() {
   }, [finderJobs]);
 
   function retryFinderJob(job) {
-    patchFinderJob(job.id, { state: "queued", privacy: { ...privacy }, results: [], rawDiscovered: [], rawDiscoveredCount: 0, error: null, diagnostics: [], queryEvidence: [], cached: false, batchCompareState: "idle", batchCompareProgress: null });
+    patchFinderJob(job.id, { state: "queued", privacy: { ...privacy }, results: [], lowRelevanceResults: [], rawDiscovered: [], rawDiscoveredCount: 0, error: null, diagnostics: [], queryEvidence: [], cached: false, batchCompareState: "idle", batchCompareProgress: null });
   }
   function removeFinderJob(id) { setFinderJobs((current) => current.filter((job) => job.id !== id)); }
   function clearCompletedFinderJobs() { setFinderJobs((current) => current.filter((job) => ["queued", "running"].includes(job.state))); }
@@ -544,7 +549,7 @@ function App() {
     }
     patchPreview(preview.id, {
       authorizationState: "authorizing",
-      authorizationMessage: `Reusable site session opened for ${siteKeyFor(preview.url)}. If you see an Accept/consent prompt, refresh or accept it until the real video is visible, then click Retry once. The session will be reused automatically for other previews from this site.`
+      authorizationMessage: `Reusable site session opened for ${siteKeyFor(preview.url)}. The app will try one automatic refresh and recognized cookie/privacy consent buttons. CAPTCHA/challenge, age confirmation, login, or other access-control prompts remain manual. Once the real video is visible, click Retry once; the session is reused for the site.`
     });
   }
 
@@ -822,7 +827,7 @@ function App() {
                   {job.state === "ready" && (
                     <>
                       <div className="alternate-toolbar">
-                        <span>{job.results.length} shown · {job.rawDiscoveredCount || job.candidateCount || 0} raw discovered · {job.evaluatedCount || 0} page-inspected · {job.toolEvaluatedCount || 0} tool-probed{job.cached ? " · cache" : ""}</span>
+                        <span>{job.results.length} related · {(job.lowRelevanceResults || []).length} low relevance · {job.rawDiscoveredCount || job.candidateCount || 0} raw discovered · {job.evaluatedCount || 0} page-inspected · {job.toolEvaluatedCount || 0} tool-probed{job.cached ? " · cache" : ""}</span>
                         <span className="alternate-toolbar-right">
                           {job.privacy?.sampleComparison && (
                             <button type="button" className="compare-top-button" onClick={() => compareTopCandidates(job)} disabled={job.batchCompareState === "running" || !job.results.length}>
@@ -851,7 +856,27 @@ function App() {
                           ))}
                         </div>
                       ) : (
-                        <div className="alternate-empty"><strong>No inspected candidates to show</strong><p>Open Raw discovered results below. If raw URLs exist, discovery worked but candidate inspection failed or did not complete; if raw is empty, the enabled search indexes returned no usable public URLs.</p></div>
+                        <div className="alternate-empty"><strong>No subject-related candidates ranked yet</strong><p>Low-relevance inspected results and Raw discovered results remain available below, so nothing is silently discarded.</p></div>
+                      )}
+
+                      {(job.lowRelevanceResults || []).length > 0 && (
+                        <details className="raw-discovery low-relevance-results">
+                          <summary>Low-relevance inspected results ({job.lowRelevanceResults.length})</summary>
+                          <p>These URLs were real search results and were inspected, but they did not share enough subject/title/media evidence to appear in the primary list. They are retained for transparency and renamed-mirror edge cases.</p>
+                          <div className="alternate-results">
+                            {job.lowRelevanceResults.map((candidate) => (
+                              <FinderResult
+                                key={`low-${candidate.url}`}
+                                job={job}
+                                candidate={candidate}
+                                alreadyInList={previews.some((item) => item.url.toLowerCase() === candidate.url.toLowerCase())}
+                                onAdd={(value) => addAlternate(job.id, value)}
+                                onCompare={(value) => compareCandidate(job, value)}
+                                privacy={job.privacy || privacy}
+                              />
+                            ))}
+                          </div>
+                        </details>
                       )}
 
                       <details className="raw-discovery">

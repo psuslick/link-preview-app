@@ -1434,7 +1434,7 @@ function titleTokens(value) {
     .normalize("NFKD")
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
     .split(/\s+/)
     .filter((token) => token.length > 1 && !TITLE_STOPWORDS.has(token));
 }
@@ -1514,77 +1514,52 @@ function parseDuckDuckGoResults(html) {
   const $ = cheerio.load(html || "");
   const results = [];
   const seen = new Set();
-  $(".result").each((_, element) => {
-    const anchor = $(element).find("a.result__a").first();
+  $(".result, .results_links, .web-result").each((_, element) => {
+    const anchor = $(element).find("a.result__a, h2 a, a[data-testid='result-title-a']").first();
     const url = unwrapSearchResultHref(anchor.attr("href"), "https://html.duckduckgo.com/html/");
     const title = anchor.text().replace(/\s+/g, " ").trim();
-    const snippet = $(element).find(".result__snippet").first().text().replace(/\s+/g, " ").trim();
+    const snippet = $(element).find(".result__snippet, .result-snippet, [data-result='snippet']").first().text().replace(/\s+/g, " ").trim();
     if (!url) return;
     const key = canonicalDiscoveryUrl(url).toLowerCase();
     if (seen.has(key)) return;
     seen.add(key);
     results.push({ url, searchTitle: title || null, snippet: snippet || null, engine: "DuckDuckGo" });
   });
-  // Search markup changes occasionally. Preserve recall by accepting any external public
-  // result link when the structured result selector yields little or nothing.
-  if (results.length < 3) {
-    $("a[href]").each((_, element) => {
-      if (results.length >= 30) return false;
-      const anchor = $(element);
-      const title = anchor.text().replace(/\s+/g, " ").trim();
-      const url = unwrapSearchResultHref(anchor.attr("href"), "https://html.duckduckgo.com/html/");
-      if (!url) return;
-      const key = canonicalDiscoveryUrl(url).toLowerCase();
-      if (seen.has(key)) return;
-      seen.add(key);
-      results.push({ url, searchTitle: title || null, snippet: null, engine: "DuckDuckGo" });
-    });
-  }
-  return results;
+  return results.slice(0, 30);
 }
 
 function parseBingResults(html) {
   const $ = cheerio.load(html || "");
   const results = [];
   const seen = new Set();
-  $("li.b_algo").each((_, element) => {
+  $("li.b_algo, .b_algo").each((_, element) => {
     const anchor = $(element).find("h2 a").first();
     const url = unwrapSearchResultHref(anchor.attr("href"), "https://www.bing.com/search");
     const title = anchor.text().replace(/\s+/g, " ").trim();
-    const snippet = $(element).find(".b_caption p").first().text().replace(/\s+/g, " ").trim();
+    const snippet = $(element).find(".b_caption p, .b_lineclamp2, .b_lineclamp3").first().text().replace(/\s+/g, " ").trim();
     if (!url) return;
     const key = canonicalDiscoveryUrl(url).toLowerCase();
     if (seen.has(key)) return;
     seen.add(key);
     results.push({ url, searchTitle: title || null, snippet: snippet || null, engine: "Bing" });
   });
-  if (results.length < 3) {
-    $("a[href]").each((_, element) => {
-      if (results.length >= 30) return false;
-      const anchor = $(element);
-      const title = anchor.text().replace(/\s+/g, " ").trim();
-      const url = unwrapSearchResultHref(anchor.attr("href"), "https://www.bing.com/search");
-      if (!url) return;
-      const key = canonicalDiscoveryUrl(url).toLowerCase();
-      if (seen.has(key)) return;
-      seen.add(key);
-      results.push({ url, searchTitle: title || null, snippet: null, engine: "Bing" });
-    });
-  }
-  return results;
+  return results.slice(0, 30);
 }
 
 function parseMojeekResults(html) {
   const $ = cheerio.load(html || "");
   const results = [];
   const seen = new Set();
-  $("a[href]").each((_, element) => {
-    if (results.length >= 30) return false;
-    const anchor = $(element);
-    const title = anchor.text().replace(/\s+/g, " ").trim();
+  // Mojeek's standard result layout: ul.results-standard > li, with h2/a title,
+  // p.s snippet and (in newer layouts) a.ob carrying the result URL.
+  $("ul.results-standard > li").each((_, element) => {
+    const row = $(element);
+    const anchor = row.find("h2 a").first();
+    const outbound = row.find("a.ob").first();
+    const rawHref = outbound.attr("href") || anchor.attr("href");
     let url;
     try {
-      url = new URL(anchor.attr("href"), "https://www.mojeek.com/search");
+      url = new URL(rawHref, "https://www.mojeek.com/search");
       const host = url.hostname.toLowerCase().replace(/^www\./, "");
       if (host === "mojeek.com" || host.endsWith(".mojeek.com")) return;
       url = validateUrl(url.toString());
@@ -1592,11 +1567,11 @@ function parseMojeekResults(html) {
     const key = canonicalDiscoveryUrl(url.toString()).toLowerCase();
     if (seen.has(key)) return;
     seen.add(key);
-    const parent = anchor.closest("li,article,div");
-    const snippet = parent.find("p").first().text().replace(/\s+/g, " ").trim();
+    const title = anchor.text().replace(/\s+/g, " ").trim();
+    const snippet = row.find("p.s").first().text().replace(/\s+/g, " ").trim();
     results.push({ url: url.toString(), searchTitle: title || null, snippet: snippet || null, engine: "Mojeek" });
   });
-  return results;
+  return results.slice(0, 30);
 }
 
 async function searchMojeek(query) {
@@ -1607,7 +1582,8 @@ async function searchMojeek(query) {
 }
 
 async function searchDuckDuckGo(query) {
-  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}&kl=us-en&kp=-2`;
+  const safeQuery = `${query} !safeoff`;
+  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(safeQuery)}&kl=us-en&kp=-2`;
   const response = await fetchBounded(url, {
     kind: "search",
     timeoutMs: ALTERNATE_SEARCH_TIMEOUT_MS,
@@ -1980,6 +1956,50 @@ function evidenceOverlap(sourceSignals, candidateSignals) {
   return { score, matchedIds: [...new Set(matchedIds)], matchedFilenames: [...new Set(matchedFilenames)], sharedMediaHost };
 }
 
+function subjectTokensFromText(value, limit = 80) {
+  return String(value || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/gi, " ")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .split(/\s+/)
+    .filter((token) => token.length >= 3 && !PHRASE_STOPWORDS.has(token) && !/^\d{1,3}$/.test(token))
+    .slice(0, limit);
+}
+
+function subjectAnchorTokens(source, transcript = null) {
+  const scores = new Map();
+  const add = (text, weight) => {
+    for (const token of subjectTokensFromText(text)) scores.set(token, (scores.get(token) || 0) + weight + Math.min(token.length, 12) / 24);
+  };
+  add(source?.title, 5);
+  add(source?.uploader, 2);
+  add(source?.description, 1.5);
+  add(transcript?.phrase, 2.5);
+  return [...scores.entries()]
+    .sort((a, b) => b[1] - a[1] || b[0].length - a[0].length)
+    .map(([token]) => token)
+    .slice(0, 8);
+}
+
+function candidateSubjectRelevance(source, candidate, anchors) {
+  const sourceTitleSimilarity = titleSimilarity(source?.title, candidate?.title);
+  const candidateTokens = new Set(subjectTokensFromText(`${candidate?.title || ""} ${candidate?.description || ""}`, 160));
+  const matched = (anchors || []).filter((token) => candidateTokens.has(token));
+  const anchorScore = anchors?.length ? matched.length / Math.min(6, anchors.length) : 0;
+  const score = Math.min(1, sourceTitleSimilarity * 0.68 + anchorScore * 0.52);
+  return { score, matched: matched.slice(0, 8), titleSimilarity: sourceTitleSimilarity };
+}
+
+function strongStandaloneSignal(value) {
+  const text = String(value || "").trim();
+  if (text.length < 8) return false;
+  const hasLetter = /\p{L}/u.test(text);
+  const hasNumber = /\p{N}/u.test(text);
+  return hasLetter && hasNumber && !/^(?:master|manifest|playlist|index|stream|video|media|player)/i.test(text);
+}
+
 function buildDiscoveryQueries(source, signals, transcript, privacy = DEFAULT_PRIVACY) {
   const queries = [];
   const add = (kind, query, weight, signal = null) => {
@@ -1991,40 +2011,45 @@ function buildDiscoveryQueries(source, signals, transcript, privacy = DEFAULT_PR
   const uploader = String(source.uploader || "").trim();
   const sourceHost = discoveryHost(source.url);
   const quote = (value) => `"${String(value || "").replace(/"/g, " ").trim()}"`;
-  const contextualSignalQuery = (signal) => {
-    const value = String(signal || "").trim();
-    if (!value) return null;
-    // Short/generic-looking IDs are retained, but searched with context instead of
-    // being thrown away or queried as a dangerously broad token.
-    if (value.length < 4 || /^[0-9]{1,3}$/.test(value) || /^(?:video|watch|embed|player|media|stream|master|index)$/i.test(value)) {
-      if (title) return `${quote(value)} ${quote(title)}`;
-      if (uploader) return `${quote(value)} ${quote(uploader)}`;
-      if (sourceHost) return `${quote(value)} ${quote(sourceHost)}`;
-    }
-    return quote(value);
-  };
+  const anchors = subjectAnchorTokens(source, transcript);
+  const anchorPhrase = anchors.slice(0, 5).join(" ");
+  const anchorContext = anchorPhrase || title || uploader || sourceHost;
 
-  if (privacy.searchTranscript && transcript?.phrase) add("transcript", quote(transcript.phrase), 1.0, transcript.phrase);
-
-  if (privacy.searchMediaIds) {
-    for (const id of (signals.ids || []).slice(0, 5)) {
-      const contextual = contextualSignalQuery(id);
-      if (contextual) add("media-id", contextual, 0.98, id);
-      if (title && String(id).length >= 4) add("media-id-title", `${quote(id)} ${quote(title)}`, 0.96, id);
-    }
-    for (const filename of (signals.filenames || []).slice(0, 5)) {
-      const contextual = contextualSignalQuery(filename);
-      if (contextual) add("media-filename", contextual, 0.94, filename);
-    }
+  // Subject-first queries. These are deliberately evaluated before raw identifiers so
+  // the visible candidate set remains about the same video/topic rather than arbitrary
+  // pages that happen to share an opaque ID.
+  if (privacy.searchTitleUploader && title) {
+    add("title-exact", quote(title), 1.0, title);
+    if (anchorPhrase && anchorPhrase.toLowerCase() !== title.toLowerCase()) add("subject-anchor", anchorPhrase, 0.94, anchorPhrase);
+    if (uploader) add("uploader-title", `${quote(uploader)} ${quote(title)}`, 0.96, uploader);
+    add("longer-title", `${quote(title)} full complete extended uncut longer`, 0.90, title);
+  }
+  if (privacy.searchTranscript && transcript?.phrase) {
+    const transcriptShort = distinctivePhrase(transcript.phrase, 7) || transcript.phrase;
+    add("transcript", quote(transcriptShort), 0.98, transcriptShort);
+    const transcriptWords = subjectTokensFromText(transcriptShort, 12).slice(0, 6).join(" ");
+    if (transcriptWords) add("transcript-subject", transcriptWords, 0.90, transcriptWords);
+  }
+  const descriptionPhrase = privacy.searchDescription ? distinctivePhrase(source.description, 7) : null;
+  if (descriptionPhrase) {
+    add("description", quote(descriptionPhrase), 0.88, descriptionPhrase);
+    const descWords = subjectTokensFromText(descriptionPhrase, 12).slice(0, 6).join(" ");
+    if (descWords) add("description-subject", descWords, 0.82, descWords);
   }
 
-  const descriptionPhrase = privacy.searchDescription ? distinctivePhrase(source.description, 9) : null;
-  if (descriptionPhrase) add("description", quote(descriptionPhrase), 0.82, descriptionPhrase);
-
-  if (privacy.searchTitleUploader && uploader && title) add("uploader-title", `${quote(uploader)} ${quote(title)}`, 0.86, uploader);
-  if (privacy.searchTitleUploader && title) {
-    add("title-exact", quote(title), 0.78, title);
-    add("longer-title", `${quote(title)} full complete extended uncut`, 0.70, title);
+  if (privacy.searchMediaIds) {
+    for (const id of (signals.ids || []).slice(0, 6)) {
+      const value = String(id || "").trim();
+      if (!value) continue;
+      if (anchorContext) add("media-id-subject", `${quote(value)} ${anchorContext}`, 0.82, value);
+      if (strongStandaloneSignal(value)) add("media-id", quote(value), 0.72, value);
+    }
+    for (const filename of (signals.filenames || []).slice(0, 5)) {
+      const value = String(filename || "").trim();
+      if (!value) continue;
+      if (anchorContext) add("media-filename-subject", `${quote(value)} ${anchorContext}`, 0.80, value);
+      if (strongStandaloneSignal(value)) add("media-filename", quote(value), 0.68, value);
+    }
   }
 
   try {
@@ -2032,20 +2057,20 @@ function buildDiscoveryQueries(source, signals, transcript, privacy = DEFAULT_PR
     const pathBits = sourceUrl.pathname.split("/").filter(Boolean)
       .map((part) => decodeURIComponent(part).replace(/\.[a-z0-9]{2,6}$/i, ""))
       .filter(Boolean);
-    if (privacy.searchMediaIds) {
-      for (const bit of pathBits.slice(-3)) {
-        const contextual = contextualSignalQuery(bit);
-        if (contextual) add("url-path", contextual, 0.55, bit);
-      }
+    if (privacy.searchMediaIds && anchorContext) {
+      for (const bit of pathBits.slice(-2)) add("url-path-subject", `${quote(bit)} ${anchorContext}`, 0.58, bit);
     }
     if (!queries.length && privacy.searchTitleUploader) add("url-fallback", quote(`${sourceUrl.hostname}${sourceUrl.pathname}`), 0.35, sourceUrl.pathname);
   } catch {}
 
-  // Keep network activity bounded, but do not let one signal family consume every slot.
-  const familyOrder = ["transcript", "media-id", "media-id-title", "media-filename", "description", "uploader-title", "title-exact", "longer-title", "url-path", "url-fallback"];
+  const familyOrder = [
+    "title-exact", "uploader-title", "subject-anchor", "transcript", "transcript-subject",
+    "description", "description-subject", "longer-title", "media-id-subject", "media-filename-subject",
+    "media-id", "media-filename", "url-path-subject", "url-fallback"
+  ];
   return queries
     .sort((a, b) => familyOrder.indexOf(a.kind) - familyOrder.indexOf(b.kind) || b.weight - a.weight)
-    .slice(0, 10);
+    .slice(0, 14);
 }
 
 function classifyEvidenceAlternate(source, candidate, similarity, overlap, searchSupport = {}) {
@@ -2169,6 +2194,7 @@ async function findAlternates({ url, title, description, provider, durationSecon
     }
   }
   const transcript = privacy.searchTranscript && sourceTool?.ok ? await transcriptPhraseFromTool(sourceTool) : null;
+  const subjectAnchors = subjectAnchorTokens(source, transcript);
   const queries = buildDiscoveryQueries(source, sourceSignals, transcript, privacy);
 
   if (!queries.length) {
@@ -2286,7 +2312,8 @@ async function findAlternates({ url, title, description, provider, durationSecon
     };
     const similarity = Math.max(item.searchSimilarity, titleSimilarity(source.title, candidate.title));
     const overlap = evidenceOverlap(sourceSignals, candidate.pageSignals);
-    return { ...candidate, similarity, overlap };
+    const subject = candidateSubjectRelevance(source, candidate, subjectAnchors);
+    return { ...candidate, similarity, overlap, subject };
   });
 
   // Tool-probe a larger but still bounded set. Selection is based only on evidence
@@ -2296,8 +2323,9 @@ async function findAlternates({ url, title, description, provider, durationSecon
     .sort((a, b) => {
       const score = (candidate) =>
         candidate.overlap.score * 3 +
-        candidate.similarity * 45 +
-        Math.min(12, candidate.searchSupport.engineCount * 4 + candidate.searchSupport.queryCount);
+        candidate.similarity * 35 +
+        (candidate.subject?.score || 0) * 55 +
+        Math.min(10, candidate.searchSupport.engineCount * 3 + candidate.searchSupport.queryCount);
       return score(b) - score(a);
     })
     .slice(0, privacy.mediaTools && toolsDir ? MEDIA_TOOL_CANDIDATE_LIMIT : 0);
@@ -2332,13 +2360,14 @@ async function findAlternates({ url, title, description, provider, durationSecon
     };
     updated.image = updated.images[0] || null;
     updated.similarity = Math.max(candidate.similarity, titleSimilarity(source.title, updated.title));
+    updated.subject = candidateSubjectRelevance(source, updated, subjectAnchors);
     return {
       ...updated,
       ...classifyEvidenceAlternate(source, updated, updated.similarity, overlap, candidate.searchSupport)
     };
   });
 
-  const results = candidates
+  const rankedCandidates = candidates
     .filter(Boolean)
     .filter((candidate) => canonicalDiscoveryUrl(candidate.url).toLowerCase() !== sourceKey)
     .sort((a, b) => {
@@ -2350,10 +2379,19 @@ async function findAlternates({ url, title, description, provider, durationSecon
         value === "Unverified candidate" ? 2 : 1;
       return rank(b.relation) - rank(a.relation) ||
         b.confidence - a.confidence ||
+        (b.subject?.score || 0) - (a.subject?.score || 0) ||
         b.overlap.score - a.overlap.score ||
         b.similarity - a.similarity;
-    })
-    .slice(0, ALTERNATE_SEARCH_MAX_RESULTS);
+    });
+
+  const isRelatedCandidate = (candidate) =>
+    candidate.overlap?.score > 0 ||
+    candidate.strongIdentity ||
+    (candidate.subject?.score || 0) >= 0.24 ||
+    candidate.similarity >= 0.32;
+
+  const results = rankedCandidates.filter(isRelatedCandidate).slice(0, ALTERNATE_SEARCH_MAX_RESULTS);
+  const lowRelevanceResults = rankedCandidates.filter((candidate) => !isRelatedCandidate(candidate)).slice(0, ALTERNATE_SEARCH_MAX_RESULTS);
 
   const value = {
     source,
@@ -2361,7 +2399,8 @@ async function findAlternates({ url, title, description, provider, durationSecon
       ids: sourceSignals.ids.slice(0, 12),
       filenames: sourceSignals.filenames.slice(0, 8),
       mediaHosts: [...new Set(sourceSignals.mediaUrls.map(discoveryHost).filter(Boolean))].slice(0, 8),
-      transcript: transcript ? { phrase: transcript.phrase, lang: transcript.lang, automatic: transcript.automatic } : null
+      transcript: transcript ? { phrase: transcript.phrase, lang: transcript.lang, automatic: transcript.automatic } : null,
+      subjectAnchors: subjectAnchors.slice(0, 8)
     },
     privacy,
     tools: {
@@ -2376,14 +2415,15 @@ async function findAlternates({ url, title, description, provider, durationSecon
       attempts: sourceTool?.attempts || []
     },
     results,
+    lowRelevanceResults,
     queries: queries.map((entry) => entry.query),
     queryEvidence: queries,
     searchDiagnostics,
     searchPolicy: {
-      duckDuckGoSafeSearch: "off-requested (kp=-2)",
+      duckDuckGoSafeSearch: "off-requested twice (kp=-2 + !safeoff)",
       bingSafeSearch: "off-requested (adlt=off, adlt_set=off, safeSearch=Off)",
       mojeekSafeSearch: "off-requested (safe=0)",
-      note: "DuckDuckGo and Mojeek are explicitly requested with their documented Safe Search-off parameters. Bing is requested with multiple recognized off parameters; Bing may still enforce jurisdiction/account/age policy outside this app."
+      note: "DuckDuckGo is explicitly requested with kp=-2 and !safeoff; Mojeek with safe=0. Bing is requested with multiple off parameters. Any provider may still enforce jurisdiction/account/age policy outside this app."
     },
     candidateCount: gathered.length,
     rawDiscoveredCount: gathered.length,
@@ -2391,10 +2431,10 @@ async function findAlternates({ url, title, description, provider, durationSecon
     rawDiscoveredTruncated: gathered.length > rawDiscovered.length,
     evaluatedCount: prioritized.length,
     toolEvaluatedCount: toolTargets.length,
-    manualSearchUrl: privacy.searchDuckDuckGo && queries[0] ? `https://duckduckgo.com/?q=${encodeURIComponent(queries[0].query)}&kp=-2` : null,
+    manualSearchUrl: privacy.searchDuckDuckGo && queries[0] ? `https://duckduckgo.com/?q=${encodeURIComponent(`${queries[0].query} !safeoff`)}&kp=-2` : null,
     cached: false,
     note: toolsDir
-      ? "Discovery is host-agnostic: yt-dlp native and forced-generic extraction, raw page/embed/media identifiers, optional subtitle phrases, and general web search are combined. Unknown hosts are not rejected. Search provenance is used only for discovery/inspection priority; it can no longer create a likely-match label by itself. Unknown hosts and low-confidence candidates are retained. Candidate identity labels require evidence recovered from the candidate itself, and frame comparison is available for verification."
+      ? "Discovery is host-agnostic: yt-dlp native and forced-generic extraction, raw page/embed/media identifiers, optional subtitle phrases, and general web search are combined. Unknown hosts are not rejected. Search provenance is used only for discovery/inspection priority; it can no longer create a likely-match label by itself. Unknown hosts are retained. Ranked results are subject-focused, while low-relevance inspected results and raw discovery remain visible separately so relevance filtering never becomes hidden censorship. Candidate identity labels require evidence recovered from the candidate itself, and frame comparison is available for verification."
       : "Portable media tools were not found, so discovery used host-agnostic page/media signatures and general web search only. Install the Link Preview tools package for yt-dlp generic extraction and subtitle-assisted discovery."
   };
   alternateCacheSet(cacheKey, value);
@@ -2551,7 +2591,7 @@ app.post("/api/authorize-host", async (req, res) => {
     return res.json({
       ...result,
       reusableForHost: result.host || null,
-      note: "A reusable site session was opened inside Windows Sandbox. Once the real site is reachable, one successful Retry can reuse this same session for other queued previews on the same host while the Edge window remains open."
+      note: "A reusable site session was opened inside Windows Sandbox. The app will automatically retry one refresh and may accept recognized cookie/privacy consent controls. CAPTCHA/anti-bot challenges, age attestations, logins, and other access-control prompts remain manual. Once the real site is reachable, one successful Retry can reuse this session for other previews on the same host."
     });
   } catch (error) {
     return res.status(400).json({ error: error?.message || "authorization_launch_failed" });

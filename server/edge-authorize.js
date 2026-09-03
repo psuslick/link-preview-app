@@ -3,12 +3,17 @@ import net from "node:net";
 import dns from "node:dns";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const targetUrl = process.argv[2];
 const profileDir = process.argv[3];
 const debugPort = Number(process.argv[4] || 0);
 const GLOBAL_LIMIT = 8;
 const PER_HOST_LIMIT = 4;
+
+const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
+const CONSENT_ASSIST_PATH = path.join(SERVER_DIR, "edge-consent-assist.js");
 
 class Semaphore {
   constructor(limit) { this.limit = limit; this.active = 0; this.waiters = []; }
@@ -190,7 +195,12 @@ async function run() {
     `--user-data-dir=${profileDir}`, "--new-window", targetUrl
   ];
   const edge = spawn(edgePath, args, { windowsHide: false, stdio: "ignore" });
+  const assistant = spawn(process.execPath, ["--experimental-websocket", CONSENT_ASSIST_PATH, String(debugPort), targetUrl], {
+    windowsHide: true, stdio: "ignore"
+  });
+  assistant.unref();
   await new Promise((resolve) => { edge.once("close", resolve); edge.once("error", resolve); });
+  try { assistant.kill(); } catch {}
   await proxy.close();
 }
 
