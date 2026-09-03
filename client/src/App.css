@@ -1068,3 +1068,84 @@ button:disabled { opacity: 0.42; cursor: default; }
   .privacy-presets { align-items: flex-start; flex-direction: column; }
   .privacy-panel-summary { align-items: flex-start; }
 }
+
+
+/* v2.5.3 finder auditability / batch comparison */
+.search-support-note {
+  margin-top: 7px;
+  color: #7f8da0;
+  font-size: 0.69rem;
+  line-height: 1.35;
+}
+.discovery-chip {
+  border-style: dashed !important;
+  opacity: 0.8;
+}
+.compare-top-button {
+  border: 1px solid #3d5d83;
+  border-radius: 7px;
+  padding: 6px 9px;
+  background: #14243a;
+  color: #c5ddfb;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.compare-top-button:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
+}
+.raw-discovery {
+  margin-top: 12px;
+  border: 1px solid #263447;
+  border-radius: 9px;
+  background: #0b121a;
+  overflow: hidden;
+}
+.raw-discovery summary {
+  padding: 10px 12px;
+  cursor: pointer;
+  color: #b4c5da;
+  font-weight: 700;
+  background: #0f1823;
+}
+.raw-discovery > p {
+  margin: 10px 12px;
+  color: #8796aa;
+  font-size: 0.72rem;
+  line-height: 1.4;
+}
+.raw-discovery-list {
+  max-height: 430px;
+  overflow: auto;
+  border-top: 1px solid #202b39;
+}
+.raw-discovery-row {
+  padding: 9px 11px;
+  border-bottom: 1px solid #1a2431;
+  font-size: 0.7rem;
+}
+.raw-discovery-row:last-child { border-bottom: 0; }
+.raw-discovery-row > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  align-items: baseline;
+}
+.raw-discovery-row strong {
+  color: #b7c5d6;
+  font-size: 0.74rem;
+}
+.raw-discovery-row span {
+  color: #718096;
+}
+.raw-discovery-row p {
+  margin: 4px 0;
+  color: #8997aa;
+  line-height: 1.35;
+}
+.raw-discovery-row a {
+  display: block;
+  color: #78a8e0;
+  overflow-wrap: anywhere;
+}
+.warning-text { color: #d6b874 !important; }

@@ -34,8 +34,9 @@ const CACHE_MAX_ENTRIES = 1500;
 // Alternate/mirror discovery is intentionally small and user-triggered. It reuses
 // the same bounded network stack as previews instead of becoming a second crawler.
 const ALTERNATE_SEARCH_TIMEOUT_MS = 8000;
-const ALTERNATE_SEARCH_MAX_RESULTS = 30;
-const ALTERNATE_CANDIDATE_PREVIEW_LIMIT = 36;
+const ALTERNATE_SEARCH_MAX_RESULTS = 60;
+const ALTERNATE_CANDIDATE_PREVIEW_LIMIT = 72;
+const ALTERNATE_RAW_DISCOVERY_LIMIT = 1000;
 const ALTERNATE_CANDIDATE_CONCURRENCY = 3;
 const ALTERNATE_CACHE_TTL_MS = 10 * 60 * 1000;
 const ALTERNATE_CACHE_MAX_ENTRIES = 100;
@@ -896,7 +897,7 @@ function markChallengeCircuit(rawUrl) {
 }
 
 function authorizationHost(rawUrl) {
-  try { return new URL(rawUrl).hostname.toLowerCase(); } catch { return null; }
+  try { return new URL(rawUrl).hostname.toLowerCase().replace(/^www\./, ""); } catch { return null; }
 }
 
 function authorizationEntryFor(rawUrl) {
@@ -1006,7 +1007,7 @@ async function renderMetadataFromAuthorizedSession(targetUrl, debugPort) {
     const timer = setTimeout(() => {
       try { child.kill(); } catch {}
       finish({ ok: false, error: "authorized_session_probe_timeout" });
-    }, 5000);
+    }, 9000);
     child.stdout.on("data", (chunk) => {
       outBytes += chunk.length;
       if (outBytes > BROWSER_DOM_LIMIT_BYTES * 2 + 256 * 1024) {
@@ -1046,7 +1047,7 @@ async function renderMetadataFromAuthorizedSession(targetUrl, debugPort) {
           bytes: Buffer.byteLength(html),
           liveAuthorizedSession: true,
           pageUrl,
-          diagnostic: parsed.title ? `visible Edge: ${parsed.title}` : null
+          diagnostic: parsed.title ? `authorized site session: ${parsed.title}` : null
         });
       } catch {
         finish({ ok: false, error: "authorized_session_invalid_output", diagnostic: Buffer.concat(stderr).toString("utf8").slice(0, 1000) });
@@ -1519,7 +1520,6 @@ function parseDuckDuckGoResults(html) {
       if (results.length >= 30) return false;
       const anchor = $(element);
       const title = anchor.text().replace(/\s+/g, " ").trim();
-      if (title.length < 3) return;
       const url = unwrapSearchResultHref(anchor.attr("href"), "https://html.duckduckgo.com/html/");
       if (!url) return;
       const key = canonicalDiscoveryUrl(url).toLowerCase();
@@ -1551,7 +1551,6 @@ function parseBingResults(html) {
       if (results.length >= 30) return false;
       const anchor = $(element);
       const title = anchor.text().replace(/\s+/g, " ").trim();
-      if (title.length < 3) return;
       const url = unwrapSearchResultHref(anchor.attr("href"), "https://www.bing.com/search");
       if (!url) return;
       const key = canonicalDiscoveryUrl(url).toLowerCase();
@@ -1571,7 +1570,6 @@ function parseMojeekResults(html) {
     if (results.length >= 30) return false;
     const anchor = $(element);
     const title = anchor.text().replace(/\s+/g, " ").trim();
-    if (title.length < 3) return;
     let url;
     try {
       url = new URL(anchor.attr("href"), "https://www.mojeek.com/search");
@@ -1590,14 +1588,14 @@ function parseMojeekResults(html) {
 }
 
 async function searchMojeek(query) {
-  const url = `https://www.mojeek.com/search?q=${encodeURIComponent(query)}&hp=minimal&autocomp=0`;
+  const url = `https://www.mojeek.com/search?q=${encodeURIComponent(query)}&hp=minimal&autocomp=0&safe=0`;
   const response = await fetchBounded(url, { kind: "search", timeoutMs: ALTERNATE_SEARCH_TIMEOUT_MS, retries: 1 });
   if (!response.ok) return { ok: false, status: response.status, results: [], error: response.error || `search_status_${response.status}` };
   return { ok: true, status: response.status, results: parseMojeekResults(response.text) };
 }
 
 async function searchDuckDuckGo(query) {
-  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}&kl=us-en`;
+  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}&kl=us-en&kp=-2`;
   const response = await fetchBounded(url, {
     kind: "search",
     timeoutMs: ALTERNATE_SEARCH_TIMEOUT_MS,
@@ -1609,7 +1607,7 @@ async function searchDuckDuckGo(query) {
 }
 
 async function searchBing(query) {
-  const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=25&setlang=en-US`;
+  const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=25&setlang=en-US&adlt=off`;
   const response = await fetchBounded(url, { kind: "search", timeoutMs: ALTERNATE_SEARCH_TIMEOUT_MS, retries: 1 });
   if (!response.ok) return { ok: false, status: response.status, results: [], error: response.error || `search_status_${response.status}` };
   return { ok: true, status: response.status, results: parseBingResults(response.text) };
@@ -1637,11 +1635,11 @@ function normalizeSignal(value) {
 }
 
 function signalIdCandidate(value) {
+  // Discovery-first: preserve short, numeric, alphabetic, and unfamiliar media IDs.
+  // We only discard values that are too small to be actionable or implausibly large.
   const cleaned = String(value || "").trim().replace(/^['"]|['"]$/g, "");
-  if (cleaned.length < 4 || cleaned.length > 96) return null;
-  if (/^(?:https?|www|video|videos|watch|embed|player|media|stream|master|index|playlist|manifest|assets?|static|content|uploads?)$/i.test(cleaned)) return null;
-  if (!/[a-z0-9]/i.test(cleaned)) return null;
-  if (/^[0-9]{1,3}$/.test(cleaned)) return null;
+  if (cleaned.length < 2 || cleaned.length > 128) return null;
+  if (!/[\p{L}\p{N}]/u.test(cleaned)) return null;
   return cleaned;
 }
 
@@ -1813,7 +1811,7 @@ async function transcriptPhraseFromTool(toolResult) {
 
 const MEDIA_TOOL_HELPER_PATH = path.join(SERVER_DIR, "media-tool-probe.js");
 const MEDIA_TOOL_TIMEOUT_MS = 16_000;
-const MEDIA_TOOL_CANDIDATE_LIMIT = 10;
+const MEDIA_TOOL_CANDIDATE_LIMIT = 18;
 const MEDIA_TOOL_CANDIDATE_CONCURRENCY = 2;
 
 async function findToolsDir() {
@@ -1978,32 +1976,67 @@ function buildDiscoveryQueries(source, signals, transcript, privacy = DEFAULT_PR
     queries.push({ kind, query: cleaned, weight, signal });
   };
   const title = cleanSearchTitle(source.title);
-  if (privacy.searchTranscript && transcript?.phrase) add("transcript", `"${transcript.phrase.replace(/"/g, " ")}"`, 1.0, transcript.phrase);
-  if (privacy.searchMediaIds) {
-    for (const id of (signals.ids || []).slice(0, 4)) {
-      add("media-id", `"${String(id).replace(/"/g, " ")}"`, 0.98, id);
-      add("media-id-video", `"${String(id).replace(/"/g, " ")}" video`, 0.94, id);
+  const uploader = String(source.uploader || "").trim();
+  const sourceHost = discoveryHost(source.url);
+  const quote = (value) => `"${String(value || "").replace(/"/g, " ").trim()}"`;
+  const contextualSignalQuery = (signal) => {
+    const value = String(signal || "").trim();
+    if (!value) return null;
+    // Short/generic-looking IDs are retained, but searched with context instead of
+    // being thrown away or queried as a dangerously broad token.
+    if (value.length < 4 || /^[0-9]{1,3}$/.test(value) || /^(?:video|watch|embed|player|media|stream|master|index)$/i.test(value)) {
+      if (title) return `${quote(value)} ${quote(title)}`;
+      if (uploader) return `${quote(value)} ${quote(uploader)}`;
+      if (sourceHost) return `${quote(value)} ${quote(sourceHost)}`;
     }
-    for (const filename of (signals.filenames || []).slice(0, 4)) add("media-filename", `"${String(filename).replace(/"/g, " ")}"`, 0.94, filename);
+    return quote(value);
+  };
+
+  if (privacy.searchTranscript && transcript?.phrase) add("transcript", quote(transcript.phrase), 1.0, transcript.phrase);
+
+  if (privacy.searchMediaIds) {
+    for (const id of (signals.ids || []).slice(0, 5)) {
+      const contextual = contextualSignalQuery(id);
+      if (contextual) add("media-id", contextual, 0.98, id);
+      if (title && String(id).length >= 4) add("media-id-title", `${quote(id)} ${quote(title)}`, 0.96, id);
+    }
+    for (const filename of (signals.filenames || []).slice(0, 5)) {
+      const contextual = contextualSignalQuery(filename);
+      if (contextual) add("media-filename", contextual, 0.94, filename);
+    }
   }
+
   const descriptionPhrase = privacy.searchDescription ? distinctivePhrase(source.description, 9) : null;
-  if (descriptionPhrase) add("description", `"${descriptionPhrase.replace(/"/g, " ")}"`, 0.82, descriptionPhrase);
-  if (privacy.searchTitleUploader && source.uploader && title) add("uploader-title", `"${String(source.uploader).replace(/"/g, " ")}" "${title.replace(/"/g, " ")}"`, 0.86, source.uploader);
+  if (descriptionPhrase) add("description", quote(descriptionPhrase), 0.82, descriptionPhrase);
+
+  if (privacy.searchTitleUploader && uploader && title) add("uploader-title", `${quote(uploader)} ${quote(title)}`, 0.86, uploader);
   if (privacy.searchTitleUploader && title) {
-    add("title-exact", `"${title.replace(/"/g, " ")}"`, 0.78, title);
-    add("title-video", `"${title.replace(/"/g, " ")}" video`, 0.74, title);
-    add("longer-title", `"${title.replace(/"/g, " ")}" full complete extended uncut`, 0.70, title);
+    add("title-exact", quote(title), 0.78, title);
+    add("longer-title", `${quote(title)} full complete extended uncut`, 0.70, title);
   }
+
   try {
     const sourceUrl = new URL(source.url);
-    const pathBits = sourceUrl.pathname.split("/").filter(Boolean).map((part) => decodeURIComponent(part).replace(/\.[a-z0-9]{2,6}$/i, "")).filter((part) => part.length >= 4);
-    if (privacy.searchMediaIds) for (const bit of pathBits.slice(-2)) add("url-path", `"${bit.replace(/"/g, " ")}"`, 0.55, bit);
-    if (!queries.length && privacy.searchTitleUploader) add("url-fallback", `"${sourceUrl.hostname}${sourceUrl.pathname}"`, 0.35, sourceUrl.pathname);
+    const pathBits = sourceUrl.pathname.split("/").filter(Boolean)
+      .map((part) => decodeURIComponent(part).replace(/\.[a-z0-9]{2,6}$/i, ""))
+      .filter(Boolean);
+    if (privacy.searchMediaIds) {
+      for (const bit of pathBits.slice(-3)) {
+        const contextual = contextualSignalQuery(bit);
+        if (contextual) add("url-path", contextual, 0.55, bit);
+      }
+    }
+    if (!queries.length && privacy.searchTitleUploader) add("url-fallback", quote(`${sourceUrl.hostname}${sourceUrl.pathname}`), 0.35, sourceUrl.pathname);
   } catch {}
-  return queries.slice(0, 10);
+
+  // Keep network activity bounded, but do not let one signal family consume every slot.
+  const familyOrder = ["transcript", "media-id", "media-id-title", "media-filename", "description", "uploader-title", "title-exact", "longer-title", "url-path", "url-fallback"];
+  return queries
+    .sort((a, b) => familyOrder.indexOf(a.kind) - familyOrder.indexOf(b.kind) || b.weight - a.weight)
+    .slice(0, 10);
 }
 
-function classifyEvidenceAlternate(source, candidate, similarity, overlap, evidenceWeight) {
+function classifyEvidenceAlternate(source, candidate, similarity, overlap, searchSupport = {}) {
   const sourceDuration = Number(source.durationSeconds) || 0;
   const candidateDuration = Number(candidate.durationSeconds) || 0;
   const sourceHost = discoveryHost(source.url);
@@ -2013,21 +2046,83 @@ function classifyEvidenceAlternate(source, candidate, similarity, overlap, evide
   const longerWords = /\b(?:full|complete|extended|uncut|full[- ]?length|long(?:er)? version)\b/i;
   const lexicalLongerHint = longerWords.test(candidate.title || "") && !longerWords.test(source.title || "");
 
-  let confidence = similarity * 48 + overlap.score + evidenceWeight * 15;
-  if (differentSource) confidence += 5;
+  // Search-engine provenance is discovery support, not identity evidence.
+  // "Likely" labels require evidence actually recovered from the candidate page/tool.
+  const engineCount = Number(searchSupport.engineCount) || 0;
+  const queryCount = Number(searchSupport.queryCount) || 0;
+  const provenanceBonus = Math.min(8, Math.max(0, engineCount - 1) * 2 + Math.max(0, queryCount - 1));
+  let confidence = similarity * 52 + overlap.score + provenanceBonus;
+  if (differentSource && similarity >= 0.45) confidence += 3;
   if (durationRatio !== null) {
-    if (durationRatio >= 1.15) confidence += 10;
-    else if (durationRatio >= 0.88 && durationRatio <= 1.12) confidence += 8;
-  } else if (lexicalLongerHint) confidence += 4;
+    if (durationRatio >= 1.15) confidence += 8;
+    else if (durationRatio >= 0.88 && durationRatio <= 1.12) confidence += 7;
+  } else if (lexicalLongerHint && similarity >= 0.45) confidence += 3;
   confidence = Math.max(0, Math.min(99, Math.round(confidence)));
 
-  const strongIdentity = overlap.score >= 22 || evidenceWeight >= 0.94;
-  let relation = "Possible match";
+  const strongIdentity = overlap.score >= 22;
+  let relation = "Unverified candidate";
   if (durationRatio !== null && durationRatio >= 1.15 && strongIdentity) relation = "Likely longer";
   else if (durationRatio === null && lexicalLongerHint && strongIdentity) relation = "Possible longer";
   else if (strongIdentity && (durationRatio === null || (durationRatio >= 0.82 && durationRatio <= 1.18))) relation = "Likely mirror";
-  else if (confidence < 35) relation = "Weak match";
-  return { relation, confidence, durationRatio, differentSource, lexicalLongerHint, strongIdentity };
+  else if (similarity >= 0.62 || overlap.score > 0) relation = "Possible match";
+  else if (confidence < 25) relation = "Weak match";
+  return { relation, confidence, durationRatio, differentSource, lexicalLongerHint, strongIdentity, provenanceBonus };
+}
+
+
+function searchSupportFor(item) {
+  const engines = [...new Set((item?.evidence || []).map((entry) => entry.engine).filter(Boolean))];
+  const queries = [...new Set((item?.evidence || []).map((entry) => `${entry.kind}:${entry.query}`).filter(Boolean))];
+  const kinds = [...new Set((item?.evidence || []).map((entry) => entry.kind).filter(Boolean))];
+  return { engineCount: engines.length, queryCount: queries.length, engines, kinds };
+}
+
+function balancedCandidateSelection(gatheredMap, searchBuckets, sourceTitle, limit) {
+  const selected = [];
+  const selectedKeys = new Set();
+  const bucketEntries = [...searchBuckets.entries()]
+    .map(([bucket, keys]) => ({
+      bucket,
+      keys: keys.filter((key, index, all) => all.indexOf(key) === index)
+    }))
+    .filter((entry) => entry.keys.length);
+
+  // Round-robin across query+engine buckets so one noisy signal cannot crowd out
+  // later query families or independently indexed search engines.
+  let round = 0;
+  while (selected.length < limit) {
+    let addedThisRound = 0;
+    for (const bucket of bucketEntries) {
+      const key = bucket.keys[round];
+      if (!key || selectedKeys.has(key)) continue;
+      const item = gatheredMap.get(key);
+      if (!item) continue;
+      selectedKeys.add(key);
+      selected.push(item);
+      addedThisRound += 1;
+      if (selected.length >= limit) break;
+    }
+    if (!addedThisRound && bucketEntries.every((bucket) => round >= bucket.keys.length - 1)) break;
+    round += 1;
+    if (round > 100) break;
+  }
+
+  // Fill any remaining capacity by lexical relevance + independent engine/query support.
+  if (selected.length < limit) {
+    const remaining = [...gatheredMap.entries()]
+      .filter(([key]) => !selectedKeys.has(key))
+      .map(([key, item]) => {
+        const support = searchSupportFor(item);
+        const searchSimilarity = titleSimilarity(sourceTitle, item.searchTitle || "");
+        return { key, item, score: searchSimilarity * 60 + Math.min(15, support.engineCount * 4 + support.queryCount * 2) };
+      })
+      .sort((a, b) => b.score - a.score);
+    for (const entry of remaining) {
+      selected.push(entry.item);
+      if (selected.length >= limit) break;
+    }
+  }
+  return selected;
 }
 
 async function findAlternates({ url, title, description, provider, durationSeconds, privacy: privacyInput }) {
@@ -2076,57 +2171,88 @@ async function findAlternates({ url, title, description, provider, durationSecon
   if (cached) return cached;
 
   const gatheredMap = new Map();
+  const searchBuckets = new Map();
   const searchDiagnostics = [];
   const sourceKey = canonicalDiscoveryUrl(sourceUrl).toLowerCase();
-  const addResults = (items, querySpec) => {
+
+  const addResults = (items, querySpec, engineName) => {
+    const bucketKey = `${engineName}:${querySpec.kind}:${querySpec.query}`;
+    if (!searchBuckets.has(bucketKey)) searchBuckets.set(bucketKey, []);
+    const bucket = searchBuckets.get(bucketKey);
+
     for (const item of items) {
       const key = canonicalDiscoveryUrl(item.url).toLowerCase();
       if (key === sourceKey) continue;
+      const provenance = {
+        kind: querySpec.kind,
+        queryWeight: querySpec.weight,
+        signal: querySpec.signal,
+        query: querySpec.query,
+        engine: item.engine || engineName
+      };
       const existing = gatheredMap.get(key);
-      const evidence = { kind: querySpec.kind, weight: querySpec.weight, signal: querySpec.signal, query: querySpec.query, engine: item.engine };
       if (existing) {
-        existing.evidence.push(evidence);
+        existing.evidence.push(provenance);
         if (!existing.searchTitle && item.searchTitle) existing.searchTitle = item.searchTitle;
         if (!existing.snippet && item.snippet) existing.snippet = item.snippet;
       } else {
-        gatheredMap.set(key, { ...item, evidence: [evidence] });
+        gatheredMap.set(key, { ...item, evidence: [provenance], discoveredOrder: gatheredMap.size });
       }
+      bucket.push(key);
     }
   };
 
-  for (let queryIndex = 0; queryIndex < queries.length; queryIndex += 1) {
-    const querySpec = queries[queryIndex];
-    let ddg = { ok: false, results: [] };
-    if (privacy.searchDuckDuckGo) {
-      ddg = await searchDuckDuckGo(querySpec.query);
-      searchDiagnostics.push({ engine: "DuckDuckGo", kind: querySpec.kind, query: querySpec.query, status: ddg.status || 0, error: ddg.error || null, found: ddg.results.length });
-      addResults(ddg.results, querySpec);
-    }
+  // Every enabled engine gets every generated query. Search engines may still apply
+  // their own jurisdiction/account/index policies, but our code does not selectively
+  // skip an engine because another engine returned "enough" results.
+  for (const querySpec of queries) {
+    const tasks = [];
+    if (privacy.searchDuckDuckGo) tasks.push(["DuckDuckGo", () => searchDuckDuckGo(querySpec.query)]);
+    if (privacy.searchBing) tasks.push(["Bing", () => searchBing(querySpec.query)]);
+    if (privacy.searchMojeek) tasks.push(["Mojeek", () => searchMojeek(querySpec.query)]);
 
-    // Search engines are individually privacy-controlled. Disabling one never causes
-    // a candidate from another enabled engine to be rejected.
-    if (privacy.searchBing && (queryIndex < 5 || !privacy.searchDuckDuckGo || !ddg.ok || ddg.results.length < 3)) {
-      const bing = await searchBing(querySpec.query);
-      searchDiagnostics.push({ engine: "Bing", kind: querySpec.kind, query: querySpec.query, status: bing.status || 0, error: bing.error || null, found: bing.results.length });
-      addResults(bing.results, querySpec);
+    const responses = await Promise.all(tasks.map(async ([engine, run]) => {
+      try { return [engine, await run()]; }
+      catch (error) { return [engine, { ok: false, status: 0, results: [], error: error?.message || "search_failed" }]; }
+    }));
+
+    for (const [engine, response] of responses) {
+      searchDiagnostics.push({
+        engine,
+        kind: querySpec.kind,
+        query: querySpec.query,
+        status: response.status || 0,
+        error: response.error || null,
+        found: response.results?.length || 0
+      });
+      addResults(response.results || [], querySpec, engine);
     }
-    if (privacy.searchMojeek && (queryIndex < 4 || gatheredMap.size < 8)) {
-      const mojeek = await searchMojeek(querySpec.query);
-      searchDiagnostics.push({ engine: "Mojeek", kind: querySpec.kind, query: querySpec.query, status: mojeek.status || 0, error: mojeek.error || null, found: mojeek.results.length });
-      addResults(mojeek.results, querySpec);
-    }
-    if (gatheredMap.size >= 80) break;
   }
 
   const gathered = [...gatheredMap.values()];
-  const prioritized = gathered
-    .map((item) => {
-      const evidenceWeight = Math.max(0, ...item.evidence.map((entry) => entry.weight || 0));
-      const searchSimilarity = titleSimilarity(source.title, item.searchTitle || "");
-      return { ...item, evidenceWeight, searchSimilarity, initialScore: evidenceWeight * 60 + searchSimilarity * 30 + Math.min(10, item.evidence.length * 2) };
-    })
-    .sort((a, b) => b.initialScore - a.initialScore)
-    .slice(0, ALTERNATE_CANDIDATE_PREVIEW_LIMIT);
+  const rawDiscovered = gathered.slice(0, ALTERNATE_RAW_DISCOVERY_LIMIT).map((item) => {
+    const support = searchSupportFor(item);
+    return {
+      url: item.url,
+      searchTitle: item.searchTitle || null,
+      snippet: item.snippet || null,
+      engines: support.engines,
+      queryKinds: support.kinds,
+      queryCount: support.queryCount,
+      discoveredOrder: item.discoveredOrder
+    };
+  });
+
+  const prioritized = balancedCandidateSelection(
+    gatheredMap,
+    searchBuckets,
+    source.title,
+    ALTERNATE_CANDIDATE_PREVIEW_LIMIT
+  ).map((item) => {
+    const searchSupport = searchSupportFor(item);
+    const searchSimilarity = titleSimilarity(source.title, item.searchTitle || "");
+    return { ...item, searchSupport, searchSimilarity };
+  });
 
   const basicCandidates = await runLimited(prioritized, ALTERNATE_CANDIDATE_CONCURRENCY, async (item) => {
     const page = await probePublicPageSignals(item.url);
@@ -2141,9 +2267,9 @@ async function findAlternates({ url, title, description, provider, durationSecon
       images: metadata.images || [],
       method: page.ok ? "page-media-probe" : "search-result",
       previewError: page.error || null,
-      searchEngine: [...new Set(item.evidence.map((e) => e.engine))].join("+") || item.engine,
-      evidence: item.evidence,
-      evidenceWeight: item.evidenceWeight,
+      searchEngine: item.searchSupport.engines.join("+") || item.engine,
+      discovery: item.evidence,
+      searchSupport: item.searchSupport,
       pageSignals: page.signals
     };
     const similarity = Math.max(item.searchSimilarity, titleSimilarity(source.title, candidate.title));
@@ -2151,12 +2277,19 @@ async function findAlternates({ url, title, description, provider, durationSecon
     return { ...candidate, similarity, overlap };
   });
 
-  // Tool-probe only the strongest few candidates. This is deliberately bounded and does not reject
-  // unfamiliar hosts; yt-dlp native -> forced generic is attempted through the private-network-safe proxy.
+  // Tool-probe a larger but still bounded set. Selection is based only on evidence
+  // present on the candidate page plus lexical relevance and independent search support.
   const toolTargets = basicCandidates
     .filter(Boolean)
-    .sort((a, b) => (b.overlap.score + b.evidenceWeight * 40 + b.similarity * 25) - (a.overlap.score + a.evidenceWeight * 40 + a.similarity * 25))
+    .sort((a, b) => {
+      const score = (candidate) =>
+        candidate.overlap.score * 3 +
+        candidate.similarity * 45 +
+        Math.min(12, candidate.searchSupport.engineCount * 4 + candidate.searchSupport.queryCount);
+      return score(b) - score(a);
+    })
     .slice(0, privacy.mediaTools && toolsDir ? MEDIA_TOOL_CANDIDATE_LIMIT : 0);
+
   const toolMap = new Map();
   const toolResults = await runLimited(toolTargets, MEDIA_TOOL_CANDIDATE_CONCURRENCY, async (candidate) => ({
     url: candidate.url,
@@ -2177,20 +2310,36 @@ async function findAlternates({ url, title, description, provider, durationSecon
       provider: candidate.provider || tool?.extractor || null,
       durationSeconds: Number(tool?.durationSeconds || candidate.durationSeconds) || null,
       images: uniqueUrls([tool?.thumbnails || [], candidate.images || [], candidate.image], candidate.url),
-      toolProbe: toolProbe ? { ok: Boolean(toolProbe.ok), mode: tool?.mode || null, extractor: tool?.extractor || null, attempts: toolProbe.attempts || [] } : null,
+      toolProbe: toolProbe ? {
+        ok: Boolean(toolProbe.ok),
+        mode: tool?.mode || null,
+        extractor: tool?.extractor || null,
+        attempts: toolProbe.attempts || []
+      } : null,
       overlap
     };
     updated.image = updated.images[0] || null;
     updated.similarity = Math.max(candidate.similarity, titleSimilarity(source.title, updated.title));
-    return { ...updated, ...classifyEvidenceAlternate(source, updated, updated.similarity, overlap, candidate.evidenceWeight) };
+    return {
+      ...updated,
+      ...classifyEvidenceAlternate(source, updated, updated.similarity, overlap, candidate.searchSupport)
+    };
   });
 
   const results = candidates
     .filter(Boolean)
     .filter((candidate) => canonicalDiscoveryUrl(candidate.url).toLowerCase() !== sourceKey)
     .sort((a, b) => {
-      const rank = (value) => value === "Likely longer" ? 5 : value === "Likely mirror" ? 4 : value === "Possible longer" ? 3 : value === "Possible match" ? 2 : 1;
-      return rank(b.relation) - rank(a.relation) || b.confidence - a.confidence || b.overlap.score - a.overlap.score;
+      const rank = (value) =>
+        value === "Likely longer" ? 6 :
+        value === "Likely mirror" ? 5 :
+        value === "Possible longer" ? 4 :
+        value === "Possible match" ? 3 :
+        value === "Unverified candidate" ? 2 : 1;
+      return rank(b.relation) - rank(a.relation) ||
+        b.confidence - a.confidence ||
+        b.overlap.score - a.overlap.score ||
+        b.similarity - a.similarity;
     })
     .slice(0, ALTERNATE_SEARCH_MAX_RESULTS);
 
@@ -2218,12 +2367,17 @@ async function findAlternates({ url, title, description, provider, durationSecon
     queries: queries.map((entry) => entry.query),
     queryEvidence: queries,
     searchDiagnostics,
+    searchPolicy: { duckDuckGoSafeSearch: "off-requested", bingSafeSearch: "off-requested", mojeekSafeSearch: "off-requested", note: "Search engines may still enforce jurisdiction, account, or index-level policies outside this app." },
     candidateCount: gathered.length,
+    rawDiscoveredCount: gathered.length,
+    rawDiscovered,
+    rawDiscoveredTruncated: gathered.length > rawDiscovered.length,
     evaluatedCount: prioritized.length,
-    manualSearchUrl: privacy.searchDuckDuckGo && queries[0] ? `https://duckduckgo.com/?q=${encodeURIComponent(queries[0].query)}` : null,
+    toolEvaluatedCount: toolTargets.length,
+    manualSearchUrl: privacy.searchDuckDuckGo && queries[0] ? `https://duckduckgo.com/?q=${encodeURIComponent(queries[0].query)}&kp=-2` : null,
     cached: false,
     note: toolsDir
-      ? "Discovery is host-agnostic: yt-dlp native and forced-generic extraction, raw page/embed/media identifiers, optional subtitle phrases, and general web search are combined. Unknown hosts are not rejected. Results are evidence-ranked; low-confidence candidates are retained instead of rejected. Frame comparison is available on demand for individual candidates."
+      ? "Discovery is host-agnostic: yt-dlp native and forced-generic extraction, raw page/embed/media identifiers, optional subtitle phrases, and general web search are combined. Unknown hosts are not rejected. Search provenance is used only for discovery/inspection priority; it can no longer create a likely-match label by itself. Unknown hosts and low-confidence candidates are retained. Candidate identity labels require evidence recovered from the candidate itself, and frame comparison is available for verification."
       : "Portable media tools were not found, so discovery used host-agnostic page/media signatures and general web search only. Install the Link Preview tools package for yt-dlp generic extraction and subtitle-assisted discovery."
   };
   alternateCacheSet(cacheKey, value);
@@ -2379,7 +2533,8 @@ app.post("/api/authorize-host", async (req, res) => {
     const result = await launchAuthorizationBrowser(targetUrl.trim());
     return res.json({
       ...result,
-      note: "A visible Edge session was opened inside Windows Sandbox through the public-network safety proxy. If the real video page is visible, you can click Retry preview while the window remains open. If a challenge appears, complete it first."
+      reusableForHost: result.host || null,
+      note: "A reusable site session was opened inside Windows Sandbox. Once the real site is reachable, one successful Retry can reuse this same session for other queued previews on the same host while the Edge window remains open."
     });
   } catch (error) {
     return res.status(400).json({ error: error?.message || "authorization_launch_failed" });

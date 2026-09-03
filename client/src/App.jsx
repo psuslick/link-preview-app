@@ -12,6 +12,7 @@ import "./App.css";
 const CLIENT_CONCURRENCY = 12;
 const BROWSER_FALLBACK_CONCURRENCY = 1;
 const FINDER_CONCURRENCY = 2;
+const BATCH_COMPARE_LIMIT = 5;
 const PRIVACY_STORAGE_KEY = "linkPreviewPrivacyV1";
 const FULL_PRIVACY = Object.freeze({
   remoteThumbnails: true,
@@ -80,6 +81,23 @@ function extractUrls(text) {
 function domainFor(url) {
   try { return new URL(url).hostname.replace(/^www\./, ""); }
   catch { return "Unknown source"; }
+}
+
+function siteKeyFor(url) {
+  try { return new URL(url).hostname.toLowerCase().replace(/^www\./, ""); }
+  catch { return ""; }
+}
+
+function needsAuthorizedSiteRetry(item) {
+  if (!item || item.image || item.state === "loading") return false;
+  return Boolean(
+    item.challengeDetected ||
+    item.needsBrowserFallback ||
+    item.browserFallbackSkippedReason === "challenge_page_detected" ||
+    item.warning === "challenge_page_detected" ||
+    item.method === "blocked-no-thumbnail" ||
+    item.method === "edge-no-thumbnail"
+  );
 }
 
 function formatDuration(seconds) {
@@ -190,11 +208,17 @@ function FinderResult({ job, candidate, alreadyInList, onAdd, onCompare, privacy
         </div>
         <h3>{candidate.title || candidate.url}</h3>
         <div className="alternate-domain">{candidate.provider || domainFor(candidate.url)}</div>
-        {(candidate.overlap?.matchedIds?.length > 0 || candidate.overlap?.matchedFilenames?.length > 0 || candidate.evidence?.length > 0) && (
+        {(candidate.overlap?.matchedIds?.length > 0 || candidate.overlap?.matchedFilenames?.length > 0 || candidate.discovery?.length > 0) && (
           <div className="candidate-evidence">
-            {candidate.overlap?.matchedIds?.slice(0, 2).map((value) => <span key={`id-${value}`}>ID match: {value}</span>)}
-            {candidate.overlap?.matchedFilenames?.slice(0, 2).map((value) => <span key={`file-${value}`}>File match: {value}</span>)}
-            {candidate.evidence?.slice(0, 3).map((entry, index) => <span key={`${entry.kind}-${index}`}>{entry.kind}</span>)}
+            {candidate.overlap?.matchedIds?.slice(0, 2).map((value) => <span key={`id-${value}`}>Verified ID: {value}</span>)}
+            {candidate.overlap?.matchedFilenames?.slice(0, 2).map((value) => <span key={`file-${value}`}>Verified file: {value}</span>)}
+            {candidate.discovery?.slice(0, 3).map((entry, index) => <span className="discovery-chip" key={`${entry.kind}-${index}`}>Found via {entry.engine}: {entry.kind}</span>)}
+          </div>
+        )}
+        {candidate.searchSupport && (
+          <div className="search-support-note">
+            Discovery support: {candidate.searchSupport.engineCount} engine{candidate.searchSupport.engineCount === 1 ? "" : "s"} · {candidate.searchSupport.queryCount} quer{candidate.searchSupport.queryCount === 1 ? "y" : "ies"}
+            {!candidate.strongIdentity && " · not identity evidence"}
           </div>
         )}
         {candidate.description && <p>{candidate.description}</p>}
@@ -311,14 +335,15 @@ function App() {
     } finally { setProcessing(false); }
   }
 
-  async function processSinglePreview(item) {
-    patchPreview(item.id, { state: "loading", error: null, method: "retrying" });
+  async function processSinglePreview(item, extraPatch = {}) {
+    patchPreview(item.id, { state: "loading", error: null, method: "retrying", ...extraPatch });
     const result = await fetchPreview(item.url, { allowBrowserFallback: privacy.browserFallback, privacy });
     patchPreview(item.id, {
       ...result,
       state: result.clientOk ? "ready" : "failed",
       error: result.clientOk ? result.error || null : result.error || `HTTP ${result.clientStatus}`
     });
+    return result;
   }
 
   async function handleSubmit(event) {
@@ -388,7 +413,7 @@ function App() {
     const jobs = sources.filter((source) => !activeSourceUrls.has(source.url.toLowerCase())).map((source, index) => ({
       id: `finder-${now}-${index}-${Math.random().toString(36).slice(2, 7)}`,
       source: { ...source }, privacy: { ...privacy }, state: "queued", results: [], error: null, queuedAt: Date.now(),
-      note: null, diagnostics: [], queryEvidence: [], candidateCount: 0, evaluatedCount: 0
+      note: null, diagnostics: [], queryEvidence: [], candidateCount: 0, rawDiscovered: [], rawDiscoveredCount: 0, evaluatedCount: 0, toolEvaluatedCount: 0, batchCompareState: "idle", batchCompareProgress: null
     }));
     if (!jobs.length) { setCopyStatus("Selected videos are already queued/running"); setTimeout(() => setCopyStatus(""), 2200); return; }
     setFinderJobs((current) => [...jobs, ...current]);
@@ -410,12 +435,17 @@ function App() {
       note: result.note || null,
       diagnostics: result.searchDiagnostics || [],
       candidateCount: result.candidateCount || 0,
+      rawDiscovered: Array.isArray(result.rawDiscovered) ? result.rawDiscovered : [],
+      rawDiscoveredCount: result.rawDiscoveredCount || result.candidateCount || 0,
+      rawDiscoveredTruncated: Boolean(result.rawDiscoveredTruncated),
       evaluatedCount: result.evaluatedCount || 0,
+      toolEvaluatedCount: result.toolEvaluatedCount || 0,
       cached: Boolean(result.cached),
       clientMs: result.clientMs,
       manualSearchUrl: result.manualSearchUrl || null,
       sourceSignals: result.sourceSignals || null,
       tools: result.tools || null,
+      searchPolicy: result.searchPolicy || null,
       queryEvidence: result.queryEvidence || []
     });
   }
@@ -434,7 +464,7 @@ function App() {
   }, [finderJobs]);
 
   function retryFinderJob(job) {
-    patchFinderJob(job.id, { state: "queued", privacy: { ...privacy }, results: [], error: null, diagnostics: [], queryEvidence: [], cached: false });
+    patchFinderJob(job.id, { state: "queued", privacy: { ...privacy }, results: [], rawDiscovered: [], rawDiscoveredCount: 0, error: null, diagnostics: [], queryEvidence: [], cached: false, batchCompareState: "idle", batchCompareProgress: null });
   }
   function removeFinderJob(id) { setFinderJobs((current) => current.filter((job) => job.id !== id)); }
   function clearCompletedFinderJobs() { setFinderJobs((current) => current.filter((job) => ["queued", "running"].includes(job.state))); }
@@ -457,15 +487,46 @@ function App() {
     patchFinderCandidate(jobId, candidate.url, { added: true });
   }
 
-  async function compareCandidate(job, candidate) {
+  async function compareCandidate(job, candidate, privacyOverride = null) {
+    const comparisonPrivacy = privacyOverride || job.privacy || privacy;
     patchFinderCandidate(job.id, candidate.url, { comparison: { state: "loading" } });
-    if (!privacy.sampleComparison) return;
-    const result = await compareVideoSamples(job.source.url, candidate.url, { privacy });
+    if (!comparisonPrivacy.sampleComparison) {
+      patchFinderCandidate(job.id, candidate.url, { comparison: { state: "failed", error: "comparison_disabled" } });
+      return null;
+    }
+    const result = await compareVideoSamples(job.source.url, candidate.url, { privacy: comparisonPrivacy });
     if (!result.clientOk || !result.ok) {
       patchFinderCandidate(job.id, candidate.url, { comparison: { state: "failed", error: result.error || "frame_compare_failed" } });
-      return;
+      return null;
     }
     patchFinderCandidate(job.id, candidate.url, { comparison: { state: "ready", result } });
+    return result;
+  }
+
+  async function compareTopCandidates(job) {
+    if ((job.batchCompareState || "idle") === "running") return;
+    const comparisonPrivacy = job.privacy || privacy;
+    if (!comparisonPrivacy.sampleComparison) {
+      setCopyStatus("Sample comparison was disabled in this finder job's privacy snapshot");
+      setTimeout(() => setCopyStatus(""), 2600);
+      return;
+    }
+    const targets = (job.results || [])
+      .filter((candidate) => candidate.comparison?.state !== "loading")
+      .slice(0, BATCH_COMPARE_LIMIT);
+    if (!targets.length) return;
+
+    patchFinderJob(job.id, { batchCompareState: "running", batchCompareProgress: { done: 0, total: targets.length } });
+    let done = 0;
+    try {
+      for (const candidate of targets) {
+        await compareCandidate(job, candidate, comparisonPrivacy);
+        done += 1;
+        patchFinderJob(job.id, { batchCompareProgress: { done, total: targets.length } });
+      }
+    } finally {
+      patchFinderJob(job.id, { batchCompareState: "ready", batchCompareProgress: { done, total: targets.length } });
+    }
   }
 
   async function authorizeSite(preview) {
@@ -481,7 +542,7 @@ function App() {
     }
     patchPreview(preview.id, {
       authorizationState: "authorizing",
-      authorizationMessage: "If the real video page is visible in Edge, click Retry preview now. If a challenge appears, complete it first. You may leave the Edge window open while Retry reads that exact session."
+      authorizationMessage: `Reusable site session opened for ${siteKeyFor(preview.url)}. If the real page is visible, click Retry once; successful authorization will then be reused automatically for other previews from this site.`
     });
   }
 
@@ -490,12 +551,40 @@ function App() {
     if (status.clientOk && status.live) {
       patchPreview(preview.id, {
         authorizationState: "authorizing",
-        authorizationMessage: "Reading the currently open Sandbox Edge session…"
+        authorizationMessage: "Reading this exact URL through the reusable Sandbox site session…"
       });
     } else if (status.clientOk && status.ready) {
-      patchPreview(preview.id, { authorizationState: "ready", authorizationMessage: "Authorized Sandbox browser profile ready." });
+      patchPreview(preview.id, { authorizationState: "ready", authorizationMessage: "Reusable Sandbox site profile ready." });
     }
-    await processSinglePreview(preview);
+
+    const result = await processSinglePreview(preview);
+    if (!result?.clientOk || !result.image) return;
+
+    const siteKey = siteKeyFor(preview.url);
+    if (!siteKey) return;
+    const siblings = previews.filter((item) =>
+      item.id !== preview.id &&
+      siteKeyFor(item.url) === siteKey &&
+      needsAuthorizedSiteRetry(item)
+    );
+    if (!siblings.length) {
+      patchPreview(preview.id, {
+        authorizationState: "site-ready",
+        authorizationMessage: `Site session active for ${siteKey}. Other previews from this site can reuse it.`
+      });
+      return;
+    }
+
+    patchPreview(preview.id, {
+      authorizationState: "site-ready",
+      authorizationMessage: `Site session active for ${siteKey}. Automatically retrying ${siblings.length} other preview${siblings.length === 1 ? "" : "s"} from this site.`
+    });
+    for (const sibling of siblings) {
+      await processSinglePreview(sibling, {
+        authorizationState: "site-retry",
+        authorizationMessage: `Reusing authorized ${siteKey} session automatically…`
+      });
+    }
   }
 
   function handleCardClick(event, id) {
@@ -628,7 +717,7 @@ function App() {
                         {preview.description && <p>{preview.description}</p>}
                         {preview.challengeDetected && preview.state !== "failed" && (
                           <div className="challenge-box">
-                            <p className="warning-message">The lightweight preview was blocked or challenged. Open the site in a normal Sandbox Edge session; if the real video page appears, Retry can read that same live session.</p>
+                            <p className="warning-message">The lightweight preview was blocked or challenged. Open one reusable Sandbox site session. After one successful Retry, other challenged previews from this same site are retried automatically.</p>
                             <div className="challenge-actions">
                               <button type="button" onClick={() => authorizeSite(preview)} disabled={!privacy.browserFallback || !privacy.interactiveAuthorization || preview.authorizationState === "launching" || preview.authorizationState === "authorizing"}>
                                 {preview.authorizationState === "authorizing" ? "Site session open" : "Open site session"}
@@ -725,8 +814,18 @@ function App() {
                   {job.state === "ready" && (
                     <>
                       <div className="alternate-toolbar">
-                        <span>{job.results.length} candidate{job.results.length === 1 ? "" : "s"} shown · {job.candidateCount || 0} discovered · {job.evaluatedCount || 0} evaluated{job.cached ? " · cache" : ""}</span>
-                        <span className="alternate-toolbar-right">{Number.isFinite(job.clientMs) && <span>{job.clientMs} ms</span>}{job.manualSearchUrl && <a href={job.manualSearchUrl} target="_blank" rel="noopener noreferrer">Broader web search ↗</a>}</span>
+                        <span>{job.results.length} shown · {job.rawDiscoveredCount || job.candidateCount || 0} raw discovered · {job.evaluatedCount || 0} page-inspected · {job.toolEvaluatedCount || 0} tool-probed{job.cached ? " · cache" : ""}</span>
+                        <span className="alternate-toolbar-right">
+                          {job.privacy?.sampleComparison && (
+                            <button type="button" className="compare-top-button" onClick={() => compareTopCandidates(job)} disabled={job.batchCompareState === "running" || !job.results.length}>
+                              {job.batchCompareState === "running"
+                                ? `Comparing ${job.batchCompareProgress?.done || 0}/${job.batchCompareProgress?.total || Math.min(BATCH_COMPARE_LIMIT, job.results.length)}…`
+                                : `Compare top ${Math.min(BATCH_COMPARE_LIMIT, job.results.length)}`}
+                            </button>
+                          )}
+                          {Number.isFinite(job.clientMs) && <span>{job.clientMs} ms</span>}
+                          {job.manualSearchUrl && <a href={job.manualSearchUrl} target="_blank" rel="noopener noreferrer">Broader web search ↗</a>}
+                        </span>
                       </div>
 
                       {job.results.length ? (
@@ -739,13 +838,28 @@ function App() {
                               alreadyInList={previews.some((item) => item.url.toLowerCase() === candidate.url.toLowerCase())}
                               onAdd={(value) => addAlternate(job.id, value)}
                               onCompare={(value) => compareCandidate(job, value)}
-                              privacy={privacy}
+                              privacy={job.privacy || privacy}
                             />
                           ))}
                         </div>
                       ) : (
-                        <div className="alternate-empty"><strong>No candidates were returned by the public indexes</strong><p>The finder no longer suppresses low-confidence results. If this is empty, check diagnostics: the search engines themselves likely returned zero usable external URLs.</p></div>
+                        <div className="alternate-empty"><strong>No inspected candidates to show</strong><p>Open Raw discovered results below. If raw URLs exist, discovery worked but candidate inspection failed or did not complete; if raw is empty, the enabled search indexes returned no usable public URLs.</p></div>
                       )}
+
+                      <details className="raw-discovery">
+                        <summary>Raw discovered results ({job.rawDiscoveredCount || 0})</summary>
+                        <p>These are URLs returned by the enabled public search indexes before page/tool ranking. Search provenance is not treated as proof that a video matches.</p>
+                        {job.rawDiscoveredTruncated && <p className="warning-text">Showing the first {job.rawDiscovered?.length || 0} raw URLs of {job.rawDiscoveredCount}.</p>}
+                        <div className="raw-discovery-list">
+                          {(job.rawDiscovered || []).map((item, index) => (
+                            <div className="raw-discovery-row" key={`${item.url}-${index}`}>
+                              <div><strong>{item.searchTitle || domainFor(item.url)}</strong><span>{(item.engines || []).join(" + ") || "search"}</span><span>{(item.queryKinds || []).join(" · ") || "unknown query"}</span></div>
+                              {item.snippet && <p>{item.snippet}</p>}
+                              <a href={item.url} target="_blank" rel="noopener noreferrer">{item.url}</a>
+                            </div>
+                          ))}
+                        </div>
+                      </details>
 
                       <details className="alternate-diagnostics">
                         <summary>Discovery diagnostics</summary>
@@ -758,8 +872,9 @@ function App() {
                             <code>{job.tools.sourceMode || "—"}{job.tools.sourceExtractor ? ` / ${job.tools.sourceExtractor}` : ""}</code>
                           </div>
                         )}
+                        {job.searchPolicy && <div className="alternate-diagnostic-row"><strong>Search filtering</strong><span>DDG off requested</span><span>Bing off requested · Mojeek off requested</span><code>{job.searchPolicy.note}</code></div>}
                         {job.sourceSignals?.transcript?.phrase && <div className="alternate-diagnostic-row"><strong>Transcript</strong><span>{job.sourceSignals.transcript.lang || "unknown"}</span><span>{job.sourceSignals.transcript.automatic ? "automatic" : "subtitle"}</span><code>“{job.sourceSignals.transcript.phrase}”</code></div>}
-                        {(job.queryEvidence || []).map((entry, index) => <div className="alternate-diagnostic-row" key={`query-${entry.kind}-${index}`}><strong>{entry.kind}</strong><span>{Math.round((entry.weight || 0) * 100)}% signal</span><span>query</span><code>{entry.query}</code></div>)}
+                        {(job.queryEvidence || []).map((entry, index) => <div className="alternate-diagnostic-row" key={`query-${entry.kind}-${index}`}><strong>{entry.kind}</strong><span>{Math.round((entry.weight || 0) * 100)}% query priority</span><span>discovery only</span><code>{entry.query}</code></div>)}
                         {(job.diagnostics || []).map((entry, index) => <div className="alternate-diagnostic-row" key={`${entry.engine}-${entry.kind}-${index}`}><strong>{entry.engine}</strong><span>{entry.status || "network"}</span><span>{entry.found || 0} results</span><code>{entry.query}</code>{entry.error && <span className="failed-text">{entry.error}</span>}</div>)}
                       </details>
                     </>
