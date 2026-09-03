@@ -637,3 +637,41 @@ button:disabled { opacity: 0.42; cursor: default; }
 }
 
 .alternate-toolbar-right a:hover { text-decoration: underline; }
+
+/* v2.3 host-agnostic version discovery */
+.discovery-evidence-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 14px;
+  margin: 0 0 14px;
+  border: 1px solid rgba(127, 127, 127, 0.24);
+  border-radius: 10px;
+  background: rgba(127, 127, 127, 0.06);
+  font-size: 0.82rem;
+}
+
+.discovery-evidence-strip > span,
+.candidate-evidence > span {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid rgba(127, 127, 127, 0.25);
+  border-radius: 999px;
+  padding: 3px 8px;
+  line-height: 1.2;
+}
+
+.tool-status.ready { font-weight: 700; }
+.tool-status.missing { opacity: 0.78; }
+
+.candidate-evidence {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 7px 0 4px;
+  font-size: 0.74rem;
+}
+
+.discovery-tool-row code {
+  overflow-wrap: anywhere;
+}

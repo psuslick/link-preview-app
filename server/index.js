@@ -22,6 +22,7 @@ const GLOBAL_NETWORK_LIMIT = 16;
 const PER_HOST_NETWORK_LIMIT = 4;
 const REQUEST_TIMEOUT_MS = 9000;
 const HTML_LIMIT_BYTES = 512 * 1024;
+const MEDIA_DISCOVERY_HTML_LIMIT_BYTES = 1024 * 1024;
 const JSON_LIMIT_BYTES = 256 * 1024;
 const IMAGE_LIMIT_BYTES = 8 * 1024 * 1024;
 const IMAGE_NETWORK_LIMIT = 6;
@@ -363,7 +364,9 @@ async function fetchBounded(
         }
 
         const maxBytes =
-          kind === "json" ? JSON_LIMIT_BYTES : kind === "image" ? IMAGE_LIMIT_BYTES : HTML_LIMIT_BYTES;
+          kind === "json" ? JSON_LIMIT_BYTES :
+          kind === "image" ? IMAGE_LIMIT_BYTES :
+          kind === "media-page" ? MEDIA_DISCOVERY_HTML_LIMIT_BYTES : HTML_LIMIT_BYTES;
         const body = await readLimitedBody(response.body, maxBytes, kind === "html");
         const text = kind === "image" ? null : body.buffer.toString("utf8");
 
@@ -476,6 +479,141 @@ function parseDurationSeconds(value) {
   );
 }
 
+function decodeEmbeddedValue(value) {
+  if (typeof value !== "string") return value;
+  return value
+    .replace(/\\u002[fF]/g, "/")
+    .replace(/\\u0026/g, "&")
+    .replace(/\\u003[aA]/g, ":")
+    .replace(/\\u003[dD]/g, "=")
+    .replace(/\\\//g, "/")
+    .replace(/&amp;/g, "&")
+    .trim();
+}
+
+function collectJsonImageCandidates(value, out, depth = 0, videoContext = false) {
+  if (!value || depth > 10 || out.length >= 80) return;
+  if (Array.isArray(value)) {
+    for (const item of value) collectJsonImageCandidates(item, out, depth + 1, videoContext);
+    return;
+  }
+  if (typeof value !== "object") return;
+
+  const rawType = value["@type"];
+  const types = Array.isArray(rawType) ? rawType : [rawType];
+  const isVideo = videoContext || types.some((entry) => String(entry || "").toLowerCase() === "videoobject");
+  const strongKeys = new Set([
+    "thumbnailurl", "thumbnail_url", "thumbnail", "thumbnailuri",
+    "poster", "posterurl", "poster_url", "posterimage", "posterimageurl",
+    "previewimage", "preview_image", "previewimageurl", "preview_image_url",
+    "imageurl", "image_url"
+  ]);
+
+  for (const [key, child] of Object.entries(value)) {
+    const normalized = key.toLowerCase().replace(/[^a-z0-9_]/g, "");
+    const imageKey = strongKeys.has(normalized) || (isVideo && normalized === "image");
+    if (imageKey) {
+      if (typeof child === "string") out.push(decodeEmbeddedValue(child));
+      else if (Array.isArray(child)) {
+        for (const item of child) {
+          if (typeof item === "string") out.push(decodeEmbeddedValue(item));
+          else if (item && typeof item === "object") {
+            for (const candidateKey of ["url", "contentUrl", "src", "href"]) {
+              if (typeof item[candidateKey] === "string") out.push(decodeEmbeddedValue(item[candidateKey]));
+            }
+          }
+        }
+      } else if (child && typeof child === "object") {
+        for (const candidateKey of ["url", "contentUrl", "src", "href"]) {
+          if (typeof child[candidateKey] === "string") out.push(decodeEmbeddedValue(child[candidateKey]));
+        }
+      }
+    }
+    collectJsonImageCandidates(child, out, depth + 1, isVideo);
+  }
+}
+
+function extractScriptImageCandidates($) {
+  const results = [];
+  const keyPattern = /["'](?:thumbnail(?:Url|_url)?|poster(?:Url|_url)?|posterImage(?:Url)?|preview(?:Image|_image)(?:Url|_url)?|imageUrl|image_url)["']\s*:\s*["']([^"'<>]{4,2048})["']/gi;
+
+  $("script").each((_, element) => {
+    if (results.length >= 80) return;
+    const text = $(element).html() || $(element).text() || "";
+    if (!text || text.length > 1_500_000) return;
+
+    const type = String($(element).attr("type") || "").toLowerCase();
+    const id = String($(element).attr("id") || "").toLowerCase();
+    const looksJson = type.includes("json") || id.includes("next_data") || id.includes("initial") || id.includes("state");
+    if (looksJson) {
+      try {
+        const parsed = JSON.parse(text.trim());
+        collectJsonImageCandidates(parsed, results);
+      } catch {
+        // Many frameworks wrap state in JavaScript instead of pure JSON.
+      }
+    }
+
+    let match;
+    keyPattern.lastIndex = 0;
+    while ((match = keyPattern.exec(text)) && results.length < 80) {
+      results.push(decodeEmbeddedValue(match[1]));
+    }
+  });
+
+  return results;
+}
+
+function extractDomImageCandidates($) {
+  const scored = [];
+  const seen = new Set();
+  const add = (value, score, reason) => {
+    if (!value || typeof value !== "string") return;
+    const key = value.trim();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    scored.push({ value: key, score, reason });
+  };
+
+  $("video[poster]").each((_, element) => add($(element).attr("poster"), 30, "video-poster"));
+
+  $("img").slice(0, 400).each((_, element) => {
+    const el = $(element);
+    const attrs = ["src", "data-src", "data-lazy-src", "data-original", "data-image", "data-thumb", "data-thumbnail", "data-poster"];
+    const haystack = [el.attr("id"), el.attr("class"), el.attr("alt")].filter(Boolean).join(" ").toLowerCase();
+    const width = Number.parseInt(el.attr("width") || el.attr("data-width") || "", 10);
+    const height = Number.parseInt(el.attr("height") || el.attr("data-height") || "", 10);
+
+    for (const attr of attrs) {
+      const value = el.attr(attr);
+      if (!value) continue;
+      const probe = `${haystack} ${value}`.toLowerCase();
+      let score = 0;
+      if (/poster|thumbnail|thumb|preview|video|player|cover|hero/.test(probe)) score += 10;
+      if (/logo|icon|avatar|emoji|sprite|badge|favicon/.test(probe)) score -= 12;
+      if (Number.isFinite(width) && Number.isFinite(height)) {
+        if (width >= 300 && height >= 160) score += 5;
+        if (width > height && width / Math.max(height, 1) >= 1.25) score += 2;
+        if (width <= 96 || height <= 96) score -= 6;
+      }
+      if (/\.(?:jpe?g|png|webp|avif)(?:[?#]|$)/i.test(value)) score += 1;
+      if (score >= 1) add(value, score, attr);
+    }
+  });
+
+  $("[style*='background']").slice(0, 250).each((_, element) => {
+    const el = $(element);
+    const hint = `${el.attr("id") || ""} ${el.attr("class") || ""}`.toLowerCase();
+    if (!/poster|thumbnail|thumb|preview|video|player|cover|hero/.test(hint)) return;
+    const style = el.attr("style") || "";
+    const matches = style.matchAll(/background(?:-image)?\s*:\s*url\((['"]?)(.*?)\1\)/gi);
+    for (const match of matches) add(match[2], 8, "background");
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, 24).map((entry) => entry.value);
+}
+
 function extractHtmlMetadata(html, pageUrl) {
   const $ = cheerio.load(html || "");
   const meta = (selector) => $(selector).first().attr("content")?.trim() || null;
@@ -489,35 +627,45 @@ function extractHtmlMetadata(html, pageUrl) {
   const jsonImages = [];
   $('script[type="application/ld+json"]').each((_, element) => {
     const text = $(element).text();
-    if (!text || text.length > 512_000) return;
+    if (!text || text.length > 1_000_000) return;
     try {
       const parsed = JSON.parse(text);
       if (!videoObject) videoObject = findVideoObject(parsed);
+      collectJsonImageCandidates(parsed, jsonImages);
       const found = findVideoObject(parsed);
       const thumbs = found?.thumbnailUrl;
       if (Array.isArray(thumbs)) jsonImages.push(...thumbs);
       else if (typeof thumbs === "string") jsonImages.push(thumbs);
+      if (typeof found?.image === "string") jsonImages.push(found.image);
     } catch {
       // Invalid JSON-LD is common.
     }
   });
 
+  const metaImages = [
+    ...metas('meta[property="og:image:secure_url"]'),
+    ...metas('meta[property="og:image"]'),
+    ...metas('meta[property="og:image:url"]'),
+    ...metas('meta[name="twitter:image"]'),
+    ...metas('meta[name="twitter:image:src"]'),
+    ...metas('meta[property="twitter:image"]'),
+    ...metas('meta[itemprop="thumbnailUrl"]'),
+    ...metas('meta[name="thumbnail"]'),
+    ...metas('meta[name="thumbnail_url"]')
+  ];
+  const posterImages = $("video[poster]")
+    .map((_, element) => $(element).attr("poster"))
+    .get()
+    .filter(Boolean);
+  const scriptImages = extractScriptImageCandidates($);
+  const domImages = extractDomImageCandidates($);
+  const imageSrcLinks = $('link[rel="image_src"], link[rel="preload"][as="image"]')
+    .map((_, element) => $(element).attr("href"))
+    .get()
+    .filter(Boolean);
+
   const images = uniqueUrls(
-    [
-      metas('meta[property="og:image:secure_url"]'),
-      metas('meta[property="og:image"]'),
-      metas('meta[property="og:image:url"]'),
-      metas('meta[name="twitter:image"]'),
-      metas('meta[name="twitter:image:src"]'),
-      metas('meta[itemprop="thumbnailUrl"]'),
-      jsonImages,
-      $("video[poster]")
-        .map((_, element) => $(element).attr("poster"))
-        .get(),
-      $('link[rel="image_src"]')
-        .map((_, element) => $(element).attr("href"))
-        .get()
-    ],
+    [metaImages, jsonImages, posterImages, scriptImages, domImages, imageSrcLinks],
     pageUrl
   );
 
@@ -546,7 +694,15 @@ function extractHtmlMetadata(html, pageUrl) {
       parseDurationSeconds(videoObject?.duration) ||
       parseDurationSeconds(meta('meta[property="video:duration"]')) ||
       parseDurationSeconds(meta('meta[property="og:video:duration"]')),
-    oembedUrl: resolveUrl(oembedLink, pageUrl)
+    oembedUrl: resolveUrl(oembedLink, pageUrl),
+    extractorStats: {
+      meta: uniqueUrls(metaImages, pageUrl).length,
+      json: uniqueUrls(jsonImages, pageUrl).length,
+      script: uniqueUrls(scriptImages, pageUrl).length,
+      poster: uniqueUrls(posterImages, pageUrl).length,
+      dom: uniqueUrls(domImages, pageUrl).length,
+      total: images.length
+    }
   };
 }
 
@@ -805,6 +961,7 @@ async function renderMetadataWithEdge(targetUrl) {
     return {
       ok: true,
       metadata,
+      mediaSignals: extractMediaDiscoverySignals(html, targetUrl),
       bytes: Buffer.byteLength(html),
       diagnostic: helperResult.diagnostic || null
     };
@@ -824,7 +981,6 @@ async function createPreview(rawUrl, { allowBrowserFallback = true } = {}) {
   const derivedImages = providerDerivedImages(targetUrl);
   let providerMetadata = null;
 
-  // Fast lane: provider oEmbed first. This often avoids anti-bot HTML pages entirely.
   if (provider?.oembedUrl) {
     providerMetadata = await fetchOEmbed(provider.oembedUrl, targetUrl, provider.name);
     if (providerMetadata?.image) {
@@ -837,14 +993,18 @@ async function createPreview(rawUrl, { allowBrowserFallback = true } = {}) {
         elapsedMs: Date.now() - started,
         cached: false,
         warning: null,
-        browserFallback: false
+        browserFallback: false,
+        browserFallbackAttempted: false,
+        browserFallbackError: null,
+        needsBrowserFallback: false,
+        extractorStats: null,
+        browserExtractorStats: null
       };
       cacheSet(cacheKey, value);
       return value;
     }
   }
 
-  // YouTube is special: deterministic thumbnail candidates are reliable and cheap.
   if (derivedImages.length) {
     const value = {
       url: targetUrl,
@@ -860,36 +1020,52 @@ async function createPreview(rawUrl, { allowBrowserFallback = true } = {}) {
       elapsedMs: Date.now() - started,
       cached: false,
       warning: null,
-      browserFallback: false
+      browserFallback: false,
+      browserFallbackAttempted: false,
+      browserFallbackError: null,
+      needsBrowserFallback: false,
+      extractorStats: null,
+      browserExtractorStats: null
     };
     cacheSet(cacheKey, value);
     return value;
   }
 
   const htmlResult = await fetchBounded(targetUrl, { kind: "html" });
-  let metadata = htmlResult.ok
+  const httpMetadata = htmlResult.ok
     ? extractHtmlMetadata(htmlResult.text, htmlResult.finalUrl || targetUrl)
-    : {
-        title: providerMetadata?.title || null,
-        description: providerMetadata?.description || null,
-        image: null,
-        images: providerMetadata?.images || [],
-        provider: providerMetadata?.provider || provider?.name || null,
-        durationSeconds: providerMetadata?.durationSeconds || null,
-        oembedUrl: null
-      };
+    : null;
+  let metadata = httpMetadata || {
+    title: providerMetadata?.title || null,
+    description: providerMetadata?.description || null,
+    image: null,
+    images: providerMetadata?.images || [],
+    provider: providerMetadata?.provider || provider?.name || null,
+    durationSeconds: providerMetadata?.durationSeconds || null,
+    oembedUrl: null,
+    extractorStats: null
+  };
 
   metadata = mergeMetadata(metadata, providerMetadata, htmlResult.finalUrl || targetUrl);
+  let discoveredOembedAttempted = false;
+
+  // Discovery order matters: try an advertised oEmbed endpoint first, then decide
+  // whether a real browser is required. v2.2.1 incorrectly treated the mere
+  // presence of an oEmbed link as proof that browser fallback was unnecessary.
+  if (!metadata.image && httpMetadata?.oembedUrl) {
+    discoveredOembedAttempted = true;
+    const discovered = await fetchOEmbed(httpMetadata.oembedUrl, targetUrl, metadata.provider);
+    if (discovered) metadata = mergeMetadata(discovered, metadata, targetUrl);
+  }
+
   let usedBrowserFallback = false;
   let browserFallbackAttempted = false;
   let browserError = null;
   let browserDiagnostic = null;
+  let browserExtractorStats = null;
 
-  // 401/403/405 commonly mean "real browser required" rather than "URL is invalid".
-  // Also use the browser when plain HTML succeeded but exposed no usable thumbnail.
-  const needsBrowserFallback =
-    [401, 403, 405].includes(htmlResult.status) ||
-    (htmlResult.ok && !metadata.image && !metadata.oembedUrl);
+  const restrictedStatus = [401, 403, 405, 406, 418].includes(htmlResult.status);
+  const needsBrowserFallback = restrictedStatus || (htmlResult.ok && !metadata.image);
   const shouldTryBrowser = allowBrowserFallback && needsBrowserFallback;
 
   if (shouldTryBrowser) {
@@ -897,23 +1073,24 @@ async function createPreview(rawUrl, { allowBrowserFallback = true } = {}) {
     const browser = await renderMetadataWithEdge(targetUrl);
     if (browser.ok) {
       usedBrowserFallback = true;
+      browserExtractorStats = browser.metadata?.extractorStats || null;
+      const browserOembedUrl = browser.metadata?.oembedUrl || null;
       metadata = mergeMetadata(browser.metadata, metadata, targetUrl);
+
+      if (!metadata.image && browserOembedUrl && (!discoveredOembedAttempted || browserOembedUrl !== httpMetadata?.oembedUrl)) {
+        const discovered = await fetchOEmbed(browserOembedUrl, targetUrl, metadata.provider);
+        if (discovered) metadata = mergeMetadata(discovered, metadata, targetUrl);
+      }
     } else {
       browserError = browser.error || "edge_fallback_failed";
       browserDiagnostic = browser.diagnostic || null;
     }
   }
 
-  // Respect explicit upstream throttling; do not try to bulldoze through 429/503.
   if (!htmlResult.ok && [429, 503].includes(htmlResult.status) && !metadata.image) {
     const error = new Error(htmlResult.error || `upstream_status_${htmlResult.status}`);
     error.status = htmlResult.status;
     throw error;
-  }
-
-  if (!metadata.image && metadata.oembedUrl) {
-    const discovered = await fetchOEmbed(metadata.oembedUrl, targetUrl, metadata.provider);
-    if (discovered) metadata = mergeMetadata(discovered, metadata, targetUrl);
   }
 
   const images = uniqueUrls([metadata.images, metadata.image], targetUrl);
@@ -949,7 +1126,9 @@ async function createPreview(rawUrl, { allowBrowserFallback = true } = {}) {
     browserFallbackAttempted,
     browserFallbackError: browserError,
     browserFallbackDiagnostic: browserDiagnostic,
-    needsBrowserFallback: needsBrowserFallback && !allowBrowserFallback
+    needsBrowserFallback: needsBrowserFallback && !allowBrowserFallback,
+    extractorStats: httpMetadata?.extractorStats || null,
+    browserExtractorStats
   };
 
   if ((value.image || value.title) && !value.needsBrowserFallback) cacheSet(cacheKey, value);
@@ -988,6 +1167,12 @@ function cleanSearchTitle(rawTitle) {
 const TITLE_STOPWORDS = new Set([
   "a", "an", "and", "are", "at", "be", "by", "for", "from", "in", "is", "it", "of", "on", "or", "the", "to", "with",
   "video", "official", "watch", "clip", "hd", "4k", "short", "shorts"
+]);
+
+const PHRASE_STOPWORDS = new Set([
+  ...TITLE_STOPWORDS, "this", "that", "these", "those", "you", "your", "we", "our", "they", "their", "was", "were", "will",
+  "have", "has", "had", "not", "but", "can", "could", "would", "should", "about", "into", "over", "after", "before", "when",
+  "where", "what", "who", "how"
 ]);
 
 function titleTokens(value) {
@@ -1036,28 +1221,6 @@ function discoveryHost(rawUrl) {
   }
 }
 
-const VIDEO_DISCOVERY_HOSTS = [
-  "youtube.com", "youtu.be", "vimeo.com", "dailymotion.com", "dai.ly", "tiktok.com", "streamable.com", "loom.com",
-  "x.com", "twitter.com", "reddit.com", "rumble.com", "bitchute.com", "odysee.com", "archive.org", "twitch.tv",
-  "facebook.com", "fb.watch", "instagram.com", "vk.com", "ok.ru", "kick.com"
-];
-
-function isLikelyVideoResult(rawUrl, resultTitle = "", sourceHost = "") {
-  let url;
-  try {
-    url = validateUrl(rawUrl);
-  } catch {
-    return false;
-  }
-  const host = url.hostname.toLowerCase().replace(/^www\./, "");
-  if (host === sourceHost) return true;
-  if (VIDEO_DISCOVERY_HOSTS.some((domain) => host === domain || host.endsWith(`.${domain}`))) return true;
-  if (knownProvider(url.toString())) return true;
-  if (/\.(?:mp4|webm|mov|m4v)(?:$|[?#])/i.test(url.pathname)) return true;
-  if (/(?:^|\/)(?:watch|video|videos|clip|clips|shorts|reel|reels|embed|v)(?:\/|$)/i.test(url.pathname)) return true;
-  return /\b(?:video|watch|full|clip|mirror|reupload|re-upload)\b/i.test(resultTitle);
-}
-
 function unwrapSearchResultHref(rawHref, baseUrl) {
   if (!rawHref) return null;
   try {
@@ -1069,7 +1232,6 @@ function unwrapSearchResultHref(rawHref, baseUrl) {
       return null;
     }
     if (host === "bing.com" || host.endsWith(".bing.com")) {
-      // Bing sometimes wraps organic URLs in /ck/a links with a base64-encoded `u` value.
       if (resolved.pathname.startsWith("/ck/")) {
         const encoded = resolved.searchParams.get("u");
         if (encoded) {
@@ -1084,7 +1246,6 @@ function unwrapSearchResultHref(rawHref, baseUrl) {
         }
         return null;
       }
-      // Organic Bing links are often direct. Ignore internal navigation links.
       if (resolved.pathname.startsWith("/search") || resolved.pathname.startsWith("/images")) return null;
     }
     return validateUrl(resolved.toString()).toString();
@@ -1093,7 +1254,9 @@ function unwrapSearchResultHref(rawHref, baseUrl) {
   }
 }
 
-function parseDuckDuckGoResults(html, sourceHost) {
+// Deliberately do not apply a video-host allowlist or a "looks like video" URL filter here.
+// Mirrors can live on arbitrary public sites; relevance is established later from evidence.
+function parseDuckDuckGoResults(html) {
   const $ = cheerio.load(html || "");
   const results = [];
   const seen = new Set();
@@ -1102,7 +1265,7 @@ function parseDuckDuckGoResults(html, sourceHost) {
     const url = unwrapSearchResultHref(anchor.attr("href"), "https://html.duckduckgo.com/html/");
     const title = anchor.text().replace(/\s+/g, " ").trim();
     const snippet = $(element).find(".result__snippet").first().text().replace(/\s+/g, " ").trim();
-    if (!url || !isLikelyVideoResult(url, title, sourceHost)) return;
+    if (!url) return;
     const key = canonicalDiscoveryUrl(url).toLowerCase();
     if (seen.has(key)) return;
     seen.add(key);
@@ -1111,7 +1274,7 @@ function parseDuckDuckGoResults(html, sourceHost) {
   return results;
 }
 
-function parseBingResults(html, sourceHost) {
+function parseBingResults(html) {
   const $ = cheerio.load(html || "");
   const results = [];
   const seen = new Set();
@@ -1120,7 +1283,7 @@ function parseBingResults(html, sourceHost) {
     const url = unwrapSearchResultHref(anchor.attr("href"), "https://www.bing.com/search");
     const title = anchor.text().replace(/\s+/g, " ").trim();
     const snippet = $(element).find(".b_caption p").first().text().replace(/\s+/g, " ").trim();
-    if (!url || !isLikelyVideoResult(url, title, sourceHost)) return;
+    if (!url) return;
     const key = canonicalDiscoveryUrl(url).toLowerCase();
     if (seen.has(key)) return;
     seen.add(key);
@@ -1129,7 +1292,7 @@ function parseBingResults(html, sourceHost) {
   return results;
 }
 
-async function searchDuckDuckGo(query, sourceHost) {
+async function searchDuckDuckGo(query) {
   const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}&kl=us-en`;
   const response = await fetchBounded(url, {
     kind: "search",
@@ -1138,14 +1301,14 @@ async function searchDuckDuckGo(query, sourceHost) {
     headers: { Referer: "https://duckduckgo.com/" }
   });
   if (!response.ok) return { ok: false, status: response.status, results: [], error: response.error || `search_status_${response.status}` };
-  return { ok: true, status: response.status, results: parseDuckDuckGoResults(response.text, sourceHost) };
+  return { ok: true, status: response.status, results: parseDuckDuckGoResults(response.text) };
 }
 
-async function searchBing(query, sourceHost) {
-  const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=20&setlang=en-US`;
+async function searchBing(query) {
+  const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=25&setlang=en-US`;
   const response = await fetchBounded(url, { kind: "search", timeoutMs: ALTERNATE_SEARCH_TIMEOUT_MS, retries: 1 });
   if (!response.ok) return { ok: false, status: response.status, results: [], error: response.error || `search_status_${response.status}` };
-  return { ok: true, status: response.status, results: parseBingResults(response.text, sourceHost) };
+  return { ok: true, status: response.status, results: parseBingResults(response.text) };
 }
 
 async function runLimited(items, concurrency, worker) {
@@ -1165,164 +1328,503 @@ async function runLimited(items, concurrency, worker) {
   return output;
 }
 
-function classifyAlternate(source, candidate, similarity) {
+function normalizeSignal(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function signalIdCandidate(value) {
+  const cleaned = String(value || "").trim().replace(/^['"]|['"]$/g, "");
+  if (cleaned.length < 5 || cleaned.length > 64) return null;
+  if (/^(?:https?|www|video|videos|watch|embed|player|media|stream|master|index|playlist|manifest)$/i.test(cleaned)) return null;
+  if (!/[a-z]/i.test(cleaned) || !/\d/.test(cleaned)) return null;
+  return cleaned;
+}
+
+function mediaFilenameStem(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    const name = decodeURIComponent(url.pathname.split("/").filter(Boolean).pop() || "");
+    const stem = name.replace(/\.(?:mp4|m4v|mov|webm|mkv|avi|m3u8|mpd|ts)$/i, "").trim();
+    return signalIdCandidate(stem);
+  } catch {
+    return null;
+  }
+}
+
+function extractMediaDiscoverySignals(html, pageUrl) {
+  const $ = cheerio.load(html || "");
+  const mediaUrls = [];
+  const embedUrls = [];
+  const ids = [];
+  const filenames = [];
+  const seenUrl = new Set();
+  const seenId = new Set();
+
+  const addId = (value) => {
+    const candidate = signalIdCandidate(decodeEmbeddedValue(String(value || "")));
+    if (!candidate) return;
+    const key = candidate.toLowerCase();
+    if (seenId.has(key)) return;
+    seenId.add(key); ids.push(candidate);
+  };
+
+  const addUrl = (value, kind = "media") => {
+    const decoded = decodeEmbeddedValue(String(value || ""));
+    const resolved = resolveUrl(decoded, pageUrl);
+    if (!resolved) return;
+    try { validateUrl(resolved); } catch { return; }
+    const key = resolved.toLowerCase();
+    if (seenUrl.has(key)) return;
+    seenUrl.add(key);
+    if (kind === "embed") embedUrls.push(resolved); else mediaUrls.push(resolved);
+    const stem = mediaFilenameStem(resolved);
+    if (stem) filenames.push(stem);
+    try {
+      const u = new URL(resolved);
+      for (const segment of u.pathname.split("/").filter(Boolean)) addId(segment.replace(/\.[a-z0-9]{2,5}$/i, ""));
+      for (const keyName of ["id", "video", "video_id", "videoId", "media", "media_id", "mediaId", "asset", "asset_id", "assetId", "clip", "clip_id", "clipId"]) {
+        if (u.searchParams.has(keyName)) addId(u.searchParams.get(keyName));
+      }
+    } catch {}
+  };
+
+  const directSelectors = [
+    ["video[src]", "src", "media"], ["video source[src]", "src", "media"], ["source[src]", "src", "media"],
+    ["iframe[src]", "src", "embed"], ["embed[src]", "src", "embed"], ["object[data]", "data", "embed"]
+  ];
+  for (const [selector, attr, kind] of directSelectors) {
+    $(selector).slice(0, 150).each((_, element) => addUrl($(element).attr(attr), kind));
+  }
+  for (const selector of [
+    'meta[property="og:video"]', 'meta[property="og:video:url"]', 'meta[property="og:video:secure_url"]',
+    'meta[name="twitter:player"]', 'meta[itemprop="contentUrl"]', 'meta[itemprop="embedUrl"]'
+  ]) {
+    $(selector).each((_, element) => addUrl($(element).attr("content"), selector.includes("player") || selector.includes("embed") ? "embed" : "media"));
+  }
+
+  const mediaUrlPattern = /(?:https?:)?\\?\/\\?\/[^\s"'<>\\]{4,1800}?\.(?:m3u8|mpd|mp4|m4v|mov|webm|mkv)(?:\?[^\s"'<>\\]*)?/gi;
+  const keyedPattern = /["'](?:contentUrl|embedUrl|videoUrl|video_url|playbackUrl|playback_url|streamUrl|stream_url|hlsUrl|hls_url|dashUrl|dash_url|manifestUrl|manifest_url|file|src)["']\s*:\s*["']([^"'<>]{4,1800})["']/gi;
+  const idPattern = /["'](?:videoId|video_id|mediaId|media_id|assetId|asset_id|clipId|clip_id|contentId|content_id)["']\s*:\s*["']([^"'<>]{3,128})["']/gi;
+  $("script").slice(0, 200).each((_, element) => {
+    const text = $(element).html() || $(element).text() || "";
+    if (!text || text.length > 1_500_000) return;
+    let match;
+    mediaUrlPattern.lastIndex = 0;
+    while ((match = mediaUrlPattern.exec(text)) && mediaUrls.length < 40) addUrl(match[0].replace(/\\\//g, "/"), "media");
+    keyedPattern.lastIndex = 0;
+    while ((match = keyedPattern.exec(text)) && mediaUrls.length + embedUrls.length < 60) {
+      const value = match[1].replace(/\\\//g, "/");
+      addUrl(value, /embed/i.test(match[0]) ? "embed" : "media");
+    }
+    idPattern.lastIndex = 0;
+    while ((match = idPattern.exec(text)) && ids.length < 40) addId(match[1]);
+  });
+
+  // Keep discovery evidence compact. Full signed URLs are not sent to search engines.
+  return {
+    mediaUrls: mediaUrls.slice(0, 24),
+    embedUrls: embedUrls.slice(0, 16),
+    ids: [...new Set(ids)].slice(0, 24),
+    filenames: [...new Set(filenames)].slice(0, 16)
+  };
+}
+
+function signalsFromToolResult(toolResult) {
+  const result = toolResult?.result;
+  if (!result) return { ids: [], filenames: [], mediaUrls: [], embedUrls: [] };
+  const ids = [result.id, result.displayId, result.genericId, result.uploaderId].map(signalIdCandidate).filter(Boolean);
+  const mediaUrls = (result.mediaUrls || []).filter(Boolean);
+  const filenames = mediaUrls.map(mediaFilenameStem).filter(Boolean);
+  return { ids: [...new Set(ids)], filenames: [...new Set(filenames)], mediaUrls, embedUrls: [] };
+}
+
+function mergeDiscoverySignals(...signals) {
+  const merge = (key) => [...new Set(signals.flatMap((signal) => signal?.[key] || []).filter(Boolean))];
+  return {
+    ids: merge("ids").slice(0, 32),
+    filenames: merge("filenames").slice(0, 24),
+    mediaUrls: merge("mediaUrls").slice(0, 32),
+    embedUrls: merge("embedUrls").slice(0, 24)
+  };
+}
+
+function distinctivePhrase(text, wordCount = 10) {
+  const words = String(text || "")
+    .replace(/https?:\/\/\S+/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/[^\p{L}\p{N}' -]+/gu, " ")
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 1200);
+  if (words.length < 6) return null;
+  let best = null;
+  for (let i = 0; i <= words.length - Math.min(wordCount, words.length); i += 1) {
+    const window = words.slice(i, i + wordCount);
+    const content = window.filter((word) => word.length >= 4 && !PHRASE_STOPWORDS.has(word.toLowerCase()));
+    const unique = new Set(content.map((word) => word.toLowerCase()));
+    const score = unique.size * 3 + content.reduce((sum, word) => sum + Math.min(word.length, 10), 0) / 10;
+    if (!best || score > best.score) best = { score, phrase: window.join(" ") };
+  }
+  return best?.score >= 12 ? best.phrase : null;
+}
+
+function subtitleCandidates(toolResult) {
+  const subtitles = toolResult?.result?.subtitles || [];
+  return [...subtitles].sort((a, b) => {
+    const score = (item) => (item.automatic ? 0 : 20) + (/^en(?:[-_]|$)/i.test(item.lang || "") ? 10 : 0) + (/^(?:vtt|srt|ttml|json3)$/i.test(item.ext || "") ? 4 : 0);
+    return score(b) - score(a);
+  });
+}
+
+function subtitleText(raw, ext = "") {
+  let text = String(raw || "");
+  if (/json3/i.test(ext)) {
+    try {
+      const data = JSON.parse(text);
+      text = (data?.events || []).flatMap((event) => event?.segs || []).map((seg) => seg?.utf8 || "").join(" ");
+    } catch {}
+  }
+  return text
+    .replace(/^WEBVTT.*$/gim, " ")
+    .replace(/^\d+\s*$/gm, " ")
+    .replace(/\d{1,2}:\d{2}(?::\d{2})?[.,]\d+\s*-->\s*\d{1,2}:\d{2}(?::\d{2})?[.,]\d+.*$/gm, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\{\\[^}]+\}/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function transcriptPhraseFromTool(toolResult) {
+  for (const subtitle of subtitleCandidates(toolResult).slice(0, 4)) {
+    try {
+      const response = await fetchBounded(subtitle.url, { kind: "json", timeoutMs: 7000, retries: 0, headers: { Accept: "text/vtt,text/plain,application/json,*/*" } });
+      if (!response.ok || !response.text) continue;
+      const phrase = distinctivePhrase(subtitleText(response.text, subtitle.ext), 11);
+      if (phrase) return { phrase, lang: subtitle.lang || null, automatic: Boolean(subtitle.automatic) };
+    } catch {}
+  }
+  return null;
+}
+
+const MEDIA_TOOL_HELPER_PATH = path.join(SERVER_DIR, "media-tool-probe.js");
+const MEDIA_TOOL_TIMEOUT_MS = 16_000;
+const MEDIA_TOOL_CANDIDATE_LIMIT = 6;
+const MEDIA_TOOL_CANDIDATE_CONCURRENCY = 2;
+
+async function findToolsDir() {
+  const candidates = [
+    process.env.LINK_PREVIEW_TOOLS_DIR,
+    "C:\\Users\\WDAGUtilityAccount\\Desktop\\SandboxBootstrap\\tools",
+    "C:\\SandboxBootstrap\\tools",
+    path.resolve(SERVER_DIR, "..", "..", "tools")
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    try {
+      await fs.access(path.join(candidate, "yt-dlp.exe"));
+      return candidate;
+    } catch {}
+  }
+  return null;
+}
+
+async function runMediaToolProbe(targetUrl, toolsDir) {
+  if (!toolsDir) return { ok: false, error: "tools_not_installed", attempts: [] };
+  return await new Promise((resolve) => {
+    const child = spawn(process.execPath, [
+      MEDIA_TOOL_HELPER_PATH,
+      targetUrl,
+      toolsDir,
+      String(MEDIA_TOOL_TIMEOUT_MS),
+      "6",
+      "2"
+    ], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    const stdout = [];
+    const stderr = [];
+    let outBytes = 0;
+    let errBytes = 0;
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => {
+      if (process.platform === "win32" && child.pid) spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+      else child.kill("SIGKILL");
+      finish({ ok: false, error: "media_tool_helper_timeout", attempts: [] });
+    }, MEDIA_TOOL_TIMEOUT_MS * 2 + 5000);
+    child.stdout.on("data", (chunk) => { outBytes += chunk.length; if (outBytes <= 2 * 1024 * 1024) stdout.push(chunk); });
+    child.stderr.on("data", (chunk) => { errBytes += chunk.length; if (errBytes <= 128 * 1024) stderr.push(chunk); });
+    child.once("error", (error) => finish({ ok: false, error: error.message, diagnostic: Buffer.concat(stderr).toString("utf8").slice(-2000), attempts: [] }));
+    child.once("close", () => {
+      if (settled) return;
+      try {
+        finish(JSON.parse(Buffer.concat(stdout).toString("utf8")));
+      } catch {
+        finish({ ok: false, error: "invalid_media_tool_response", diagnostic: Buffer.concat(stderr).toString("utf8").slice(-2000), attempts: [] });
+      }
+    });
+  });
+}
+
+async function probePublicPageSignals(targetUrl) {
+  const response = await fetchBounded(targetUrl, { kind: "media-page", timeoutMs: 8000, retries: 1 });
+  if (!response.ok) return { ok: false, status: response.status, error: response.error || `status_${response.status}`, metadata: null, signals: { ids: [], filenames: [], mediaUrls: [], embedUrls: [] } };
+  const pageUrl = response.finalUrl || targetUrl;
+  return {
+    ok: true,
+    status: response.status,
+    error: null,
+    metadata: extractHtmlMetadata(response.text, pageUrl),
+    signals: extractMediaDiscoverySignals(response.text, pageUrl)
+  };
+}
+
+function evidenceOverlap(sourceSignals, candidateSignals) {
+  const sourceIds = new Set((sourceSignals?.ids || []).map(normalizeSignal));
+  const sourceFiles = new Set((sourceSignals?.filenames || []).map(normalizeSignal));
+  const sourceHosts = new Set((sourceSignals?.mediaUrls || []).map(discoveryHost).filter(Boolean));
+  const candidateIds = (candidateSignals?.ids || []).map(normalizeSignal);
+  const candidateFiles = (candidateSignals?.filenames || []).map(normalizeSignal);
+  const candidateHosts = new Set((candidateSignals?.mediaUrls || []).map(discoveryHost).filter(Boolean));
+  const matchedIds = candidateIds.filter((value) => sourceIds.has(value));
+  const matchedFilenames = candidateFiles.filter((value) => sourceFiles.has(value));
+  let sharedMediaHost = false;
+  for (const host of candidateHosts) if (sourceHosts.has(host)) sharedMediaHost = true;
+  const score = Math.min(45, matchedIds.length * 25 + matchedFilenames.length * 22 + (sharedMediaHost ? 6 : 0));
+  return { score, matchedIds: [...new Set(matchedIds)], matchedFilenames: [...new Set(matchedFilenames)], sharedMediaHost };
+}
+
+function buildDiscoveryQueries(source, signals, transcript) {
+  const queries = [];
+  const add = (kind, query, weight, signal = null) => {
+    const cleaned = String(query || "").replace(/\s+/g, " ").trim();
+    if (!cleaned || queries.some((entry) => entry.query.toLowerCase() === cleaned.toLowerCase())) return;
+    queries.push({ kind, query: cleaned, weight, signal });
+  };
+  const title = cleanSearchTitle(source.title);
+  if (transcript?.phrase) add("transcript", `"${transcript.phrase.replace(/"/g, " ")}"`, 1.0, transcript.phrase);
+  for (const id of (signals.ids || []).slice(0, 2)) add("media-id", `"${id}" video`, 0.98, id);
+  for (const filename of (signals.filenames || []).slice(0, 2)) add("media-filename", `"${filename}"`, 0.94, filename);
+  const descriptionPhrase = distinctivePhrase(source.description, 9);
+  if (descriptionPhrase) add("description", `"${descriptionPhrase.replace(/"/g, " ")}"`, 0.82, descriptionPhrase);
+  if (source.uploader && title) add("uploader-title", `"${String(source.uploader).replace(/"/g, " ")}" "${title.replace(/"/g, " ")}"`, 0.86, source.uploader);
+  if (title) {
+    add("title", `"${title.replace(/"/g, " ")}" video`, 0.74, title);
+    add("longer-title", `"${title.replace(/"/g, " ")}" full complete extended uncut`, 0.7, title);
+  }
+  return queries.slice(0, 6);
+}
+
+function classifyEvidenceAlternate(source, candidate, similarity, overlap, evidenceWeight) {
   const sourceDuration = Number(source.durationSeconds) || 0;
   const candidateDuration = Number(candidate.durationSeconds) || 0;
   const sourceHost = discoveryHost(source.url);
   const candidateHost = discoveryHost(candidate.url);
   const differentSource = Boolean(sourceHost && candidateHost && sourceHost !== candidateHost);
-  let durationRatio = null;
-  if (sourceDuration > 0 && candidateDuration > 0) durationRatio = candidateDuration / sourceDuration;
-
+  const durationRatio = sourceDuration > 0 && candidateDuration > 0 ? candidateDuration / sourceDuration : null;
   const longerWords = /\b(?:full|complete|extended|uncut|full[- ]?length|long(?:er)? version)\b/i;
-  const candidateLongerHint = longerWords.test(candidate.title || "");
-  const sourceAlreadyLongHint = longerWords.test(source.title || "");
-  const lexicalLongerHint = candidateLongerHint && !sourceAlreadyLongHint;
+  const lexicalLongerHint = longerWords.test(candidate.title || "") && !longerWords.test(source.title || "");
 
-  let confidence = similarity * 70;
-  if (differentSource) confidence += 9;
+  let confidence = similarity * 48 + overlap.score + evidenceWeight * 15;
+  if (differentSource) confidence += 5;
   if (durationRatio !== null) {
-    if (durationRatio >= 1.15 && similarity >= 0.34) confidence += 16;
-    else if (durationRatio >= 0.9 && durationRatio <= 1.1) confidence += 12;
-    else if (durationRatio >= 0.65 && durationRatio <= 1.35) confidence += 5;
-  } else if (lexicalLongerHint && similarity >= 0.34) {
-    confidence += 7;
-  }
-  if (candidate.provider || knownProvider(candidate.url)) confidence += 3;
-  confidence = Math.max(0, Math.min(98, Math.round(confidence)));
+    if (durationRatio >= 1.15) confidence += 10;
+    else if (durationRatio >= 0.88 && durationRatio <= 1.12) confidence += 8;
+  } else if (lexicalLongerHint) confidence += 4;
+  confidence = Math.max(0, Math.min(99, Math.round(confidence)));
 
+  const strongIdentity = overlap.score >= 22 || evidenceWeight >= 0.94;
   let relation = "Possible match";
-  if (durationRatio !== null && durationRatio >= 1.15 && similarity >= 0.34) relation = "Likely longer";
-  else if (durationRatio === null && lexicalLongerHint && similarity >= 0.34) relation = "Possible longer";
-  else if (similarity >= 0.62 && (durationRatio === null || (durationRatio >= 0.88 && durationRatio <= 1.12))) relation = "Likely mirror";
-  else if (similarity < 0.34) relation = "Weak match";
-
-  return { relation, confidence, durationRatio, differentSource, lexicalLongerHint };
+  if (durationRatio !== null && durationRatio >= 1.15 && strongIdentity) relation = "Likely longer";
+  else if (durationRatio === null && lexicalLongerHint && strongIdentity) relation = "Possible longer";
+  else if (strongIdentity && (durationRatio === null || (durationRatio >= 0.82 && durationRatio <= 1.18))) relation = "Likely mirror";
+  else if (confidence < 35) relation = "Weak match";
+  return { relation, confidence, durationRatio, differentSource, lexicalLongerHint, strongIdentity };
 }
 
 async function findAlternates({ url, title, description, provider, durationSeconds }) {
   const sourceUrl = validateUrl(url).toString();
+  const toolsDir = await findToolsDir();
+  const sourcePage = await probePublicPageSignals(sourceUrl);
+  const sourceTool = await runMediaToolProbe(sourceUrl, toolsDir);
+  const toolInfo = sourceTool?.result || null;
+
   let source = {
     url: sourceUrl,
-    title: cleanSearchTitle(title),
-    description: description || null,
-    provider: provider || null,
-    durationSeconds: Number(durationSeconds) || null
+    title: cleanSearchTitle(toolInfo?.title || title || sourcePage.metadata?.title),
+    description: toolInfo?.description || description || sourcePage.metadata?.description || null,
+    provider: provider || sourcePage.metadata?.provider || toolInfo?.extractor || null,
+    uploader: toolInfo?.uploader || null,
+    durationSeconds: Number(toolInfo?.durationSeconds || durationSeconds || sourcePage.metadata?.durationSeconds) || null
   };
 
-  if (!source.title) {
-    const preview = await createPreview(sourceUrl, { allowBrowserFallback: true });
-    source = {
-      ...source,
-      title: cleanSearchTitle(preview.title),
-      description: source.description || preview.description || null,
-      provider: source.provider || preview.provider || null,
-      durationSeconds: source.durationSeconds || preview.durationSeconds || null
-    };
+  let sourceSignals = mergeDiscoverySignals(sourcePage.signals, signalsFromToolResult(sourceTool));
+  let sourceEdge = null;
+  if (!sourceSignals.ids.length && !sourceSignals.filenames.length && !sourceSignals.mediaUrls.length) {
+    sourceEdge = await renderMetadataWithEdge(sourceUrl);
+    if (sourceEdge?.ok) {
+      sourceSignals = mergeDiscoverySignals(sourceSignals, sourceEdge.mediaSignals);
+      source = {
+        ...source,
+        title: source.title || cleanSearchTitle(sourceEdge.metadata?.title),
+        description: source.description || sourceEdge.metadata?.description || null,
+        durationSeconds: source.durationSeconds || sourceEdge.metadata?.durationSeconds || null
+      };
+    }
   }
+  const transcript = sourceTool?.ok ? await transcriptPhraseFromTool(sourceTool) : null;
+  const queries = buildDiscoveryQueries(source, sourceSignals, transcript);
 
-  if (!source.title && source.description) {
-    source.title = cleanSearchTitle(String(source.description).split(/[.!?]/)[0].slice(0, 140));
-  }
-
-  if (!source.title || titleTokens(source.title).length < 2) {
-    const error = new Error("not_enough_title_metadata_for_search");
+  if (!queries.length) {
+    const error = new Error("not_enough_media_metadata_for_search");
     error.status = 422;
     throw error;
   }
 
-  const cacheKey = `${canonicalDiscoveryUrl(sourceUrl)}|${source.title}|${source.durationSeconds || 0}`;
+  const cacheKey = `${canonicalDiscoveryUrl(sourceUrl)}|${source.title || ""}|${source.durationSeconds || 0}|${queries.map((q) => q.query).join("|")}`;
   const cached = alternateCacheGet(cacheKey);
   if (cached) return cached;
 
-  const escapedTitle = source.title.replace(/"/g, " ").replace(/\s+/g, " ").trim();
-  const queries = [
-    `"${escapedTitle}" video`,
-    `"${escapedTitle}" full complete extended video`
-  ];
-  const sourceHost = discoveryHost(sourceUrl);
-  const gathered = [];
-  const gatheredKeys = new Set([canonicalDiscoveryUrl(sourceUrl).toLowerCase()]);
+  const gatheredMap = new Map();
   const searchDiagnostics = [];
-
-  for (const query of queries) {
-    const result = await searchDuckDuckGo(query, sourceHost);
-    searchDiagnostics.push({ engine: "DuckDuckGo", query, status: result.status || 0, error: result.error || null, found: result.results.length });
-    for (const item of result.results) {
+  const sourceKey = canonicalDiscoveryUrl(sourceUrl).toLowerCase();
+  const addResults = (items, querySpec) => {
+    for (const item of items) {
       const key = canonicalDiscoveryUrl(item.url).toLowerCase();
-      if (gatheredKeys.has(key)) continue;
-      gatheredKeys.add(key);
-      gathered.push(item);
+      if (key === sourceKey) continue;
+      const existing = gatheredMap.get(key);
+      const evidence = { kind: querySpec.kind, weight: querySpec.weight, signal: querySpec.signal, query: querySpec.query, engine: item.engine };
+      if (existing) {
+        existing.evidence.push(evidence);
+        if (!existing.searchTitle && item.searchTitle) existing.searchTitle = item.searchTitle;
+        if (!existing.snippet && item.snippet) existing.snippet = item.snippet;
+      } else {
+        gatheredMap.set(key, { ...item, evidence: [evidence] });
+      }
     }
-    if (gathered.length >= ALTERNATE_CANDIDATE_PREVIEW_LIMIT * 2) break;
+  };
+
+  for (const querySpec of queries) {
+    const ddg = await searchDuckDuckGo(querySpec.query);
+    searchDiagnostics.push({ engine: "DuckDuckGo", kind: querySpec.kind, query: querySpec.query, status: ddg.status || 0, error: ddg.error || null, found: ddg.results.length });
+    addResults(ddg.results, querySpec);
+    if (!ddg.ok || ddg.results.length < 2) {
+      const bing = await searchBing(querySpec.query);
+      searchDiagnostics.push({ engine: "Bing", kind: querySpec.kind, query: querySpec.query, status: bing.status || 0, error: bing.error || null, found: bing.results.length });
+      addResults(bing.results, querySpec);
+    }
+    if (gatheredMap.size >= 36) break;
   }
 
-  // DuckDuckGo's HTML endpoint is convenient but can occasionally challenge automated clients.
-  // Use one Bing request only when the primary search produced too little to evaluate.
-  if (gathered.length < 4) {
-    const query = queries[0];
-    const result = await searchBing(query, sourceHost);
-    searchDiagnostics.push({ engine: "Bing", query, status: result.status || 0, error: result.error || null, found: result.results.length });
-    for (const item of result.results) {
-      const key = canonicalDiscoveryUrl(item.url).toLowerCase();
-      if (gatheredKeys.has(key)) continue;
-      gatheredKeys.add(key);
-      gathered.push(item);
-    }
-  }
-
-  // Search-title similarity is cheap; use it to choose which URLs deserve metadata calls.
+  const gathered = [...gatheredMap.values()];
   const prioritized = gathered
-    .map((item) => ({ ...item, searchSimilarity: titleSimilarity(source.title, item.searchTitle || "") }))
-    .sort((a, b) => b.searchSimilarity - a.searchSimilarity)
-    .slice(0, ALTERNATE_CANDIDATE_PREVIEW_LIMIT);
+    .map((item) => {
+      const evidenceWeight = Math.max(0, ...item.evidence.map((entry) => entry.weight || 0));
+      const searchSimilarity = titleSimilarity(source.title, item.searchTitle || "");
+      return { ...item, evidenceWeight, searchSimilarity, initialScore: evidenceWeight * 60 + searchSimilarity * 30 + Math.min(10, item.evidence.length * 2) };
+    })
+    .sort((a, b) => b.initialScore - a.initialScore)
+    .slice(0, 18);
 
-  const candidates = await runLimited(prioritized, ALTERNATE_CANDIDATE_CONCURRENCY, async (item) => {
-    let preview = null;
-    let previewError = null;
-    try {
-      preview = await createPreview(item.url, { allowBrowserFallback: false });
-    } catch (error) {
-      previewError = error?.message || "candidate_preview_failed";
-    }
-
+  const basicCandidates = await runLimited(prioritized, ALTERNATE_CANDIDATE_CONCURRENCY, async (item) => {
+    const page = await probePublicPageSignals(item.url);
+    const metadata = page.metadata || {};
     const candidate = {
       url: item.url,
-      title: cleanSearchTitle(preview?.title || item.searchTitle) || item.searchTitle || item.url,
-      description: preview?.description || item.snippet || null,
-      provider: preview?.provider || null,
-      durationSeconds: preview?.durationSeconds || null,
-      image: preview?.image || null,
-      images: preview?.images || [],
-      method: preview?.method || "search-result",
-      previewError,
-      searchEngine: item.engine
+      title: cleanSearchTitle(metadata.title || item.searchTitle) || item.searchTitle || item.url,
+      description: metadata.description || item.snippet || null,
+      provider: metadata.provider || null,
+      durationSeconds: metadata.durationSeconds || null,
+      image: metadata.image || null,
+      images: metadata.images || [],
+      method: page.ok ? "page-media-probe" : "search-result",
+      previewError: page.error || null,
+      searchEngine: [...new Set(item.evidence.map((e) => e.engine))].join("+") || item.engine,
+      evidence: item.evidence,
+      evidenceWeight: item.evidenceWeight,
+      pageSignals: page.signals
     };
     const similarity = Math.max(item.searchSimilarity, titleSimilarity(source.title, candidate.title));
-    const classification = classifyAlternate(source, candidate, similarity);
-    return { ...candidate, similarity, ...classification };
+    const overlap = evidenceOverlap(sourceSignals, candidate.pageSignals);
+    return { ...candidate, similarity, overlap };
+  });
+
+  // Tool-probe only the strongest few candidates. This is deliberately bounded and does not reject
+  // unfamiliar hosts; yt-dlp native -> forced generic is attempted through the private-network-safe proxy.
+  const toolTargets = basicCandidates
+    .filter(Boolean)
+    .sort((a, b) => (b.overlap.score + b.evidenceWeight * 40 + b.similarity * 25) - (a.overlap.score + a.evidenceWeight * 40 + a.similarity * 25))
+    .slice(0, toolsDir ? MEDIA_TOOL_CANDIDATE_LIMIT : 0);
+  const toolMap = new Map();
+  const toolResults = await runLimited(toolTargets, MEDIA_TOOL_CANDIDATE_CONCURRENCY, async (candidate) => ({
+    url: candidate.url,
+    probe: await runMediaToolProbe(candidate.url, toolsDir)
+  }));
+  for (const item of toolResults) if (item?.url) toolMap.set(item.url, item.probe);
+
+  const candidates = basicCandidates.map((candidate) => {
+    if (!candidate) return null;
+    const toolProbe = toolMap.get(candidate.url) || null;
+    const tool = toolProbe?.result || null;
+    const combinedSignals = mergeDiscoverySignals(candidate.pageSignals, signalsFromToolResult(toolProbe));
+    const overlap = evidenceOverlap(sourceSignals, combinedSignals);
+    const updated = {
+      ...candidate,
+      title: cleanSearchTitle(tool?.title || candidate.title) || candidate.title,
+      description: tool?.description || candidate.description,
+      provider: candidate.provider || tool?.extractor || null,
+      durationSeconds: Number(tool?.durationSeconds || candidate.durationSeconds) || null,
+      images: uniqueUrls([tool?.thumbnails || [], candidate.images || [], candidate.image], candidate.url),
+      toolProbe: toolProbe ? { ok: Boolean(toolProbe.ok), mode: tool?.mode || null, extractor: tool?.extractor || null, attempts: toolProbe.attempts || [] } : null,
+      overlap
+    };
+    updated.image = updated.images[0] || null;
+    updated.similarity = Math.max(candidate.similarity, titleSimilarity(source.title, updated.title));
+    return { ...updated, ...classifyEvidenceAlternate(source, updated, updated.similarity, overlap, candidate.evidenceWeight) };
   });
 
   const results = candidates
     .filter(Boolean)
-    .filter((candidate) => canonicalDiscoveryUrl(candidate.url).toLowerCase() !== canonicalDiscoveryUrl(sourceUrl).toLowerCase())
-    .filter((candidate) => candidate.confidence >= 24)
+    .filter((candidate) => canonicalDiscoveryUrl(candidate.url).toLowerCase() !== sourceKey)
+    .filter((candidate) => candidate.confidence >= 28)
     .sort((a, b) => {
-      const relationRank = (value) => value === "Likely longer" ? 4 : value === "Possible longer" ? 3 : value === "Likely mirror" ? 2 : value === "Possible match" ? 1 : 0;
-      return relationRank(b.relation) - relationRank(a.relation) || b.confidence - a.confidence || (b.durationSeconds || 0) - (a.durationSeconds || 0);
+      const rank = (value) => value === "Likely longer" ? 5 : value === "Likely mirror" ? 4 : value === "Possible longer" ? 3 : value === "Possible match" ? 2 : 1;
+      return rank(b.relation) - rank(a.relation) || b.confidence - a.confidence || b.overlap.score - a.overlap.score;
     })
     .slice(0, ALTERNATE_SEARCH_MAX_RESULTS);
 
   const value = {
     source,
+    sourceSignals: {
+      ids: sourceSignals.ids.slice(0, 12),
+      filenames: sourceSignals.filenames.slice(0, 8),
+      mediaHosts: [...new Set(sourceSignals.mediaUrls.map(discoveryHost).filter(Boolean))].slice(0, 8),
+      transcript: transcript ? { phrase: transcript.phrase, lang: transcript.lang, automatic: transcript.automatic } : null
+    },
+    tools: {
+      installed: Boolean(toolsDir),
+      directory: toolsDir ? "SandboxBootstrap\\tools" : null,
+      ytDlp: Boolean(sourceTool?.tooling?.ytDlp),
+      deno: Boolean(sourceTool?.tooling?.deno),
+      ffmpeg: Boolean(sourceTool?.tooling?.ffmpeg),
+      sourceMode: sourceTool?.result?.mode || null,
+      sourceExtractor: sourceTool?.result?.extractor || null,
+      edgeMediaProbe: Boolean(sourceEdge?.ok),
+      attempts: sourceTool?.attempts || []
+    },
     results,
-    queries,
+    queries: queries.map((entry) => entry.query),
+    queryEvidence: queries,
     searchDiagnostics,
     candidateCount: gathered.length,
     evaluatedCount: prioritized.length,
-    manualSearchUrl: `https://duckduckgo.com/?q=${encodeURIComponent(`"${escapedTitle}" video full complete extended`)}`,
+    manualSearchUrl: queries[0] ? `https://duckduckgo.com/?q=${encodeURIComponent(queries[0].query)}` : null,
     cached: false,
-    note: "Matches are inferred from public search results, metadata, title similarity, duration, and source diversity; video identity is not fingerprint-verified."
+    note: toolsDir
+      ? "Discovery is host-agnostic: yt-dlp native and forced-generic extraction, raw page/embed/media identifiers, optional subtitle phrases, and general web search are combined. Unknown hosts are not rejected. Results are evidence-ranked; frame-level identity verification is not yet performed."
+      : "Portable media tools were not found, so discovery used host-agnostic page/media signatures and general web search only. Install the Link Preview tools package for yt-dlp generic extraction and subtitle-assisted discovery."
   };
   alternateCacheSet(cacheKey, value);
   return value;

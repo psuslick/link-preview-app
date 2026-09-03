@@ -337,7 +337,10 @@ function App() {
       evaluatedCount: result.evaluatedCount || 0,
       cached: Boolean(result.cached),
       clientMs: result.clientMs,
-      manualSearchUrl: result.manualSearchUrl || null
+      manualSearchUrl: result.manualSearchUrl || null,
+      sourceSignals: result.sourceSignals || null,
+      tools: result.tools || null,
+      queryEvidence: result.queryEvidence || []
     } : current);
   }
 
@@ -447,9 +450,9 @@ function App() {
                 type="button"
                 onClick={findSelectedAlternates}
                 disabled={selected.size !== 1 || processing}
-                title={selected.size === 1 ? "Find likely mirrors and longer versions of this video" : "Select exactly one video"}
+                title={selected.size === 1 ? "Find mirrors, longer versions, and renamed copies using media evidence" : "Select exactly one video"}
               >
-                Find alternates
+                Find versions
               </button>
               <button type="button" onClick={removeSelected} disabled={!selected.size || processing}>Remove selected</button>
               {stats.failed > 0 && (
@@ -532,6 +535,8 @@ function App() {
                           <div><dt>Bytes read</dt><dd>{Number.isFinite(preview.bytesRead) ? preview.bytesRead.toLocaleString() : "—"}</dd></div>
                           <div><dt>Client time</dt><dd>{Number.isFinite(preview.clientMs) ? `${preview.clientMs} ms` : "—"}</dd></div>
                           <div><dt>Thumbnails</dt><dd>{preview.images?.length || (preview.image ? 1 : 0)}</dd></div>
+                          <div><dt>HTTP extractor</dt><dd>{preview.extractorStats ? `meta ${preview.extractorStats.meta || 0} · json ${preview.extractorStats.json || 0} · script ${preview.extractorStats.script || 0} · poster ${preview.extractorStats.poster || 0} · dom ${preview.extractorStats.dom || 0}` : "—"}</dd></div>
+                          <div><dt>Edge extractor</dt><dd>{preview.browserExtractorStats ? `meta ${preview.browserExtractorStats.meta || 0} · json ${preview.browserExtractorStats.json || 0} · script ${preview.browserExtractorStats.script || 0} · poster ${preview.browserExtractorStats.poster || 0} · dom ${preview.browserExtractorStats.dom || 0}` : "—"}</dd></div>
                           <div><dt>Browser fallback</dt><dd>{preview.browserFallback ? "used" : preview.browserFallbackAttempted ? "attempted" : "no"}</dd></div>
                           <div><dt>Fallback error</dt><dd>{preview.browserFallbackError || "none"}</dd></div>
                           <div><dt>Client network</dt><dd>{preview.clientNetworkError || "none"}</dd></div>
@@ -552,13 +557,13 @@ function App() {
         <div className="alternate-overlay" role="presentation" onMouseDown={(event) => {
           if (event.target === event.currentTarget) closeAlternates();
         }}>
-          <section className="alternate-panel" role="dialog" aria-modal="true" aria-label="Find alternate video versions">
+          <section className="alternate-panel" role="dialog" aria-modal="true" aria-label="Find video versions">
             <header className="alternate-header">
               <div>
-                <div className="alternate-kicker">Alternate video discovery</div>
+                <div className="alternate-kicker">Media-signature version discovery</div>
                 <h2>{alternatePanel.source?.title || "Selected video"}</h2>
                 <p>
-                  Finds public search results that look like mirrors or longer versions. Results are ranked from metadata; they are not content-fingerprint verified.
+                  Searches the public web using whatever evidence the source exposes: media IDs, file names, embeds, transcript phrases, uploader metadata, duration, and title. Unknown video hosts are not filtered out.
                 </p>
               </div>
               <button type="button" className="close-button" onClick={closeAlternates} aria-label="Close alternate search">×</button>
@@ -572,12 +577,24 @@ function App() {
               <a href={alternatePanel.source?.url} target="_blank" rel="noopener noreferrer">Open source ↗</a>
             </div>
 
+            {alternatePanel.state === "ready" && (alternatePanel.tools || alternatePanel.sourceSignals) && (
+              <div className="discovery-evidence-strip">
+                <span className={alternatePanel.tools?.installed ? "tool-status ready" : "tool-status missing"}>
+                  Tools: {alternatePanel.tools?.installed ? `ready${alternatePanel.tools?.sourceMode ? ` · ${alternatePanel.tools.sourceMode}` : ""}` : "page-only"}
+                </span>
+                {alternatePanel.tools?.sourceExtractor && <span>Extractor: {alternatePanel.tools.sourceExtractor}</span>}
+                {!!alternatePanel.sourceSignals?.ids?.length && <span>{alternatePanel.sourceSignals.ids.length} media ID{alternatePanel.sourceSignals.ids.length === 1 ? "" : "s"}</span>}
+                {!!alternatePanel.sourceSignals?.filenames?.length && <span>{alternatePanel.sourceSignals.filenames.length} file signature{alternatePanel.sourceSignals.filenames.length === 1 ? "" : "s"}</span>}
+                {alternatePanel.sourceSignals?.transcript && <span>Transcript phrase: {alternatePanel.sourceSignals.transcript.lang || "available"}</span>}
+              </div>
+            )}
+
             {alternatePanel.state === "loading" && (
               <div className="alternate-loading">
                 <div className="alternate-spinner" />
                 <div>
-                  <strong>Searching for related copies…</strong>
-                  <p>Search and candidate checks use the same bounded network queue as previews.</p>
+                  <strong>Extracting media evidence and searching for versions…</strong>
+                  <p>The finder uses bounded queues and gives unfamiliar public hosts the same inspection path as known providers.</p>
                 </div>
               </div>
             )}
@@ -635,6 +652,13 @@ function App() {
                             </div>
                             <h3>{candidate.title || candidate.url}</h3>
                             <div className="alternate-domain">{candidate.provider || domainFor(candidate.url)}</div>
+                            {(candidate.overlap?.matchedIds?.length > 0 || candidate.overlap?.matchedFilenames?.length > 0 || candidate.evidence?.length > 0) && (
+                              <div className="candidate-evidence">
+                                {candidate.overlap?.matchedIds?.slice(0, 2).map((value) => <span key={`id-${value}`}>ID match: {value}</span>)}
+                                {candidate.overlap?.matchedFilenames?.slice(0, 2).map((value) => <span key={`file-${value}`}>File match: {value}</span>)}
+                                {candidate.evidence?.slice(0, 2).map((entry, index) => <span key={`${entry.kind}-${index}`}>{entry.kind}</span>)}
+                              </div>
+                            )}
                             {candidate.description && <p>{candidate.description}</p>}
                             <div className="alternate-result-actions">
                               <a href={candidate.url} target="_blank" rel="noopener noreferrer">Open candidate ↗</a>
@@ -653,14 +677,38 @@ function App() {
                   </div>
                 ) : (
                   <div className="alternate-empty">
-                    <strong>No convincing alternates found</strong>
-                    <p>The search may not have enough distinctive title metadata, or public indexes may not expose another copy.</p>
+                    <strong>No convincing versions found</strong>
+                    <p>Public search indexes may not expose another copy, or this source may not reveal enough stable media/transcript identifiers. Check the discovery diagnostics below.</p>
                   </div>
                 )}
 
                 <details className="alternate-diagnostics">
                   <summary>Search diagnostics</summary>
                   <p>{alternatePanel.note}</p>
+                  {alternatePanel.tools && (
+                    <div className="alternate-diagnostic-row discovery-tool-row">
+                      <strong>Media tools</strong>
+                      <span>{alternatePanel.tools.installed ? "installed" : "not found"}</span>
+                      <span>{[alternatePanel.tools.ytDlp && "yt-dlp", alternatePanel.tools.deno && "Deno", alternatePanel.tools.ffmpeg && "FFmpeg"].filter(Boolean).join(" · ") || "page probe only"}</span>
+                      <code>{alternatePanel.tools.sourceMode || "—"}{alternatePanel.tools.sourceExtractor ? ` / ${alternatePanel.tools.sourceExtractor}` : ""}</code>
+                    </div>
+                  )}
+                  {alternatePanel.sourceSignals?.transcript?.phrase && (
+                    <div className="alternate-diagnostic-row">
+                      <strong>Transcript signal</strong>
+                      <span>{alternatePanel.sourceSignals.transcript.lang || "unknown"}</span>
+                      <span>{alternatePanel.sourceSignals.transcript.automatic ? "automatic" : "subtitle"}</span>
+                      <code>“{alternatePanel.sourceSignals.transcript.phrase}”</code>
+                    </div>
+                  )}
+                  {(alternatePanel.queryEvidence || []).map((entry, index) => (
+                    <div className="alternate-diagnostic-row" key={`query-${entry.kind}-${index}`}>
+                      <strong>{entry.kind}</strong>
+                      <span>{Math.round((entry.weight || 0) * 100)}% signal</span>
+                      <span>query</span>
+                      <code>{entry.query}</code>
+                    </div>
+                  ))}
                   {(alternatePanel.diagnostics || []).map((entry, index) => (
                     <div className="alternate-diagnostic-row" key={`${entry.engine}-${index}`}>
                       <strong>{entry.engine}</strong>
