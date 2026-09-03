@@ -1368,6 +1368,18 @@ async function createPreview(rawUrl, { allowBrowserFallback = true } = {}) {
     challengeDetected: Boolean((httpChallenge && !usedBrowserFallback) || browserChallenge),
     challengeProvider: httpChallenge?.provider || null,
     browserFallbackSkippedReason: httpChallenge && !hasAuthorizedSession ? "challenge_page_detected" : null,
+    // Some video hosts do not present an anti-bot challenge at all. Instead, the
+    // real player/thumbnail is hidden behind an interactive consent, age, cookie,
+    // or "accept" overlay. A headless timeout/no-thumbnail is therefore also a
+    // valid reason to offer the reusable visible Sandbox site session.
+    siteSessionRecommended: Boolean(
+      !images.length && (
+        httpChallenge ||
+        browserChallenge ||
+        needsBrowserFallback ||
+        (browserFallbackAttempted && browserError)
+      )
+    ),
     needsBrowserFallback: needsBrowserFallback && !allowBrowserFallback,
     extractorStats: httpMetadata?.extractorStats || null,
     browserExtractorStats
@@ -1607,7 +1619,7 @@ async function searchDuckDuckGo(query) {
 }
 
 async function searchBing(query) {
-  const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=25&setlang=en-US&adlt=off`;
+  const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=25&setlang=en-US&adlt=off&adlt_set=off&safeSearch=Off`;
   const response = await fetchBounded(url, { kind: "search", timeoutMs: ALTERNATE_SEARCH_TIMEOUT_MS, retries: 1 });
   if (!response.ok) return { ok: false, status: response.status, results: [], error: response.error || `search_status_${response.status}` };
   return { ok: true, status: response.status, results: parseBingResults(response.text) };
@@ -2367,7 +2379,12 @@ async function findAlternates({ url, title, description, provider, durationSecon
     queries: queries.map((entry) => entry.query),
     queryEvidence: queries,
     searchDiagnostics,
-    searchPolicy: { duckDuckGoSafeSearch: "off-requested", bingSafeSearch: "off-requested", mojeekSafeSearch: "off-requested", note: "Search engines may still enforce jurisdiction, account, or index-level policies outside this app." },
+    searchPolicy: {
+      duckDuckGoSafeSearch: "off-requested (kp=-2)",
+      bingSafeSearch: "off-requested (adlt=off, adlt_set=off, safeSearch=Off)",
+      mojeekSafeSearch: "off-requested (safe=0)",
+      note: "DuckDuckGo and Mojeek are explicitly requested with their documented Safe Search-off parameters. Bing is requested with multiple recognized off parameters; Bing may still enforce jurisdiction/account/age policy outside this app."
+    },
     candidateCount: gathered.length,
     rawDiscoveredCount: gathered.length,
     rawDiscovered,

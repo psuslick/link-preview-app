@@ -91,12 +91,14 @@ function siteKeyFor(url) {
 function needsAuthorizedSiteRetry(item) {
   if (!item || item.image || item.state === "loading") return false;
   return Boolean(
+    item.siteSessionRecommended ||
     item.challengeDetected ||
     item.needsBrowserFallback ||
     item.browserFallbackSkippedReason === "challenge_page_detected" ||
     item.warning === "challenge_page_detected" ||
     item.method === "blocked-no-thumbnail" ||
-    item.method === "edge-no-thumbnail"
+    item.method === "edge-no-thumbnail" ||
+    (item.method === "metadata-no-thumbnail" && item.browserFallbackAttempted && item.browserFallbackError)
   );
 }
 
@@ -542,7 +544,7 @@ function App() {
     }
     patchPreview(preview.id, {
       authorizationState: "authorizing",
-      authorizationMessage: `Reusable site session opened for ${siteKeyFor(preview.url)}. If the real page is visible, click Retry once; successful authorization will then be reused automatically for other previews from this site.`
+      authorizationMessage: `Reusable site session opened for ${siteKeyFor(preview.url)}. If you see an Accept/consent prompt, refresh or accept it until the real video is visible, then click Retry once. The session will be reused automatically for other previews from this site.`
     });
   }
 
@@ -633,7 +635,7 @@ function App() {
               <div className="privacy-group"><h3>Preview browsing</h3>
                 <PrivacyToggle checked={privacy.remoteThumbnails} onChange={(v) => setPrivacyOption("remoteThumbnails", v)} title="Load remote thumbnails" detail="Downloads discovered poster/thumbnail images through the localhost safety proxy." />
                 <PrivacyToggle checked={privacy.browserFallback} onChange={(v) => setPrivacyOption("browserFallback", v)} title="Edge browser fallback" detail="Lets Sandbox Edge load difficult video pages when lightweight metadata is insufficient." />
-                <PrivacyToggle checked={privacy.interactiveAuthorization} onChange={(v) => setPrivacyOption("interactiveAuthorization", v)} title="Interactive site authorization" detail="Allows a visible Sandbox Edge window so you can manually pass a site's challenge page." />
+                <PrivacyToggle checked={privacy.interactiveAuthorization} onChange={(v) => setPrivacyOption("interactiveAuthorization", v)} title="Interactive site session" detail="Allows a visible Sandbox Edge window so you can manually pass challenge, consent, age, cookie, or Accept prompts and reuse that session for the site." />
               </div>
               <div className="privacy-group"><h3>Version Finder — destinations</h3>
                 <PrivacyToggle checked={privacy.mediaTools} onChange={(v) => setPrivacyOption("mediaTools", v)} title="Media-tool probing" detail="Allows yt-dlp/Deno to inspect selected and candidate public video pages/CDNs inside Sandbox." />
@@ -698,6 +700,7 @@ function App() {
                 {previews.map((preview) => {
                   const isSelected = selected.has(preview.id);
                   const duration = formatDuration(preview.durationSeconds);
+                  const siteSessionEligible = needsAuthorizedSiteRetry(preview);
                   return (
                     <article key={preview.id} className={`preview-card ${isSelected ? "selected" : ""} ${preview.state}`} onClick={(event) => handleCardClick(event, preview.id)}>
                       <div className="card-selector"><input type="checkbox" checked={isSelected} onChange={() => toggleSelected(preview.id)} aria-label={`Select ${preview.title || preview.url}`} /></div>
@@ -715,9 +718,14 @@ function App() {
                         </div>
                         <h2>{preview.title || (preview.state === "failed" ? "Preview failed" : "Video preview")}</h2>
                         {preview.description && <p>{preview.description}</p>}
-                        {preview.challengeDetected && preview.state !== "failed" && (
+                        {siteSessionEligible && preview.state !== "failed" && (
                           <div className="challenge-box">
-                            <p className="warning-message">The lightweight preview was blocked or challenged. Open one reusable Sandbox site session. After one successful Retry, other challenged previews from this same site are retried automatically.</p>
+                            <p className="warning-message">
+                              {preview.challengeDetected
+                                ? "The lightweight preview was blocked or challenged. Open one reusable Sandbox site session."
+                                : "No thumbnail was exposed to the unattended preview. This site may require an Accept/consent/age/cookie prompt in a normal browser. Open one reusable Sandbox site session."}
+                              {" "}After one successful Retry, other unresolved previews from this same site are retried automatically.
+                            </p>
                             <div className="challenge-actions">
                               <button type="button" onClick={() => authorizeSite(preview)} disabled={!privacy.browserFallback || !privacy.interactiveAuthorization || preview.authorizationState === "launching" || preview.authorizationState === "authorizing"}>
                                 {preview.authorizationState === "authorizing" ? "Site session open" : "Open site session"}
@@ -727,7 +735,7 @@ function App() {
                             {preview.authorizationMessage && <small>{preview.authorizationMessage}</small>}
                           </div>
                         )}
-                        {!preview.challengeDetected && preview.warning && preview.state !== "failed" && <p className="warning-message">Source restricted lightweight access; fallback was attempted.</p>}
+                        {!siteSessionEligible && preview.warning && preview.state !== "failed" && <p className="warning-message">Source restricted lightweight access; fallback was attempted.</p>}
                         {preview.state === "failed" && <p className="error-message">{preview.error || "Unable to retrieve preview metadata."}</p>}
                         <div className="card-footer">
                           <a href={preview.url} target="_blank" rel="noopener noreferrer">Open video ↗</a>
