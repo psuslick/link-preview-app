@@ -532,7 +532,9 @@ function App() {
                           <div><dt>Bytes read</dt><dd>{Number.isFinite(preview.bytesRead) ? preview.bytesRead.toLocaleString() : "—"}</dd></div>
                           <div><dt>Client time</dt><dd>{Number.isFinite(preview.clientMs) ? `${preview.clientMs} ms` : "—"}</dd></div>
                           <div><dt>Thumbnails</dt><dd>{preview.images?.length || (preview.image ? 1 : 0)}</dd></div>
-                          <div><dt>Browser fallback</dt><dd>{preview.browserFallback ? "yes" : "no"}</dd></div>
+                          <div><dt>Browser fallback</dt><dd>{preview.browserFallback ? "used" : preview.browserFallbackAttempted ? "attempted" : "no"}</dd></div>
+                          <div><dt>Fallback error</dt><dd>{preview.browserFallbackError || "none"}</dd></div>
+                          <div><dt>Client network</dt><dd>{preview.clientNetworkError || "none"}</dd></div>
                           <div><dt>Warning</dt><dd>{preview.warning || "none"}</dd></div>
                           <div><dt>Error</dt><dd>{preview.error || "none"}</dd></div>
                         </dl>

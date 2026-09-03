@@ -10,6 +10,7 @@ import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 
 const PORT = 3000;
 const USER_AGENT =
@@ -74,7 +75,6 @@ class Semaphore {
 const globalNetwork = new Semaphore(GLOBAL_NETWORK_LIMIT);
 const imageNetwork = new Semaphore(IMAGE_NETWORK_LIMIT);
 const browserFallback = new Semaphore(BROWSER_FALLBACK_LIMIT);
-const browserProxyNetwork = new Semaphore(BROWSER_PROXY_NETWORK_LIMIT);
 const hostSemaphores = new Map();
 const hostThrottleState = new Map();
 const previewCache = new Map();
@@ -700,187 +700,30 @@ function isLikelyMediaPath(pathname = "") {
   return /\.(?:mp4|m4v|mov|webm|mkv|avi|mp3|m4a|aac|wav|flac|m3u8|mpd|ts)(?:$|[?#])/i.test(pathname);
 }
 
-async function startBrowserSafetyProxy() {
-  const proxy = http.createServer(async (req, res) => {
-    let target;
-    try {
-      if (!["GET", "HEAD"].includes(req.method || "GET")) {
-        res.writeHead(204);
-        res.end();
-        return;
-      }
-      target = validateUrl(req.url);
-      if (target.protocol !== "http:") throw new Error("proxy_http_only");
-      if (isLikelyMediaPath(target.pathname)) {
-        res.writeHead(204);
-        res.end();
-        return;
-      }
-    } catch {
-      res.writeHead(403);
-      res.end("blocked");
-      return;
-    }
-
-    const hostname = target.hostname.toLowerCase();
-    const releaseBrowser = await browserProxyNetwork.acquire();
-    const releaseGlobal = await globalNetwork.acquire();
-    const releaseHost = await getHostSemaphore(hostname).acquire();
-    let finalized = false;
-    const finalize = () => {
-      if (finalized) return;
-      finalized = true;
-      releaseHost();
-      releaseGlobal();
-      releaseBrowser();
-    };
-
-    const headers = { ...req.headers, host: target.host };
-    delete headers["proxy-connection"];
-    headers.connection = "keep-alive";
-
-    const upstream = http.request(
-      target,
-      { method: req.method, headers, agent: httpAgent },
-      (upstreamRes) => {
-        const contentType = String(upstreamRes.headers["content-type"] || "").toLowerCase();
-        if (contentType.startsWith("video/") || contentType.startsWith("audio/")) {
-          upstreamRes.destroy();
-          res.writeHead(204);
-          res.end();
-          finalize();
-          return;
-        }
-
-        res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
-        let bytes = 0;
-        upstreamRes.on("data", (chunk) => {
-          bytes += chunk.length;
-          if (bytes > BROWSER_HTTP_RESOURCE_LIMIT_BYTES) {
-            upstreamRes.destroy();
-            res.end();
-          } else {
-            res.write(chunk);
-          }
-        });
-        upstreamRes.on("end", () => {
-          res.end();
-          finalize();
-        });
-        upstreamRes.on("error", () => {
-          res.destroy();
-          finalize();
-        });
-      }
-    );
-
-    upstream.setTimeout(8000, () => upstream.destroy(new Error("proxy_timeout")));
-    upstream.on("error", () => {
-      if (!res.headersSent) res.writeHead(502);
-      res.end();
-      finalize();
-    });
-    req.on("aborted", () => {
-      upstream.destroy();
-      finalize();
-    });
-    req.pipe(upstream);
-  });
-
-  proxy.on("connect", (req, clientSocket, head) => {
-    (async () => {
-      let authority;
-      try {
-        authority = new URL(`http://${req.url}`);
-        const hostname = validateHostname(authority.hostname);
-        const port = Number(authority.port || 443);
-        if (port !== 443) throw new Error("connect_port_blocked");
-
-        const resolved = await resolvePublicAddress(hostname);
-        const releaseBrowser = await browserProxyNetwork.acquire();
-        const releaseGlobal = await globalNetwork.acquire();
-        const releaseHost = await getHostSemaphore(hostname).acquire();
-        let finalized = false;
-        const finalize = () => {
-          if (finalized) return;
-          finalized = true;
-          releaseHost();
-          releaseGlobal();
-          releaseBrowser();
-        };
-
-        const upstreamSocket = net.connect({
-          host: resolved.address,
-          port,
-          family: resolved.family
-        });
-        upstreamSocket.setTimeout(BROWSER_FALLBACK_TIMEOUT_MS + 4000, () => upstreamSocket.destroy());
-        clientSocket.setTimeout(BROWSER_FALLBACK_TIMEOUT_MS + 4000, () => clientSocket.destroy());
-
-        upstreamSocket.once("connect", () => {
-          clientSocket.write("HTTP/1.1 200 Connection Established\r\nProxy-Agent: LinkPreviewSafeProxy\r\n\r\n");
-          if (head?.length) upstreamSocket.write(head);
-          clientSocket.pipe(upstreamSocket);
-          upstreamSocket.pipe(clientSocket);
-        });
-
-        upstreamSocket.on("error", () => clientSocket.destroy());
-        clientSocket.on("error", () => upstreamSocket.destroy());
-        upstreamSocket.on("close", finalize);
-        clientSocket.on("close", finalize);
-      } catch {
-        clientSocket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
-      }
-    })().catch(() => clientSocket.destroy());
-  });
-
-  await new Promise((resolve, reject) => {
-    proxy.once("error", reject);
-    proxy.listen(0, "127.0.0.1", resolve);
-  });
-  const address = proxy.address();
-  return { server: proxy, port: typeof address === "object" && address ? address.port : null };
-}
-
-const browserProxy = await startBrowserSafetyProxy();
+const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
+const EDGE_HELPER_PATH = path.join(SERVER_DIR, "edge-fallback.js");
 
 async function renderMetadataWithEdge(targetUrl) {
   const release = await browserFallback.acquire();
-  let profileDir = null;
   try {
-    const edgePath = await findEdgeExecutable();
-    if (!edgePath || !browserProxy.port) return { ok: false, error: "edge_fallback_unavailable" };
+    const helperResult = await new Promise((resolve) => {
+      const child = spawn(
+        process.execPath,
+        [
+          EDGE_HELPER_PATH,
+          targetUrl,
+          String(BROWSER_FALLBACK_TIMEOUT_MS),
+          String(BROWSER_PROXY_NETWORK_LIMIT),
+          String(PER_HOST_NETWORK_LIMIT),
+          String(BROWSER_DOM_LIMIT_BYTES)
+        ],
+        { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] }
+      );
 
-    profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "link-preview-edge-"));
-    const args = [
-      "--headless=new",
-      "--disable-gpu",
-      "--disable-quic",
-      "--disable-extensions",
-      "--disable-background-networking",
-      "--disable-component-update",
-      "--disable-default-apps",
-      "--disable-sync",
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--metrics-recording-only",
-      "--mute-audio",
-      "--autoplay-policy=user-gesture-required",
-      "--blink-settings=imagesEnabled=false",
-      `--proxy-server=http://127.0.0.1:${browserProxy.port}`,
-      "--proxy-bypass-list=<-loopback>",
-      `--user-data-dir=${profileDir}`,
-      "--window-size=1280,720",
-      "--dump-dom",
-      targetUrl
-    ];
-
-    const result = await new Promise((resolve) => {
-      const child = spawn(edgePath, args, { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
-      const chunks = [];
-      const errors = [];
-      let bytes = 0;
-      let overflow = false;
+      const stdout = [];
+      const stderr = [];
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
       let settled = false;
 
       const finish = (value) => {
@@ -890,41 +733,82 @@ async function renderMetadataWithEdge(targetUrl) {
         resolve(value);
       };
 
+      // Parent timeout is intentionally longer than the helper's own Edge timeout.
+      // If the entire helper wedges, terminate it without risking the main API process.
+      const terminateHelperTree = () => {
+        if (process.platform === "win32" && child.pid) {
+          const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+            windowsHide: true,
+            stdio: "ignore"
+          });
+          killer.on("error", () => child.kill());
+        } else {
+          child.kill();
+        }
+      };
+
       const timer = setTimeout(() => {
-        child.kill();
-        finish({ ok: false, error: "edge_fallback_timeout" });
-      }, BROWSER_FALLBACK_TIMEOUT_MS);
+        terminateHelperTree();
+        finish({ ok: false, error: "edge_helper_timeout" });
+      }, BROWSER_FALLBACK_TIMEOUT_MS + 8000);
 
       child.stdout.on("data", (chunk) => {
-        if (overflow) return;
-        bytes += chunk.length;
-        if (bytes > BROWSER_DOM_LIMIT_BYTES) {
-          overflow = true;
-          child.kill();
-          finish({ ok: false, error: "edge_dom_too_large" });
+        stdoutBytes += chunk.length;
+        if (stdoutBytes > BROWSER_DOM_LIMIT_BYTES * 2 + 512 * 1024) {
+          terminateHelperTree();
+          finish({ ok: false, error: "edge_helper_output_too_large" });
           return;
         }
-        chunks.push(chunk);
+        stdout.push(chunk);
       });
+
       child.stderr.on("data", (chunk) => {
-        if (errors.reduce((sum, item) => sum + item.length, 0) < 16 * 1024) errors.push(chunk);
+        if (stderrBytes >= 32 * 1024) return;
+        const remaining = 32 * 1024 - stderrBytes;
+        const used = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
+        stderrBytes += used.length;
+        stderr.push(used);
       });
-      child.once("error", (error) => finish({ ok: false, error: error.message || "edge_launch_failed" }));
-      child.once("close", () => {
-        const html = Buffer.concat(chunks).toString("utf8");
-        if (!html.trim()) {
-          finish({ ok: false, error: "edge_empty_dom", diagnostic: Buffer.concat(errors).toString("utf8").slice(0, 500) });
-        } else {
-          finish({ ok: true, html, bytes });
+
+      child.once("error", (error) => {
+        finish({ ok: false, error: error?.message || "edge_helper_launch_failed" });
+      });
+
+      child.once("close", (code) => {
+        if (settled) return;
+        const text = Buffer.concat(stdout).toString("utf8").trim();
+        try {
+          const parsed = JSON.parse(text || "{}");
+          if (!parsed.ok) {
+            finish({
+              ok: false,
+              error: parsed.error || `edge_helper_exit_${code ?? "unknown"}`,
+              diagnostic: parsed.diagnostic || Buffer.concat(stderr).toString("utf8").slice(0, 1000)
+            });
+            return;
+          }
+          finish(parsed);
+        } catch {
+          finish({
+            ok: false,
+            error: `edge_helper_invalid_output_${code ?? "unknown"}`,
+            diagnostic: `${text.slice(0, 500)} ${Buffer.concat(stderr).toString("utf8").slice(0, 500)}`.trim()
+          });
         }
       });
     });
 
-    if (!result.ok) return result;
-    const metadata = extractHtmlMetadata(result.html, targetUrl);
-    return { ok: true, metadata, bytes: result.bytes };
+    if (!helperResult.ok) return helperResult;
+    const html = String(helperResult.html || "");
+    if (!html.trim()) return { ok: false, error: "edge_empty_dom" };
+    const metadata = extractHtmlMetadata(html, targetUrl);
+    return {
+      ok: true,
+      metadata,
+      bytes: Buffer.byteLength(html),
+      diagnostic: helperResult.diagnostic || null
+    };
   } finally {
-    if (profileDir) await fs.rm(profileDir, { recursive: true, force: true }).catch(() => {});
     release();
   }
 }
@@ -997,7 +881,9 @@ async function createPreview(rawUrl, { allowBrowserFallback = true } = {}) {
 
   metadata = mergeMetadata(metadata, providerMetadata, htmlResult.finalUrl || targetUrl);
   let usedBrowserFallback = false;
+  let browserFallbackAttempted = false;
   let browserError = null;
+  let browserDiagnostic = null;
 
   // 401/403/405 commonly mean "real browser required" rather than "URL is invalid".
   // Also use the browser when plain HTML succeeded but exposed no usable thumbnail.
@@ -1007,12 +893,14 @@ async function createPreview(rawUrl, { allowBrowserFallback = true } = {}) {
   const shouldTryBrowser = allowBrowserFallback && needsBrowserFallback;
 
   if (shouldTryBrowser) {
+    browserFallbackAttempted = true;
     const browser = await renderMetadataWithEdge(targetUrl);
     if (browser.ok) {
       usedBrowserFallback = true;
       metadata = mergeMetadata(browser.metadata, metadata, targetUrl);
     } else {
       browserError = browser.error || "edge_fallback_failed";
+      browserDiagnostic = browser.diagnostic || null;
     }
   }
 
@@ -1058,7 +946,10 @@ async function createPreview(rawUrl, { allowBrowserFallback = true } = {}) {
     cached: false,
     warning,
     browserFallback: usedBrowserFallback,
-    needsBrowserFallback: needsBrowserFallback && !usedBrowserFallback
+    browserFallbackAttempted,
+    browserFallbackError: browserError,
+    browserFallbackDiagnostic: browserDiagnostic,
+    needsBrowserFallback: needsBrowserFallback && !allowBrowserFallback
   };
 
   if ((value.image || value.title) && !value.needsBrowserFallback) cacheSet(cacheKey, value);
@@ -1502,7 +1393,7 @@ app.use(express.json({ limit: "1mb" }));
 app.get("/api/status", (_req, res) => {
   res.json({
     ok: true,
-    version: "2.2",
+    version: "2.2.1",
     limits: {
       globalNetwork: GLOBAL_NETWORK_LIMIT,
       perHostNetwork: PER_HOST_NETWORK_LIMIT,
@@ -1520,7 +1411,7 @@ app.get("/api/status", (_req, res) => {
     queuedImages: imageNetwork.waiters.length,
     activeBrowserFallbacks: browserFallback.active,
     queuedBrowserFallbacks: browserFallback.waiters.length,
-    activeBrowserProxyConnections: browserProxyNetwork.active,
+    browserProxyConnectionLimit: BROWSER_PROXY_NETWORK_LIMIT,
     cachedPreviews: previewCache.size,
     cachedAlternateSearches: alternateCache.size
   });
@@ -1606,7 +1497,7 @@ app.get("/api/preview", previewHandler);
 app.post("/api/preview", previewHandler);
 
 app.listen(PORT, "127.0.0.1", () => {
-  console.log(`Video preview engine v2.2 listening on http://127.0.0.1:${PORT}`);
+  console.log(`Video preview engine v2.2.1 listening on http://127.0.0.1:${PORT}`);
   console.log(`Network limits: ${GLOBAL_NETWORK_LIMIT} global / ${PER_HOST_NETWORK_LIMIT} per host.`);
-  console.log(`Edge fallback: ${BROWSER_FALLBACK_LIMIT} worker via safety proxy on 127.0.0.1:${browserProxy.port}.`);
+  console.log(`Edge fallback: ${BROWSER_FALLBACK_LIMIT} isolated helper worker; helper proxy limit ${BROWSER_PROXY_NETWORK_LIMIT}.`);
 });

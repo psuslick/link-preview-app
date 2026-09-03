@@ -1,4 +1,4 @@
-const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:3000/api";
+const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:3000/api";
 
 export async function fetchPreview(url, { signal, allowBrowserFallback = true } = {}) {
   const started = performance.now();
@@ -30,7 +30,8 @@ export async function fetchPreview(url, { signal, allowBrowserFallback = true } 
       image: null,
       title: null,
       description: null,
-      error: error?.name === "AbortError" ? "cancelled" : error?.message || "backend_unreachable",
+      error: error?.name === "AbortError" ? "cancelled" : "backend_unreachable",
+      clientNetworkError: error?.message || "Failed to fetch",
       clientStatus: 0,
       clientOk: false,
       clientMs: Math.round(performance.now() - started)
@@ -70,7 +71,8 @@ export async function fetchAlternates(source, { signal } = {}) {
   } catch (error) {
     return {
       results: [],
-      error: error?.name === "AbortError" ? "cancelled" : error?.message || "backend_unreachable",
+      error: error?.name === "AbortError" ? "cancelled" : "backend_unreachable",
+      clientNetworkError: error?.message || "Failed to fetch",
       clientStatus: 0,
       clientOk: false,
       clientMs: Math.round(performance.now() - started)
