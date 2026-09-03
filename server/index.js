@@ -85,6 +85,27 @@ const alternateCache = new Map();
 const browserChallengeHosts = new Map();
 const authorizedBrowserProfiles = new Map();
 
+const DEFAULT_PRIVACY = Object.freeze({
+  browserFallback: true,
+  interactiveAuthorization: true,
+  mediaTools: true,
+  searchDuckDuckGo: true,
+  searchBing: true,
+  searchMojeek: true,
+  searchTitleUploader: true,
+  searchMediaIds: true,
+  searchDescription: true,
+  searchTranscript: true,
+  sampleComparison: true
+});
+
+function normalizePrivacy(value) {
+  const input = value && typeof value === "object" ? value : {};
+  return Object.fromEntries(
+    Object.entries(DEFAULT_PRIVACY).map(([key, defaultValue]) => [key, typeof input[key] === "boolean" ? input[key] : defaultValue])
+  );
+}
+
 function getHostSemaphore(hostname) {
   const key = hostname.toLowerCase();
   if (!hostSemaphores.has(key)) hostSemaphores.set(key, new Semaphore(PER_HOST_NETWORK_LIMIT));
@@ -888,6 +909,26 @@ function authorizationProfileFor(rawUrl) {
   return entry?.status === "ready" ? entry.path : null;
 }
 
+function authorizationLiveSessionFor(rawUrl) {
+  const entry = authorizationEntryFor(rawUrl);
+  return entry?.status === "authorizing" && Number.isInteger(entry.debugPort)
+    ? { path: entry.path, debugPort: entry.debugPort }
+    : null;
+}
+
+async function reserveLocalPort() {
+  return await new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.unref();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port = typeof address === "object" && address ? address.port : null;
+      server.close((error) => error ? reject(error) : resolve(port));
+    });
+  });
+}
+
 async function ensureAuthorizationProfile(rawUrl) {
   const host = authorizationHost(rawUrl);
   if (!host) throw new Error("invalid_url");
@@ -898,7 +939,7 @@ async function ensureAuthorizationProfile(rawUrl) {
   await fs.mkdir(root, { recursive: true });
   const profile = path.join(root, safeHost);
   await fs.mkdir(profile, { recursive: true });
-  const entry = { path: profile, status: "idle", startedAt: null, finishedAt: null };
+  const entry = { path: profile, status: "idle", startedAt: null, finishedAt: null, debugPort: null };
   authorizedBrowserProfiles.set(host, entry);
   return entry;
 }
@@ -939,17 +980,100 @@ function isLikelyMediaPath(pathname = "") {
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const EDGE_HELPER_PATH = path.join(SERVER_DIR, "edge-fallback.js");
 const EDGE_AUTH_HELPER_PATH = path.join(SERVER_DIR, "edge-authorize.js");
+const EDGE_SESSION_HELPER_PATH = path.join(SERVER_DIR, "edge-session-probe.js");
 const FRAME_COMPARE_HELPER_PATH = path.join(SERVER_DIR, "media-frame-compare.js");
+
+async function renderMetadataFromAuthorizedSession(targetUrl, debugPort) {
+  return await new Promise((resolve) => {
+    const child = spawn(process.execPath, [
+      "--experimental-websocket",
+      EDGE_SESSION_HELPER_PATH,
+      targetUrl,
+      String(debugPort),
+      String(BROWSER_DOM_LIMIT_BYTES)
+    ], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    const stdout = [];
+    const stderr = [];
+    let outBytes = 0;
+    let errBytes = 0;
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch {}
+      finish({ ok: false, error: "authorized_session_probe_timeout" });
+    }, 5000);
+    child.stdout.on("data", (chunk) => {
+      outBytes += chunk.length;
+      if (outBytes > BROWSER_DOM_LIMIT_BYTES * 2 + 256 * 1024) {
+        try { child.kill(); } catch {}
+        finish({ ok: false, error: "authorized_session_output_too_large" });
+        return;
+      }
+      stdout.push(chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      if (errBytes >= 24 * 1024) return;
+      const remaining = 24 * 1024 - errBytes;
+      const used = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
+      errBytes += used.length;
+      stderr.push(used);
+    });
+    child.once("error", (error) => finish({ ok: false, error: error?.message || "authorized_session_probe_launch_failed" }));
+    child.once("close", () => {
+      if (settled) return;
+      try {
+        const parsed = JSON.parse(Buffer.concat(stdout).toString("utf8") || "{}");
+        if (!parsed.ok) {
+          finish({ ok: false, error: parsed.error || "authorized_session_probe_failed", diagnostic: Buffer.concat(stderr).toString("utf8").slice(0, 1000) });
+          return;
+        }
+        const html = String(parsed.html || "");
+        const challenge = detectChallengePage(html);
+        if (challenge) {
+          finish({ ok: false, error: "authorized_session_challenge_page", challenge: true, challengeProvider: challenge.provider, challengeTitle: challenge.title });
+          return;
+        }
+        const pageUrl = parsed.pageUrl || targetUrl;
+        finish({
+          ok: true,
+          metadata: extractHtmlMetadata(html, pageUrl),
+          mediaSignals: extractMediaDiscoverySignals(html, pageUrl),
+          bytes: Buffer.byteLength(html),
+          liveAuthorizedSession: true,
+          pageUrl,
+          diagnostic: parsed.title ? `visible Edge: ${parsed.title}` : null
+        });
+      } catch {
+        finish({ ok: false, error: "authorized_session_invalid_output", diagnostic: Buffer.concat(stderr).toString("utf8").slice(0, 1000) });
+      }
+    });
+  });
+}
 
 async function renderMetadataWithEdge(targetUrl) {
   const authProfile = authorizationProfileFor(targetUrl);
+  const liveSession = authorizationLiveSessionFor(targetUrl);
   const openCircuit = challengeCircuitFor(targetUrl);
-  if (openCircuit && !authProfile) {
+  if (openCircuit && !authProfile && !liveSession) {
     return { ok: false, error: "edge_challenge_circuit_open", challenge: true };
   }
 
   const release = await browserFallback.acquire();
   try {
+    const activeLiveSession = authorizationLiveSessionFor(targetUrl);
+    if (activeLiveSession) {
+      const liveResult = await renderMetadataFromAuthorizedSession(targetUrl, activeLiveSession.debugPort);
+      if (liveResult.ok || liveResult.challenge) return liveResult;
+      // Do not start another Edge instance with the same profile while the visible
+      // authorization window owns it. Return a useful transient error instead.
+      return liveResult;
+    }
+
     const activeProfile = authorizationProfileFor(targetUrl);
     const recheckCircuit = challengeCircuitFor(targetUrl);
     if (recheckCircuit && !activeProfile) {
@@ -1169,8 +1293,10 @@ async function createPreview(rawUrl, { allowBrowserFallback = true } = {}) {
 
   const restrictedStatus = [401, 403, 405, 406, 418].includes(htmlResult.status);
   const authorizedProfile = authorizationProfileFor(targetUrl);
+  const authorizedLiveSession = authorizationLiveSessionFor(targetUrl);
+  const hasAuthorizedSession = Boolean(authorizedProfile || authorizedLiveSession);
   const needsBrowserFallback = Boolean(
-    (httpChallenge && authorizedProfile) ||
+    (httpChallenge && hasAuthorizedSession) ||
     (!httpChallenge && (restrictedStatus || (htmlResult.ok && !metadata.image)))
   );
   const shouldTryBrowser = allowBrowserFallback && needsBrowserFallback;
@@ -1233,13 +1359,14 @@ async function createPreview(rawUrl, { allowBrowserFallback = true } = {}) {
     cached: false,
     warning,
     authorizedBrowserProfile: Boolean(authorizedProfile),
+    authorizedBrowserSession: Boolean(authorizedLiveSession),
     browserFallback: usedBrowserFallback,
     browserFallbackAttempted,
     browserFallbackError: browserError,
     browserFallbackDiagnostic: browserDiagnostic,
     challengeDetected: Boolean((httpChallenge && !usedBrowserFallback) || browserChallenge),
     challengeProvider: httpChallenge?.provider || null,
-    browserFallbackSkippedReason: httpChallenge && !authorizedProfile ? "challenge_page_detected" : null,
+    browserFallbackSkippedReason: httpChallenge && !hasAuthorizedSession ? "challenge_page_detected" : null,
     needsBrowserFallback: needsBrowserFallback && !allowBrowserFallback,
     extractorStats: httpMetadata?.extractorStats || null,
     browserExtractorStats
@@ -1756,7 +1883,8 @@ async function launchAuthorizationBrowser(targetUrl) {
   entry.status = "authorizing";
   entry.startedAt = Date.now();
   entry.finishedAt = null;
-  const child = spawn(process.execPath, [EDGE_AUTH_HELPER_PATH, normalized, entry.path], {
+  entry.debugPort = await reserveLocalPort();
+  const child = spawn(process.execPath, [EDGE_AUTH_HELPER_PATH, normalized, entry.path, String(entry.debugPort)], {
     windowsHide: false,
     detached: false,
     stdio: "ignore"
@@ -1765,10 +1893,12 @@ async function launchAuthorizationBrowser(targetUrl) {
   child.once("error", () => {
     entry.status = "failed";
     entry.finishedAt = Date.now();
+    entry.debugPort = null;
   });
   child.once("close", (code) => {
     entry.status = code === 0 ? "ready" : "failed";
     entry.finishedAt = Date.now();
+    entry.debugPort = null;
     if (code === 0 && host) browserChallengeHosts.delete(host);
   });
   return { ok: true, host, status: "authorizing", alreadyOpen: false };
@@ -1840,7 +1970,7 @@ function evidenceOverlap(sourceSignals, candidateSignals) {
   return { score, matchedIds: [...new Set(matchedIds)], matchedFilenames: [...new Set(matchedFilenames)], sharedMediaHost };
 }
 
-function buildDiscoveryQueries(source, signals, transcript) {
+function buildDiscoveryQueries(source, signals, transcript, privacy = DEFAULT_PRIVACY) {
   const queries = [];
   const add = (kind, query, weight, signal = null) => {
     const cleaned = String(query || "").replace(/\s+/g, " ").trim();
@@ -1848,16 +1978,18 @@ function buildDiscoveryQueries(source, signals, transcript) {
     queries.push({ kind, query: cleaned, weight, signal });
   };
   const title = cleanSearchTitle(source.title);
-  if (transcript?.phrase) add("transcript", `"${transcript.phrase.replace(/"/g, " ")}"`, 1.0, transcript.phrase);
-  for (const id of (signals.ids || []).slice(0, 4)) {
-    add("media-id", `"${String(id).replace(/"/g, " ")}"`, 0.98, id);
-    add("media-id-video", `"${String(id).replace(/"/g, " ")}" video`, 0.94, id);
+  if (privacy.searchTranscript && transcript?.phrase) add("transcript", `"${transcript.phrase.replace(/"/g, " ")}"`, 1.0, transcript.phrase);
+  if (privacy.searchMediaIds) {
+    for (const id of (signals.ids || []).slice(0, 4)) {
+      add("media-id", `"${String(id).replace(/"/g, " ")}"`, 0.98, id);
+      add("media-id-video", `"${String(id).replace(/"/g, " ")}" video`, 0.94, id);
+    }
+    for (const filename of (signals.filenames || []).slice(0, 4)) add("media-filename", `"${String(filename).replace(/"/g, " ")}"`, 0.94, filename);
   }
-  for (const filename of (signals.filenames || []).slice(0, 4)) add("media-filename", `"${String(filename).replace(/"/g, " ")}"`, 0.94, filename);
-  const descriptionPhrase = distinctivePhrase(source.description, 9);
+  const descriptionPhrase = privacy.searchDescription ? distinctivePhrase(source.description, 9) : null;
   if (descriptionPhrase) add("description", `"${descriptionPhrase.replace(/"/g, " ")}"`, 0.82, descriptionPhrase);
-  if (source.uploader && title) add("uploader-title", `"${String(source.uploader).replace(/"/g, " ")}" "${title.replace(/"/g, " ")}"`, 0.86, source.uploader);
-  if (title) {
+  if (privacy.searchTitleUploader && source.uploader && title) add("uploader-title", `"${String(source.uploader).replace(/"/g, " ")}" "${title.replace(/"/g, " ")}"`, 0.86, source.uploader);
+  if (privacy.searchTitleUploader && title) {
     add("title-exact", `"${title.replace(/"/g, " ")}"`, 0.78, title);
     add("title-video", `"${title.replace(/"/g, " ")}" video`, 0.74, title);
     add("longer-title", `"${title.replace(/"/g, " ")}" full complete extended uncut`, 0.70, title);
@@ -1865,8 +1997,8 @@ function buildDiscoveryQueries(source, signals, transcript) {
   try {
     const sourceUrl = new URL(source.url);
     const pathBits = sourceUrl.pathname.split("/").filter(Boolean).map((part) => decodeURIComponent(part).replace(/\.[a-z0-9]{2,6}$/i, "")).filter((part) => part.length >= 4);
-    for (const bit of pathBits.slice(-2)) add("url-path", `"${bit.replace(/"/g, " ")}"`, 0.55, bit);
-    if (!queries.length) add("url-fallback", `"${sourceUrl.hostname}${sourceUrl.pathname}"`, 0.35, sourceUrl.pathname);
+    if (privacy.searchMediaIds) for (const bit of pathBits.slice(-2)) add("url-path", `"${bit.replace(/"/g, " ")}"`, 0.55, bit);
+    if (!queries.length && privacy.searchTitleUploader) add("url-fallback", `"${sourceUrl.hostname}${sourceUrl.pathname}"`, 0.35, sourceUrl.pathname);
   } catch {}
   return queries.slice(0, 10);
 }
@@ -1898,11 +2030,12 @@ function classifyEvidenceAlternate(source, candidate, similarity, overlap, evide
   return { relation, confidence, durationRatio, differentSource, lexicalLongerHint, strongIdentity };
 }
 
-async function findAlternates({ url, title, description, provider, durationSeconds }) {
+async function findAlternates({ url, title, description, provider, durationSeconds, privacy: privacyInput }) {
+  const privacy = normalizePrivacy(privacyInput);
   const sourceUrl = validateUrl(url).toString();
-  const toolsDir = await findToolsDir();
+  const toolsDir = privacy.mediaTools ? await findToolsDir() : null;
   const sourcePage = await probePublicPageSignals(sourceUrl);
-  const sourceTool = await runMediaToolProbe(sourceUrl, toolsDir);
+  const sourceTool = privacy.mediaTools ? await runMediaToolProbe(sourceUrl, toolsDir) : null;
   const toolInfo = sourceTool?.result || null;
 
   let source = {
@@ -1916,7 +2049,7 @@ async function findAlternates({ url, title, description, provider, durationSecon
 
   let sourceSignals = mergeDiscoverySignals(sourcePage.signals, signalsFromToolResult(sourceTool));
   let sourceEdge = null;
-  if (!sourceSignals.ids.length && !sourceSignals.filenames.length && !sourceSignals.mediaUrls.length) {
+  if (privacy.browserFallback && !sourceSignals.ids.length && !sourceSignals.filenames.length && !sourceSignals.mediaUrls.length) {
     sourceEdge = await renderMetadataWithEdge(sourceUrl);
     if (sourceEdge?.ok) {
       sourceSignals = mergeDiscoverySignals(sourceSignals, sourceEdge.mediaSignals);
@@ -1928,8 +2061,8 @@ async function findAlternates({ url, title, description, provider, durationSecon
       };
     }
   }
-  const transcript = sourceTool?.ok ? await transcriptPhraseFromTool(sourceTool) : null;
-  const queries = buildDiscoveryQueries(source, sourceSignals, transcript);
+  const transcript = privacy.searchTranscript && sourceTool?.ok ? await transcriptPhraseFromTool(sourceTool) : null;
+  const queries = buildDiscoveryQueries(source, sourceSignals, transcript, privacy);
 
   if (!queries.length) {
     const error = new Error("not_enough_media_metadata_for_search");
@@ -1937,7 +2070,8 @@ async function findAlternates({ url, title, description, provider, durationSecon
     throw error;
   }
 
-  const cacheKey = `${canonicalDiscoveryUrl(sourceUrl)}|${source.title || ""}|${source.durationSeconds || 0}|${queries.map((q) => q.query).join("|")}`;
+  const privacyKey = Object.entries(privacy).sort(([a],[b]) => a.localeCompare(b)).map(([key, value]) => `${key}:${value ? 1 : 0}`).join(",");
+  const cacheKey = `${canonicalDiscoveryUrl(sourceUrl)}|${source.title || ""}|${source.durationSeconds || 0}|${privacyKey}|${queries.map((q) => q.query).join("|")}`;
   const cached = alternateCacheGet(cacheKey);
   if (cached) return cached;
 
@@ -1962,18 +2096,21 @@ async function findAlternates({ url, title, description, provider, durationSecon
 
   for (let queryIndex = 0; queryIndex < queries.length; queryIndex += 1) {
     const querySpec = queries[queryIndex];
-    const ddg = await searchDuckDuckGo(querySpec.query);
-    searchDiagnostics.push({ engine: "DuckDuckGo", kind: querySpec.kind, query: querySpec.query, status: ddg.status || 0, error: ddg.error || null, found: ddg.results.length });
-    addResults(ddg.results, querySpec);
+    let ddg = { ok: false, results: [] };
+    if (privacy.searchDuckDuckGo) {
+      ddg = await searchDuckDuckGo(querySpec.query);
+      searchDiagnostics.push({ engine: "DuckDuckGo", kind: querySpec.kind, query: querySpec.query, status: ddg.status || 0, error: ddg.error || null, found: ddg.results.length });
+      addResults(ddg.results, querySpec);
+    }
 
-    // For the strongest evidence queries, search both engines even when the first succeeds.
-    // This deliberately favors recall: obscure mirrors often exist in only one public index.
-    if (queryIndex < 5 || !ddg.ok || ddg.results.length < 3) {
+    // Search engines are individually privacy-controlled. Disabling one never causes
+    // a candidate from another enabled engine to be rejected.
+    if (privacy.searchBing && (queryIndex < 5 || !privacy.searchDuckDuckGo || !ddg.ok || ddg.results.length < 3)) {
       const bing = await searchBing(querySpec.query);
       searchDiagnostics.push({ engine: "Bing", kind: querySpec.kind, query: querySpec.query, status: bing.status || 0, error: bing.error || null, found: bing.results.length });
       addResults(bing.results, querySpec);
     }
-    if (queryIndex < 4 || gatheredMap.size < 8) {
+    if (privacy.searchMojeek && (queryIndex < 4 || gatheredMap.size < 8)) {
       const mojeek = await searchMojeek(querySpec.query);
       searchDiagnostics.push({ engine: "Mojeek", kind: querySpec.kind, query: querySpec.query, status: mojeek.status || 0, error: mojeek.error || null, found: mojeek.results.length });
       addResults(mojeek.results, querySpec);
@@ -2019,7 +2156,7 @@ async function findAlternates({ url, title, description, provider, durationSecon
   const toolTargets = basicCandidates
     .filter(Boolean)
     .sort((a, b) => (b.overlap.score + b.evidenceWeight * 40 + b.similarity * 25) - (a.overlap.score + a.evidenceWeight * 40 + a.similarity * 25))
-    .slice(0, toolsDir ? MEDIA_TOOL_CANDIDATE_LIMIT : 0);
+    .slice(0, privacy.mediaTools && toolsDir ? MEDIA_TOOL_CANDIDATE_LIMIT : 0);
   const toolMap = new Map();
   const toolResults = await runLimited(toolTargets, MEDIA_TOOL_CANDIDATE_CONCURRENCY, async (candidate) => ({
     url: candidate.url,
@@ -2065,6 +2202,7 @@ async function findAlternates({ url, title, description, provider, durationSecon
       mediaHosts: [...new Set(sourceSignals.mediaUrls.map(discoveryHost).filter(Boolean))].slice(0, 8),
       transcript: transcript ? { phrase: transcript.phrase, lang: transcript.lang, automatic: transcript.automatic } : null
     },
+    privacy,
     tools: {
       installed: Boolean(toolsDir),
       directory: toolsDir ? "SandboxBootstrap\\tools" : null,
@@ -2082,7 +2220,7 @@ async function findAlternates({ url, title, description, provider, durationSecon
     searchDiagnostics,
     candidateCount: gathered.length,
     evaluatedCount: prioritized.length,
-    manualSearchUrl: queries[0] ? `https://duckduckgo.com/?q=${encodeURIComponent(queries[0].query)}` : null,
+    manualSearchUrl: privacy.searchDuckDuckGo && queries[0] ? `https://duckduckgo.com/?q=${encodeURIComponent(queries[0].query)}` : null,
     cached: false,
     note: toolsDir
       ? "Discovery is host-agnostic: yt-dlp native and forced-generic extraction, raw page/embed/media identifiers, optional subtitle phrases, and general web search are combined. Unknown hosts are not rejected. Results are evidence-ranked; low-confidence candidates are retained instead of rejected. Frame comparison is available on demand for individual candidates."
@@ -2157,7 +2295,7 @@ app.use(express.json({ limit: "1mb" }));
 app.get("/api/status", (_req, res) => {
   res.json({
     ok: true,
-    version: "2.4.0",
+    version: "2.5.0",
     limits: {
       globalNetwork: GLOBAL_NETWORK_LIMIT,
       perHostNetwork: PER_HOST_NETWORK_LIMIT,
@@ -2186,8 +2324,9 @@ async function previewHandler(req, res) {
   if (!targetUrl || typeof targetUrl !== "string") return res.status(400).json({ error: "missing_url" });
 
   try {
-    const allowBrowserFallback =
-      req.method === "POST" ? req.body?.allowBrowserFallback !== false : req.query.browser !== "0";
+    const privacy = normalizePrivacy(req.method === "POST" ? req.body?.privacy : null);
+    const allowBrowserFallback = privacy.browserFallback &&
+      (req.method === "POST" ? req.body?.allowBrowserFallback !== false : req.query.browser !== "0");
     const preview = await createPreview(targetUrl.trim(), { allowBrowserFallback });
     return res.json(preview);
   } catch (error) {
@@ -2232,13 +2371,15 @@ app.get("/api/image", async (req, res) => {
 });
 
 app.post("/api/authorize-host", async (req, res) => {
+  const privacy = normalizePrivacy(req.body?.privacy);
+  if (!privacy.interactiveAuthorization) return res.status(403).json({ error: "privacy_interactive_authorization_disabled" });
   const targetUrl = req.body?.url;
   if (!targetUrl || typeof targetUrl !== "string") return res.status(400).json({ error: "missing_url" });
   try {
     const result = await launchAuthorizationBrowser(targetUrl.trim());
     return res.json({
       ...result,
-      note: "A visible Edge window was opened inside Windows Sandbox through the public-network safety proxy. Complete the site's challenge, then close that Edge window. The profile remains only for this Sandbox session."
+      note: "A visible Edge session was opened inside Windows Sandbox through the public-network safety proxy. If the real video page is visible, you can click Retry preview while the window remains open. If a challenge appears, complete it first."
     });
   } catch (error) {
     return res.status(400).json({ error: error?.message || "authorization_launch_failed" });
@@ -2252,13 +2393,15 @@ app.get("/api/authorization-status", (req, res) => {
     validateUrl(targetUrl);
     const host = authorizationHost(targetUrl);
     const entry = authorizationEntryFor(targetUrl);
-    return res.json({ host, status: entry?.status || "none", ready: entry?.status === "ready" });
+    return res.json({ host, status: entry?.status || "none", ready: entry?.status === "ready", live: entry?.status === "authorizing" && Number.isInteger(entry?.debugPort) });
   } catch (error) {
     return res.status(400).json({ error: error?.message || "authorization_status_failed" });
   }
 });
 
 app.post("/api/compare-video", async (req, res) => {
+  const privacy = normalizePrivacy(req.body?.privacy);
+  if (!privacy.sampleComparison) return res.status(403).json({ error: "privacy_sample_comparison_disabled" });
   const sourceUrl = req.body?.sourceUrl;
   const candidateUrl = req.body?.candidateUrl;
   if (!sourceUrl || !candidateUrl || typeof sourceUrl !== "string" || typeof candidateUrl !== "string") {
@@ -2281,7 +2424,8 @@ app.post("/api/alternates", async (req, res) => {
       title: req.body?.title,
       description: req.body?.description,
       provider: req.body?.provider,
-      durationSeconds: req.body?.durationSeconds
+      durationSeconds: req.body?.durationSeconds,
+      privacy: req.body?.privacy
     });
     return res.json(result);
   } catch (error) {

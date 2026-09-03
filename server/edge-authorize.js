@@ -6,6 +6,7 @@ import fs from "node:fs/promises";
 
 const targetUrl = process.argv[2];
 const profileDir = process.argv[3];
+const debugPort = Number(process.argv[4] || 0);
 const GLOBAL_LIMIT = 8;
 const PER_HOST_LIMIT = 4;
 
@@ -175,6 +176,7 @@ async function startSafetyProxy() {
 async function run() {
   validateUrl(targetUrl);
   if (!profileDir) throw new Error("missing_profile_dir");
+  if (!Number.isInteger(debugPort) || debugPort < 1024 || debugPort > 65535) throw new Error("invalid_debug_port");
   const edgePath = await findEdgeExecutable();
   if (!edgePath) throw new Error("edge_unavailable");
   await fs.mkdir(profileDir, { recursive: true });
@@ -184,6 +186,7 @@ async function run() {
     "--disable-default-apps", "--disable-sync", "--no-first-run", "--no-default-browser-check", "--mute-audio",
     "--autoplay-policy=user-gesture-required",
     `--proxy-server=http://127.0.0.1:${proxy.port}`, "--proxy-bypass-list=<-loopback>",
+    `--remote-debugging-port=${debugPort}`, "--remote-debugging-address=127.0.0.1",
     `--user-data-dir=${profileDir}`, "--new-window", targetUrl
   ];
   const edge = spawn(edgePath, args, { windowsHide: false, stdio: "ignore" });

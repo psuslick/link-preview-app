@@ -12,6 +12,40 @@ import "./App.css";
 const CLIENT_CONCURRENCY = 12;
 const BROWSER_FALLBACK_CONCURRENCY = 1;
 const FINDER_CONCURRENCY = 2;
+const PRIVACY_STORAGE_KEY = "linkPreviewPrivacyV1";
+const FULL_PRIVACY = Object.freeze({
+  remoteThumbnails: true,
+  browserFallback: true,
+  interactiveAuthorization: true,
+  mediaTools: true,
+  searchDuckDuckGo: true,
+  searchBing: true,
+  searchMojeek: true,
+  searchTitleUploader: true,
+  searchMediaIds: true,
+  searchDescription: true,
+  searchTranscript: true,
+  sampleComparison: true
+});
+const MINIMUM_PRIVACY = Object.freeze(Object.fromEntries(Object.keys(FULL_PRIVACY).map((key) => [key, false])));
+
+function loadPrivacySettings() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(PRIVACY_STORAGE_KEY) || "null");
+    if (saved && typeof saved === "object") return { ...FULL_PRIVACY, ...saved };
+  } catch {}
+  return { ...FULL_PRIVACY };
+}
+
+function PrivacyToggle({ checked, onChange, title, detail }) {
+  return (
+    <label className="privacy-toggle">
+      <span className="privacy-toggle-copy"><strong>{title}</strong><small>{detail}</small></span>
+      <span className={`toggle-switch ${checked ? "on" : "off"}`} aria-hidden="true"><i /></span>
+      <input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} />
+    </label>
+  );
+}
 
 function normalizeUrl(raw) {
   try {
@@ -58,7 +92,7 @@ function formatDuration(seconds) {
   return `${minutes}:${String(secs).padStart(2, "0")}`;
 }
 
-function LazyThumbnail({ sources, sourceUrl, title }) {
+function LazyThumbnail({ sources, sourceUrl, title, allowRemoteImages = true }) {
   const holderRef = useRef(null);
   const candidates = useMemo(() => {
     const values = Array.isArray(sources) ? sources : sources ? [sources] : [];
@@ -70,7 +104,7 @@ function LazyThumbnail({ sources, sourceUrl, title }) {
   useEffect(() => {
     setCandidateIndex(0);
     setShouldLoad(false);
-    if (!candidates.length) return undefined;
+    if (!candidates.length || !allowRemoteImages) return undefined;
     if (typeof IntersectionObserver === "undefined") { setShouldLoad(true); return undefined; }
     const node = holderRef.current;
     if (!node) return undefined;
@@ -82,13 +116,13 @@ function LazyThumbnail({ sources, sourceUrl, title }) {
     }, { rootMargin: "700px 0px" });
     observer.observe(node);
     return () => observer.disconnect();
-  }, [candidates]);
+  }, [candidates, allowRemoteImages]);
 
   const current = candidates[candidateIndex] || null;
   const exhausted = candidates.length > 0 && candidateIndex >= candidates.length;
   return (
     <div className="thumbnail-shell" ref={holderRef}>
-      {current && shouldLoad && !exhausted ? (
+      {allowRemoteImages && current && shouldLoad && !exhausted ? (
         <img
           key={`${current}-${candidateIndex}`}
           src={imageProxyUrl(current, sourceUrl)}
@@ -101,7 +135,7 @@ function LazyThumbnail({ sources, sourceUrl, title }) {
         />
       ) : (
         <div className="thumbnail-placeholder">
-          <span>{!candidates.length || exhausted ? "Thumbnail unavailable" : shouldLoad ? "Trying alternate thumbnail…" : "Thumbnail queued…"}</span>
+          <span>{!allowRemoteImages ? "Remote thumbnails disabled" : !candidates.length || exhausted ? "Thumbnail unavailable" : shouldLoad ? "Trying alternate thumbnail…" : "Thumbnail queued…"}</span>
         </div>
       )}
       <div className="play-mark" aria-hidden="true">▶</div>
@@ -126,7 +160,7 @@ async function runPool(items, worker, concurrency = CLIENT_CONCURRENCY) {
   await Promise.all(workers);
 }
 
-function FinderResult({ job, candidate, alreadyInList, onAdd, onCompare }) {
+function FinderResult({ job, candidate, alreadyInList, onAdd, onCompare, privacy }) {
   const candidateDuration = formatDuration(candidate.durationSeconds);
   const sourceDuration = Number(job.source?.durationSeconds) || 0;
   const longerBy = sourceDuration && candidate.durationSeconds > sourceDuration
@@ -144,6 +178,7 @@ function FinderResult({ job, candidate, alreadyInList, onAdd, onCompare }) {
           sources={candidate.images?.length ? candidate.images : candidate.image ? [candidate.image] : []}
           sourceUrl={candidate.url}
           title={candidate.title}
+          allowRemoteImages={privacy.remoteThumbnails}
         />
       </div>
       <div className="alternate-result-body">
@@ -184,8 +219,8 @@ function FinderResult({ job, candidate, alreadyInList, onAdd, onCompare }) {
           <button type="button" onClick={() => onAdd(candidate)} disabled={candidate.added || alreadyInList}>
             {candidate.added || alreadyInList ? "Already in list" : "Add to list"}
           </button>
-          <button type="button" onClick={() => onCompare(candidate)} disabled={comparison?.state === "loading"} title="Best-effort low-resolution perceptual frame comparison. Does not download the complete video.">
-            {comparison?.state === "ready" ? "Compare again" : comparison?.state === "loading" ? "Comparing…" : "Compare samples"}
+          <button type="button" onClick={() => onCompare(candidate)} disabled={!privacy.sampleComparison || comparison?.state === "loading"} title={privacy.sampleComparison ? "Best-effort low-resolution perceptual frame comparison. Does not download the complete video." : "Disabled in Privacy & network activity."}>
+            {!privacy.sampleComparison ? "Comparison disabled" : comparison?.state === "ready" ? "Compare again" : comparison?.state === "loading" ? "Comparing…" : "Compare samples"}
           </button>
         </div>
       </div>
@@ -203,6 +238,19 @@ function App() {
   const [activeTab, setActiveTab] = useState("previews");
   const [finderJobs, setFinderJobs] = useState([]);
   const finderRunningRef = useRef(new Set());
+  const [privacy, setPrivacy] = useState(loadPrivacySettings);
+  const [privacyOpen, setPrivacyOpen] = useState(false);
+
+  useEffect(() => {
+    try { localStorage.setItem(PRIVACY_STORAGE_KEY, JSON.stringify(privacy)); } catch {}
+  }, [privacy]);
+
+  const enabledPrivacyCount = useMemo(() => Object.values(privacy).filter(Boolean).length, [privacy]);
+  const finderSearchEnabled = useMemo(() =>
+    (privacy.searchDuckDuckGo || privacy.searchBing || privacy.searchMojeek) &&
+    (privacy.searchTitleUploader || privacy.searchMediaIds || privacy.searchDescription || privacy.searchTranscript), [privacy]);
+  function setPrivacyOption(key, value) { setPrivacy((current) => ({ ...current, [key]: Boolean(value) })); }
+
 
   const stats = useMemo(() => {
     let queued = 0, loading = 0, ready = 0, failed = 0;
@@ -241,7 +289,7 @@ function App() {
     try {
       await runPool(items, async (item) => {
         patchPreview(item.id, { state: "loading", error: null });
-        const result = await fetchPreview(item.url, { allowBrowserFallback: false });
+        const result = await fetchPreview(item.url, { allowBrowserFallback: false, privacy });
         patchPreview(item.id, {
           ...result,
           state: result.clientOk ? "ready" : "failed",
@@ -249,10 +297,10 @@ function App() {
         });
         if (result.clientOk && result.needsBrowserFallback) browserFallbackItems.push(item);
       });
-      if (browserFallbackItems.length) {
+      if (privacy.browserFallback && browserFallbackItems.length) {
         await runPool(browserFallbackItems, async (item) => {
           patchPreview(item.id, { state: "loading", error: null, method: "edge-fallback-queued" });
-          const result = await fetchPreview(item.url, { allowBrowserFallback: true });
+          const result = await fetchPreview(item.url, { allowBrowserFallback: privacy.browserFallback, privacy });
           patchPreview(item.id, {
             ...result,
             state: result.clientOk ? "ready" : "failed",
@@ -265,7 +313,7 @@ function App() {
 
   async function processSinglePreview(item) {
     patchPreview(item.id, { state: "loading", error: null, method: "retrying" });
-    const result = await fetchPreview(item.url, { allowBrowserFallback: true });
+    const result = await fetchPreview(item.url, { allowBrowserFallback: privacy.browserFallback, privacy });
     patchPreview(item.id, {
       ...result,
       state: result.clientOk ? "ready" : "failed",
@@ -330,6 +378,7 @@ function App() {
   }
 
   function queueSelectedVersionSearches() {
+    if (!finderSearchEnabled) { setCopyStatus("Enable a search engine and at least one finder query signal in Privacy & network activity"); setTimeout(() => setCopyStatus(""), 3200); return; }
     const sources = previews.filter((item) => selected.has(item.id));
     if (!sources.length) return;
     const now = Date.now();
@@ -338,7 +387,7 @@ function App() {
     );
     const jobs = sources.filter((source) => !activeSourceUrls.has(source.url.toLowerCase())).map((source, index) => ({
       id: `finder-${now}-${index}-${Math.random().toString(36).slice(2, 7)}`,
-      source: { ...source }, state: "queued", results: [], error: null, queuedAt: Date.now(),
+      source: { ...source }, privacy: { ...privacy }, state: "queued", results: [], error: null, queuedAt: Date.now(),
       note: null, diagnostics: [], queryEvidence: [], candidateCount: 0, evaluatedCount: 0
     }));
     if (!jobs.length) { setCopyStatus("Selected videos are already queued/running"); setTimeout(() => setCopyStatus(""), 2200); return; }
@@ -349,7 +398,7 @@ function App() {
 
   async function executeFinderJob(job) {
     patchFinderJob(job.id, { state: "running", startedAt: Date.now(), error: null });
-    const result = await fetchAlternates(job.source);
+    const result = await fetchAlternates(job.source, { privacy: job.privacy || privacy });
     if (!result.clientOk) {
       patchFinderJob(job.id, { state: "failed", finishedAt: Date.now(), error: result.error || `Search failed (${result.clientStatus || "network"})`, clientMs: result.clientMs });
       return;
@@ -385,7 +434,7 @@ function App() {
   }, [finderJobs]);
 
   function retryFinderJob(job) {
-    patchFinderJob(job.id, { state: "queued", results: [], error: null, diagnostics: [], queryEvidence: [], cached: false });
+    patchFinderJob(job.id, { state: "queued", privacy: { ...privacy }, results: [], error: null, diagnostics: [], queryEvidence: [], cached: false });
   }
   function removeFinderJob(id) { setFinderJobs((current) => current.filter((job) => job.id !== id)); }
   function clearCompletedFinderJobs() { setFinderJobs((current) => current.filter((job) => ["queued", "running"].includes(job.state))); }
@@ -410,7 +459,8 @@ function App() {
 
   async function compareCandidate(job, candidate) {
     patchFinderCandidate(job.id, candidate.url, { comparison: { state: "loading" } });
-    const result = await compareVideoSamples(job.source.url, candidate.url);
+    if (!privacy.sampleComparison) return;
+    const result = await compareVideoSamples(job.source.url, candidate.url, { privacy });
     if (!result.clientOk || !result.ok) {
       patchFinderCandidate(job.id, candidate.url, { comparison: { state: "failed", error: result.error || "frame_compare_failed" } });
       return;
@@ -420,24 +470,31 @@ function App() {
 
   async function authorizeSite(preview) {
     patchPreview(preview.id, { authorizationState: "launching", authorizationMessage: null });
-    const result = await authorizePreviewHost(preview.url);
+    if (!privacy.interactiveAuthorization || !privacy.browserFallback) {
+      patchPreview(preview.id, { authorizationState: "disabled", authorizationMessage: "Enable Edge fallback and interactive authorization in Privacy & network activity." });
+      return;
+    }
+    const result = await authorizePreviewHost(preview.url, { privacy });
     if (!result.clientOk) {
       patchPreview(preview.id, { authorizationState: "failed", authorizationMessage: result.error || "Unable to open authorization browser" });
       return;
     }
     patchPreview(preview.id, {
       authorizationState: "authorizing",
-      authorizationMessage: "Complete the site challenge in the Edge window, close that window, then click Retry preview."
+      authorizationMessage: "If the real video page is visible in Edge, click Retry preview now. If a challenge appears, complete it first. You may leave the Edge window open while Retry reads that exact session."
     });
   }
 
   async function retryAuthorizedPreview(preview) {
     const status = await authorizationStatus(preview.url);
-    if (status.clientOk && status.status === "authorizing") {
-      patchPreview(preview.id, { authorizationState: "authorizing", authorizationMessage: "The authorization Edge window is still open. Complete the challenge and close it first." });
-      return;
+    if (status.clientOk && status.live) {
+      patchPreview(preview.id, {
+        authorizationState: "authorizing",
+        authorizationMessage: "Reading the currently open Sandbox Edge session…"
+      });
+    } else if (status.clientOk && status.ready) {
+      patchPreview(preview.id, { authorizationState: "ready", authorizationMessage: "Authorized Sandbox browser profile ready." });
     }
-    patchPreview(preview.id, { authorizationState: status.ready ? "ready" : preview.authorizationState, authorizationMessage: status.ready ? "Authorized Sandbox browser profile ready." : preview.authorizationMessage });
     await processSinglePreview(preview);
   }
 
@@ -468,6 +525,44 @@ function App() {
           <div className="import-summary">
             <strong>{importSummary.added}</strong> added <span>·</span> <strong>{importSummary.duplicates}</strong> duplicates skipped
             {importSummary.invalid > 0 && <><span>·</span> <strong>{importSummary.invalid}</strong> invalid entries ignored</>}
+          </div>
+        )}
+      </section>
+
+      <section className={`privacy-panel ${privacyOpen ? "open" : ""}`}>
+        <button type="button" className="privacy-panel-summary" onClick={() => setPrivacyOpen((value) => !value)} aria-expanded={privacyOpen}>
+          <span><strong>Privacy & network activity</strong><small>{enabledPrivacyCount}/{Object.keys(FULL_PRIVACY).length} optional outbound features enabled · basic preview-page requests always occur when you create previews</small></span>
+          <span className="privacy-summary-actions"><b>{privacyOpen ? "Hide" : "Configure"}</b><i>{privacyOpen ? "▴" : "▾"}</i></span>
+        </button>
+        {privacyOpen && (
+          <div className="privacy-panel-body">
+            <div className="privacy-presets">
+              <div><strong>Sandbox-session controls</strong><p>These settings are stored only in this disposable Sandbox browser profile. They do not change the host or the .wsb file.</p></div>
+              <div className="privacy-preset-buttons"><button type="button" onClick={() => setPrivacy({ ...FULL_PRIVACY })}>Full functionality</button><button type="button" onClick={() => setPrivacy({ ...MINIMUM_PRIVACY })}>Minimum exposure</button></div>
+            </div>
+            <div className="privacy-groups">
+              <div className="privacy-group"><h3>Preview browsing</h3>
+                <PrivacyToggle checked={privacy.remoteThumbnails} onChange={(v) => setPrivacyOption("remoteThumbnails", v)} title="Load remote thumbnails" detail="Downloads discovered poster/thumbnail images through the localhost safety proxy." />
+                <PrivacyToggle checked={privacy.browserFallback} onChange={(v) => setPrivacyOption("browserFallback", v)} title="Edge browser fallback" detail="Lets Sandbox Edge load difficult video pages when lightweight metadata is insufficient." />
+                <PrivacyToggle checked={privacy.interactiveAuthorization} onChange={(v) => setPrivacyOption("interactiveAuthorization", v)} title="Interactive site authorization" detail="Allows a visible Sandbox Edge window so you can manually pass a site's challenge page." />
+              </div>
+              <div className="privacy-group"><h3>Version Finder — destinations</h3>
+                <PrivacyToggle checked={privacy.mediaTools} onChange={(v) => setPrivacyOption("mediaTools", v)} title="Media-tool probing" detail="Allows yt-dlp/Deno to inspect selected and candidate public video pages/CDNs inside Sandbox." />
+                <PrivacyToggle checked={privacy.searchDuckDuckGo} onChange={(v) => setPrivacyOption("searchDuckDuckGo", v)} title="DuckDuckGo search" detail="Sends enabled finder queries to DuckDuckGo's public search endpoint." />
+                <PrivacyToggle checked={privacy.searchBing} onChange={(v) => setPrivacyOption("searchBing", v)} title="Bing search" detail="Sends enabled finder queries to Bing's public search endpoint." />
+                <PrivacyToggle checked={privacy.searchMojeek} onChange={(v) => setPrivacyOption("searchMojeek", v)} title="Mojeek search" detail="Sends enabled finder queries to Mojeek's public search endpoint." />
+              </div>
+              <div className="privacy-group"><h3>Version Finder — query contents</h3>
+                <PrivacyToggle checked={privacy.searchTitleUploader} onChange={(v) => setPrivacyOption("searchTitleUploader", v)} title="Title & uploader" detail="May send the video's title and uploader/channel name to enabled search engines." />
+                <PrivacyToggle checked={privacy.searchMediaIds} onChange={(v) => setPrivacyOption("searchMediaIds", v)} title="Media IDs & filenames" detail="May send discovered asset IDs, filename stems, or URL-path identifiers to enabled search engines." />
+                <PrivacyToggle checked={privacy.searchDescription} onChange={(v) => setPrivacyOption("searchDescription", v)} title="Description phrases" detail="May send a distinctive phrase extracted from the video's description." />
+                <PrivacyToggle checked={privacy.searchTranscript} onChange={(v) => setPrivacyOption("searchTranscript", v)} title="Transcript/subtitle phrases" detail="May download public subtitles and send one distinctive phrase to enabled search engines." />
+              </div>
+              <div className="privacy-group"><h3>Verification</h3>
+                <PrivacyToggle checked={privacy.sampleComparison} onChange={(v) => setPrivacyOption("sampleComparison", v)} title="Perceptual sample comparison" detail="Allows FFmpeg to download small remote video samples for local frame comparison." />
+              </div>
+            </div>
+            <div className="privacy-footnote"><strong>Always local:</strong> selection state, queues, ranking, perceptual hashes, temporary browser profiles, and caches remain inside Windows Sandbox. <strong>Always required for basic previews:</strong> creating a preview contacts the pasted public video URL itself.</div>
           </div>
         )}
       </section>
@@ -503,7 +598,7 @@ function App() {
                   <button type="button" onClick={clearSelection}>Deselect</button>
                   <button type="button" onClick={invertSelection}>Invert</button>
                   <button type="button" onClick={copySelected} disabled={!selected.size}>Copy selected URLs</button>
-                  <button type="button" onClick={queueSelectedVersionSearches} disabled={!selected.size} title="Queue selected videos for independent background version searches">Queue version search{selected.size > 1 ? ` (${selected.size})` : ""}</button>
+                  <button type="button" onClick={queueSelectedVersionSearches} disabled={!selected.size || !finderSearchEnabled} title={finderSearchEnabled ? "Queue selected videos for independent background version searches" : "Enable a search engine and finder query signal in Privacy & network activity"}>Queue version search{selected.size > 1 ? ` (${selected.size})` : ""}</button>
                   <button type="button" onClick={removeSelected} disabled={!selected.size || processing}>Remove selected</button>
                   {stats.failed > 0 && <button type="button" onClick={retryFailed} disabled={processing}>Retry failed</button>}
                   <button type="button" onClick={clearAll} disabled={processing}>Clear all</button>
@@ -520,7 +615,7 @@ function App() {
                       {preview.state === "queued" || preview.state === "loading" ? (
                         <div className="thumbnail-shell"><div className="thumbnail-placeholder pulse"><span>{preview.state === "queued" ? "Queued…" : "Finding video thumbnail…"}</span></div></div>
                       ) : (
-                        <LazyThumbnail sources={preview.images?.length ? preview.images : preview.image ? [preview.image] : []} sourceUrl={preview.url} title={preview.title} />
+                        <LazyThumbnail sources={preview.images?.length ? preview.images : preview.image ? [preview.image] : []} sourceUrl={preview.url} title={preview.title} allowRemoteImages={privacy.remoteThumbnails} />
                       )}
                       <div className="preview-content">
                         <div className="meta-row">
@@ -533,12 +628,12 @@ function App() {
                         {preview.description && <p>{preview.description}</p>}
                         {preview.challengeDetected && preview.state !== "failed" && (
                           <div className="challenge-box">
-                            <p className="warning-message">Challenge/interstitial page detected. You can authorize this host interactively inside the Sandbox.</p>
+                            <p className="warning-message">The lightweight preview was blocked or challenged. Open the site in a normal Sandbox Edge session; if the real video page appears, Retry can read that same live session.</p>
                             <div className="challenge-actions">
-                              <button type="button" onClick={() => authorizeSite(preview)} disabled={preview.authorizationState === "launching" || preview.authorizationState === "authorizing"}>
-                                {preview.authorizationState === "authorizing" ? "Authorization window open" : "Authorize site"}
+                              <button type="button" onClick={() => authorizeSite(preview)} disabled={!privacy.browserFallback || !privacy.interactiveAuthorization || preview.authorizationState === "launching" || preview.authorizationState === "authorizing"}>
+                                {preview.authorizationState === "authorizing" ? "Site session open" : "Open site session"}
                               </button>
-                              <button type="button" onClick={() => retryAuthorizedPreview(preview)}>Retry preview</button>
+                              <button type="button" onClick={() => retryAuthorizedPreview(preview)} disabled={!privacy.browserFallback}>Retry preview</button>
                             </div>
                             {preview.authorizationMessage && <small>{preview.authorizationMessage}</small>}
                           </div>
@@ -562,7 +657,7 @@ function App() {
                               <div><dt>HTTP extractor</dt><dd>{preview.extractorStats ? `meta ${preview.extractorStats.meta || 0} · json ${preview.extractorStats.json || 0} · script ${preview.extractorStats.script || 0} · poster ${preview.extractorStats.poster || 0} · dom ${preview.extractorStats.dom || 0}` : "—"}</dd></div>
                               <div><dt>Edge extractor</dt><dd>{preview.browserExtractorStats ? `meta ${preview.browserExtractorStats.meta || 0} · json ${preview.browserExtractorStats.json || 0} · script ${preview.browserExtractorStats.script || 0} · poster ${preview.browserExtractorStats.poster || 0} · dom ${preview.browserExtractorStats.dom || 0}` : "—"}</dd></div>
                               <div><dt>Browser fallback</dt><dd>{preview.browserFallback ? "used" : preview.browserFallbackAttempted ? "attempted" : "no"}</dd></div>
-                              <div><dt>Authorized profile</dt><dd>{preview.authorizedBrowserProfile ? "used" : preview.authorizationState || "no"}</dd></div>
+                              <div><dt>Authorized session</dt><dd>{preview.authorizedBrowserSession ? "live Edge" : preview.authorizedBrowserProfile ? "saved profile" : preview.authorizationState || "no"}</dd></div>
                               <div><dt>Fallback error</dt><dd>{preview.browserFallbackError || "none"}</dd></div>
                               <div><dt>Challenge</dt><dd>{preview.challengeDetected ? (preview.challengeProvider || "detected") : "none"}</dd></div>
                               <div><dt>Fallback skipped</dt><dd>{preview.browserFallbackSkippedReason || "none"}</dd></div>
@@ -644,6 +739,7 @@ function App() {
                               alreadyInList={previews.some((item) => item.url.toLowerCase() === candidate.url.toLowerCase())}
                               onAdd={(value) => addAlternate(job.id, value)}
                               onCompare={(value) => compareCandidate(job, value)}
+                              privacy={privacy}
                             />
                           ))}
                         </div>
@@ -654,6 +750,7 @@ function App() {
                       <details className="alternate-diagnostics">
                         <summary>Discovery diagnostics</summary>
                         <p>{job.note}</p>
+                        {job.privacy && <div className="alternate-diagnostic-row"><strong>Privacy snapshot</strong><span>{[job.privacy.searchDuckDuckGo && "DDG", job.privacy.searchBing && "Bing", job.privacy.searchMojeek && "Mojeek"].filter(Boolean).join("+") || "no search engines"}</span><span>{job.privacy.mediaTools ? "media tools on" : "media tools off"}</span><code>{[job.privacy.searchTranscript && "transcript", job.privacy.searchDescription && "description", job.privacy.searchMediaIds && "media IDs", job.privacy.searchTitleUploader && "title/uploader"].filter(Boolean).join(" · ") || "no query signals"}</code></div>}
                         {job.tools && (
                           <div className="alternate-diagnostic-row discovery-tool-row">
                             <strong>Media tools</strong><span>{job.tools.installed ? "installed" : "not found"}</span>

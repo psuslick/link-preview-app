@@ -1,12 +1,12 @@
 const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:3000/api";
 
-export async function fetchPreview(url, { signal, allowBrowserFallback = true } = {}) {
+export async function fetchPreview(url, { signal, allowBrowserFallback = true, privacy } = {}) {
   const started = performance.now();
   try {
     const response = await fetch(`${API_BASE}/preview`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url, allowBrowserFallback }),
+      body: JSON.stringify({ url, allowBrowserFallback, privacy: privacy || null }),
       signal
     });
 
@@ -39,7 +39,7 @@ export async function fetchPreview(url, { signal, allowBrowserFallback = true } 
   }
 }
 
-export async function fetchAlternates(source, { signal } = {}) {
+export async function fetchAlternates(source, { signal, privacy } = {}) {
   const started = performance.now();
   try {
     const response = await fetch(`${API_BASE}/alternates`, {
@@ -50,7 +50,8 @@ export async function fetchAlternates(source, { signal } = {}) {
         title: source.title || null,
         description: source.description || null,
         provider: source.provider || null,
-        durationSeconds: source.durationSeconds || null
+        durationSeconds: source.durationSeconds || null,
+        privacy: privacy || null
       }),
       signal
     });
@@ -87,13 +88,13 @@ export function imageProxyUrl(url, sourceUrl) {
   return `${API_BASE}/image?${params.toString()}`;
 }
 
-export async function compareVideoSamples(sourceUrl, candidateUrl, { signal } = {}) {
+export async function compareVideoSamples(sourceUrl, candidateUrl, { signal, privacy } = {}) {
   const started = performance.now();
   try {
     const response = await fetch(`${API_BASE}/compare-video`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sourceUrl, candidateUrl }),
+      body: JSON.stringify({ sourceUrl, candidateUrl, privacy: privacy || null }),
       signal
     });
     let data;
@@ -116,11 +117,11 @@ export async function compareVideoSamples(sourceUrl, candidateUrl, { signal } = 
   }
 }
 
-export async function authorizePreviewHost(url) {
+export async function authorizePreviewHost(url, { privacy } = {}) {
   const response = await fetch(`${API_BASE}/authorize-host`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ url })
+    body: JSON.stringify({ url, privacy: privacy || null })
   });
   let data;
   try { data = await response.json(); } catch { data = { error: "invalid_json_response" }; }
