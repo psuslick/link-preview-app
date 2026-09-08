@@ -269,9 +269,6 @@ function App() {
   const [activeTab, setActiveTab] = useState("previews");
   const [finderJobs, setFinderJobs] = useState([]);
   const finderRunningRef = useRef(new Set());
-  const autoSiteRecoveryQueueRef = useRef([]);
-  const autoSiteRecoveryHostsRef = useRef(new Set());
-  const autoSiteRecoveryRunningRef = useRef(false);
   const [privacy, setPrivacy] = useState(loadPrivacySettings);
   const [privacyOpen, setPrivacyOpen] = useState(false);
 
@@ -311,6 +308,17 @@ function App() {
     return { queued, loading, ready, failed, total: visiblePreviews.length };
   }, [visiblePreviews]);
 
+  const unresolvedBySite = useMemo(() => {
+    const counts = new Map();
+    for (const item of previews) {
+      if (!needsAuthorizedSiteRetry(item)) continue;
+      const site = siteKeyFor(item.url);
+      if (!site) continue;
+      counts.set(site, (counts.get(site) || 0) + 1);
+    }
+    return counts;
+  }, [previews]);
+
   const finderStats = useMemo(() => {
     const summary = { queued: 0, running: 0, ready: 0, failed: 0, total: finderJobs.length };
     for (const job of finderJobs) if (Object.prototype.hasOwnProperty.call(summary, job.state)) summary[job.state] += 1;
@@ -335,7 +343,7 @@ function App() {
     if (!items.length) return;
     setProcessing(true);
     const browserFallbackItems = [];
-    const autoSessionItems = [];
+    const siteSessionItems = [];
     try {
       await runPool(items, async (item) => {
         patchPreview(item.id, { state: "loading", error: null });
@@ -346,7 +354,7 @@ function App() {
           error: result.clientOk ? result.error || null : result.error || `HTTP ${result.clientStatus}`
         });
         if (result.clientOk && result.needsBrowserFallback) browserFallbackItems.push(item);
-        else if (result.clientOk && needsAuthorizedSiteRetry(result)) autoSessionItems.push({ ...item, ...result });
+        else if (result.clientOk && needsAuthorizedSiteRetry(result)) siteSessionItems.push({ ...item, ...result });
       });
 
       if (privacy.browserFallback && browserFallbackItems.length) {
@@ -371,10 +379,16 @@ function App() {
             error: result.clientOk ? result.error || null : result.error || `HTTP ${result.clientStatus}`
           });
           if (result.clientOk && needsAuthorizedSiteRetry(result)) {
-            // Include all same-host siblings, even though we intentionally skipped their
-            // unattended Edge attempt. Automatic site recovery will navigate the exact
-            // URLs one at a time using the shared authorized site session.
-            queueAutomaticSiteRecovery(hostItems.map((item, index) => index === 0 ? { ...item, ...result } : item));
+            // Do not cascade into automatic interactive retries. Mark same-host siblings
+            // as site-session candidates and leave them idle until the user explicitly
+            // opens/reuses the shared Sandbox site session.
+            for (const sibling of hostItems.slice(1)) {
+              patchPreview(sibling.id, {
+                siteSessionRecommended: true,
+                authorizationState: "needs-attention",
+                authorizationMessage: `A reusable site session may be needed for ${host}. Automatic browser retries were skipped to protect Sandbox stability.`
+              });
+            }
           } else {
             remainingFallbackItems.push(...hostItems.slice(1));
           }
@@ -389,13 +403,19 @@ function App() {
               state: result.clientOk ? "ready" : "failed",
               error: result.clientOk ? result.error || null : result.error || `HTTP ${result.clientStatus}`
             });
-            if (result.clientOk && needsAuthorizedSiteRetry(result)) autoSessionItems.push({ ...item, ...result });
+            if (result.clientOk && needsAuthorizedSiteRetry(result)) siteSessionItems.push({ ...item, ...result });
           }, BROWSER_FALLBACK_CONCURRENCY);
         }
       }
     } finally {
       setProcessing(false);
-      if (autoSessionItems.length) queueAutomaticSiteRecovery(autoSessionItems);
+      for (const item of siteSessionItems) {
+        patchPreview(item.id, {
+          siteSessionRecommended: true,
+          authorizationState: "needs-attention",
+          authorizationMessage: `This preview may need a reusable site session for ${siteKeyFor(item.url)}. Open it manually when convenient; no automatic retry will run.`
+        });
+      }
     }
   }
 
@@ -408,53 +428,6 @@ function App() {
       error: result.clientOk ? result.error || null : result.error || `HTTP ${result.clientStatus}`
     });
     return result;
-  }
-
-  function queueAutomaticSiteRecovery(items) {
-    if (!privacy.browserFallback || !privacy.interactiveAuthorization) return;
-    const byHost = new Map();
-    for (const item of items) {
-      const host = siteKeyFor(item.url);
-      if (!host || autoSiteRecoveryHostsRef.current.has(host)) continue;
-      if (!byHost.has(host)) byHost.set(host, []);
-      byHost.get(host).push(item);
-    }
-    for (const [host, hostItems] of byHost) {
-      autoSiteRecoveryHostsRef.current.add(host);
-      autoSiteRecoveryQueueRef.current.push({ host, items: hostItems });
-    }
-    void drainAutomaticSiteRecovery();
-  }
-
-  async function drainAutomaticSiteRecovery() {
-    if (autoSiteRecoveryRunningRef.current) return;
-    autoSiteRecoveryRunningRef.current = true;
-    try {
-      while (autoSiteRecoveryQueueRef.current.length) {
-        const task = autoSiteRecoveryQueueRef.current.shift();
-        const first = task.items[0];
-        if (!first) continue;
-        patchPreview(first.id, { authorizationState: "launching", authorizationMessage: `Automatically opening one reusable site session for ${task.host}…` });
-        const launch = await authorizePreviewHost(first.url, { privacy });
-        if (!launch.clientOk) {
-          patchPreview(first.id, { authorizationState: "failed", authorizationMessage: launch.error || "Automatic site session failed to open." });
-          continue;
-        }
-        let success = false;
-        for (let attempt = 0; attempt < 8; attempt += 1) {
-          await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 2200 : 1600));
-          const result = await processSinglePreview(first, { authorizationState: "auto-retry", authorizationMessage: `Automatically reusing ${task.host} site session…` });
-          if (result?.clientOk && result.image) { success = true; break; }
-        }
-        if (success) {
-          const siblings = task.items.slice(1);
-          for (const sibling of siblings) await processSinglePreview(sibling, { authorizationState: "site-retry", authorizationMessage: `Automatically reusing ${task.host} site session…` });
-          patchPreview(first.id, { authorizationState: "site-ready", authorizationMessage: `Site session active for ${task.host}; unresolved links from this host were retried automatically.` });
-        } else {
-          patchPreview(first.id, { authorizationState: "needs-attention", authorizationMessage: `Automatic refresh/ordinary consent did not finish this site. If the visible window shows CAPTCHA, age confirmation, login, or another access-control prompt, complete it once and press Retry.` });
-        }
-      }
-    } finally { autoSiteRecoveryRunningRef.current = false; }
   }
 
   async function handleSubmit(event) {
@@ -655,7 +628,7 @@ function App() {
     }
     patchPreview(preview.id, {
       authorizationState: "authorizing",
-      authorizationMessage: `Reusable site session opened for ${siteKeyFor(preview.url)}. The app will try one automatic refresh and recognized cookie/privacy consent buttons. CAPTCHA/challenge, age confirmation, login, or other access-control prompts remain manual. Once the real video is visible, click Retry once; the session is reused for the site.`
+      authorizationMessage: `Reusable site session opened for ${siteKeyFor(preview.url)}. The site-session helper may refresh once and handle recognized cookie/privacy consent buttons. CAPTCHA/challenge, age confirmation, login, or other access-control prompts remain manual. Once the real video is visible, click Retry. Nothing else on this site will retry automatically.`
     });
   }
 
@@ -675,29 +648,54 @@ function App() {
 
     const siteKey = siteKeyFor(preview.url);
     if (!siteKey) return;
-    const siblings = previews.filter((item) =>
+    const siblingCount = previews.filter((item) =>
       item.id !== preview.id &&
       siteKeyFor(item.url) === siteKey &&
       needsAuthorizedSiteRetry(item)
-    );
-    if (!siblings.length) {
+    ).length;
+    patchPreview(preview.id, {
+      authorizationState: "site-ready",
+      authorizationMessage: siblingCount
+        ? `Site session active for ${siteKey}. ${siblingCount} other unresolved preview${siblingCount === 1 ? "" : "s"} can reuse it. They will not retry automatically.`
+        : `Site session active for ${siteKey}. Other previews from this site can reuse it.`
+    });
+  }
+
+  async function retrySiteBatch(preview, limit = 3) {
+    const siteKey = siteKeyFor(preview.url);
+    if (!siteKey) return;
+    const status = await authorizationStatus(preview.url);
+    if (!status.clientOk || (!status.live && !status.ready)) {
       patchPreview(preview.id, {
-        authorizationState: "site-ready",
-        authorizationMessage: `Site session active for ${siteKey}. Other previews from this site can reuse it.`
+        authorizationState: "needs-attention",
+        authorizationMessage: `Open the reusable ${siteKey} site session first, then retry this preview successfully before running a site batch.`
       });
       return;
     }
-
+    const targets = previews.filter((item) =>
+      item.id !== preview.id &&
+      siteKeyFor(item.url) === siteKey &&
+      needsAuthorizedSiteRetry(item)
+    ).slice(0, limit);
+    if (!targets.length) {
+      patchPreview(preview.id, { authorizationMessage: `No unresolved previews remain for ${siteKey}.` });
+      return;
+    }
+    patchPreview(preview.id, {
+      authorizationState: "site-batch",
+      authorizationMessage: `Retrying ${targets.length} ${siteKey} preview${targets.length === 1 ? "" : "s"} sequentially. No additional automatic batch will start.`
+    });
+    for (const target of targets) {
+      await processSinglePreview(target, {
+        authorizationState: "site-retry",
+        authorizationMessage: `Reusing ${siteKey} site session in an explicit bounded batch…`
+      });
+      await new Promise((resolve) => setTimeout(resolve, 350));
+    }
     patchPreview(preview.id, {
       authorizationState: "site-ready",
-      authorizationMessage: `Site session active for ${siteKey}. Automatically retrying ${siblings.length} other preview${siblings.length === 1 ? "" : "s"} from this site.`
+      authorizationMessage: `Finished explicit batch of ${targets.length} for ${siteKey}. If unresolved previews remain, run another batch only when you want to.`
     });
-    for (const sibling of siblings) {
-      await processSinglePreview(sibling, {
-        authorizationState: "site-retry",
-        authorizationMessage: `Reusing authorized ${siteKey} session automatically…`
-      });
-    }
   }
 
   function handleCardClick(event, id) {
@@ -746,7 +744,7 @@ function App() {
               <div className="privacy-group"><h3>Preview browsing</h3>
                 <PrivacyToggle checked={privacy.remoteThumbnails} onChange={(v) => setPrivacyOption("remoteThumbnails", v)} title="Load remote thumbnails" detail="Downloads discovered poster/thumbnail images through the localhost safety proxy." />
                 <PrivacyToggle checked={privacy.browserFallback} onChange={(v) => setPrivacyOption("browserFallback", v)} title="Edge browser fallback" detail="Lets Sandbox Edge load difficult video pages when lightweight metadata is insufficient." />
-                <PrivacyToggle checked={privacy.interactiveAuthorization} onChange={(v) => setPrivacyOption("interactiveAuthorization", v)} title="Automatic site session recovery" detail="Automatically opens one reusable Sandbox Edge session after a no-thumbnail browser failure, refreshes once, and clicks recognized cookie/privacy consent. CAPTCHA, age, login, and other access-control prompts remain manual." />
+                <PrivacyToggle checked={privacy.interactiveAuthorization} onChange={(v) => setPrivacyOption("interactiveAuthorization", v)} title="Interactive site sessions" detail="Allows you to open one reusable Sandbox Edge session for difficult sites. Sessions never open or retry previews automatically; explicit site batches are capped at 3." />
               </div>
               <div className="privacy-group"><h3>Version Finder — destinations</h3>
                 <PrivacyToggle checked={privacy.mediaTools} onChange={(v) => setPrivacyOption("mediaTools", v)} title="Media-tool probing" detail="Allows yt-dlp/Deno to inspect selected and candidate public video pages/CDNs inside Sandbox." />
@@ -815,6 +813,8 @@ function App() {
                   const isSelected = selected.has(preview.id);
                   const duration = formatDuration(preview.durationSeconds);
                   const siteSessionEligible = needsAuthorizedSiteRetry(preview);
+                  const previewSiteKey = siteKeyFor(preview.url);
+                  const siteUnresolvedCount = previewSiteKey ? (unresolvedBySite.get(previewSiteKey) || 0) : 0;
                   return (
                     <article key={preview.id} className={`preview-card ${isSelected ? "selected" : ""} ${preview.state}`} onClick={(event) => handleCardClick(event, preview.id)}>
                       <div className="card-selector"><input type="checkbox" checked={isSelected} onChange={() => toggleSelected(preview.id)} aria-label={`Select ${preview.title || preview.url}`} /></div>
@@ -839,13 +839,22 @@ function App() {
                               {preview.challengeDetected
                                 ? "The lightweight preview was blocked or challenged. Open one reusable Sandbox site session."
                                 : "No thumbnail was exposed to the unattended preview. This site may require an Accept/consent/age/cookie prompt in a normal browser. Open one reusable Sandbox site session."}
-                              {" "}After one successful Retry, other unresolved previews from this same site are retried automatically.
+                              {" "}After one successful Retry, other unresolved previews from this same site can reuse the session, but they will not retry automatically.
                             </p>
                             <div className="challenge-actions">
                               <button type="button" onClick={() => authorizeSite(preview)} disabled={!privacy.browserFallback || !privacy.interactiveAuthorization || preview.authorizationState === "launching" || preview.authorizationState === "authorizing"}>
                                 {preview.authorizationState === "authorizing" ? "Site session open" : "Open site session"}
                               </button>
                               <button type="button" onClick={() => retryAuthorizedPreview(preview)} disabled={!privacy.browserFallback}>Retry preview</button>
+                            </div>
+                            {preview.authorizationMessage && <small>{preview.authorizationMessage}</small>}
+                          </div>
+                        )}
+                        {preview.authorizationState === "site-ready" && siteUnresolvedCount > 0 && (
+                          <div className="challenge-box">
+                            <p className="warning-message">Reusable site session active for {previewSiteKey}. {siteUnresolvedCount} unresolved preview{siteUnresolvedCount === 1 ? "" : "s"} can reuse it. Nothing runs automatically.</p>
+                            <div className="challenge-actions">
+                              <button type="button" onClick={() => retrySiteBatch(preview, 3)} disabled={!privacy.browserFallback}>Retry next {Math.min(3, siteUnresolvedCount)} from site</button>
                             </div>
                             {preview.authorizationMessage && <small>{preview.authorizationMessage}</small>}
                           </div>
