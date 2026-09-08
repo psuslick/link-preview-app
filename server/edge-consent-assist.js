@@ -1,6 +1,6 @@
 const debugPort = Number(process.argv[2] || 0);
 const targetUrl = process.argv[3] || "";
-const RUN_MS = 18000;
+const RUN_MS = 30000;
 
 function normalizeText(value) {
   return String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
@@ -125,10 +125,14 @@ async function assist() {
         await new Promise(r => setTimeout(r, 900));
         continue;
       }
-      if (value.blurred && !reloaded) {
+      // Many video hosts initially render a blurred/interstitial shell and only expose
+      // the actual consent UI after a refresh. Do one normal refresh per reusable site
+      // session even if the blur is applied to an inner app container that our CSS test
+      // cannot reliably identify. Never do this after a detected challenge/age/auth gate.
+      if (!reloaded) {
         reloaded = true;
         await cdp.send('Page.reload', { ignoreCache: false }, sessionId, 2500).catch(() => {});
-        await new Promise(r => setTimeout(r, 1200));
+        await new Promise(r => setTimeout(r, 1400));
         continue;
       }
       await new Promise(r => setTimeout(r, 650));

@@ -22,6 +22,8 @@ const FULL_PRIVACY = Object.freeze({
   searchDuckDuckGo: true,
   searchBing: true,
   searchMojeek: true,
+  searchBrave: true,
+  archiveLookups: true,
   searchTitleUploader: true,
   searchMediaIds: true,
   searchDescription: true,
@@ -267,6 +269,9 @@ function App() {
   const [activeTab, setActiveTab] = useState("previews");
   const [finderJobs, setFinderJobs] = useState([]);
   const finderRunningRef = useRef(new Set());
+  const autoSiteRecoveryQueueRef = useRef([]);
+  const autoSiteRecoveryHostsRef = useRef(new Set());
+  const autoSiteRecoveryRunningRef = useRef(false);
   const [privacy, setPrivacy] = useState(loadPrivacySettings);
   const [privacyOpen, setPrivacyOpen] = useState(false);
 
@@ -276,7 +281,7 @@ function App() {
 
   const enabledPrivacyCount = useMemo(() => Object.values(privacy).filter(Boolean).length, [privacy]);
   const finderSearchEnabled = useMemo(() =>
-    (privacy.searchDuckDuckGo || privacy.searchBing || privacy.searchMojeek) &&
+    (privacy.searchDuckDuckGo || privacy.searchBing || privacy.searchMojeek || privacy.searchBrave || privacy.archiveLookups) &&
     (privacy.searchTitleUploader || privacy.searchMediaIds || privacy.searchDescription || privacy.searchTranscript), [privacy]);
   function setPrivacyOption(key, value) { setPrivacy((current) => ({ ...current, [key]: Boolean(value) })); }
 
@@ -291,6 +296,20 @@ function App() {
     }
     return { queued, loading, ready, failed, total: previews.length };
   }, [previews]);
+
+  const livePreviews = useMemo(() => previews.filter((item) => !item.deadLink), [previews]);
+  const deadPreviews = useMemo(() => previews.filter((item) => item.deadLink), [previews]);
+  const visiblePreviews = activeTab === "dead" ? deadPreviews : livePreviews;
+  const visibleStats = useMemo(() => {
+    let queued = 0, loading = 0, ready = 0, failed = 0;
+    for (const item of visiblePreviews) {
+      if (item.state === "queued") queued += 1;
+      else if (item.state === "loading") loading += 1;
+      else if (item.state === "failed") failed += 1;
+      else if (item.state === "ready") ready += 1;
+    }
+    return { queued, loading, ready, failed, total: visiblePreviews.length };
+  }, [visiblePreviews]);
 
   const finderStats = useMemo(() => {
     const summary = { queued: 0, running: 0, ready: 0, failed: 0, total: finderJobs.length };
@@ -316,6 +335,7 @@ function App() {
     if (!items.length) return;
     setProcessing(true);
     const browserFallbackItems = [];
+    const autoSessionItems = [];
     try {
       await runPool(items, async (item) => {
         patchPreview(item.id, { state: "loading", error: null });
@@ -326,19 +346,57 @@ function App() {
           error: result.clientOk ? result.error || null : result.error || `HTTP ${result.clientStatus}`
         });
         if (result.clientOk && result.needsBrowserFallback) browserFallbackItems.push(item);
+        else if (result.clientOk && needsAuthorizedSiteRetry(result)) autoSessionItems.push({ ...item, ...result });
       });
+
       if (privacy.browserFallback && browserFallbackItems.length) {
-        await runPool(browserFallbackItems, async (item) => {
-          patchPreview(item.id, { state: "loading", error: null, method: "edge-fallback-queued" });
-          const result = await fetchPreview(item.url, { allowBrowserFallback: privacy.browserFallback, privacy });
-          patchPreview(item.id, {
+        // Probe only one URL per host with unattended Edge first. If that representative
+        // shows the site needs an interactive session, open/recover that site once and
+        // send all sibling URLs through the reusable authorized profile instead of
+        // timing out Edge separately for every video on the same domain.
+        const fallbackGroups = new Map();
+        for (const item of browserFallbackItems) {
+          const host = siteKeyFor(item.url) || item.url;
+          if (!fallbackGroups.has(host)) fallbackGroups.set(host, []);
+          fallbackGroups.get(host).push(item);
+        }
+        const remainingFallbackItems = [];
+        for (const [host, hostItems] of fallbackGroups) {
+          const first = hostItems[0];
+          patchPreview(first.id, { state: "loading", error: null, method: "edge-fallback-queued" });
+          const result = await fetchPreview(first.url, { allowBrowserFallback: true, privacy });
+          patchPreview(first.id, {
             ...result,
             state: result.clientOk ? "ready" : "failed",
             error: result.clientOk ? result.error || null : result.error || `HTTP ${result.clientStatus}`
           });
-        }, BROWSER_FALLBACK_CONCURRENCY);
+          if (result.clientOk && needsAuthorizedSiteRetry(result)) {
+            // Include all same-host siblings, even though we intentionally skipped their
+            // unattended Edge attempt. Automatic site recovery will navigate the exact
+            // URLs one at a time using the shared authorized site session.
+            queueAutomaticSiteRecovery(hostItems.map((item, index) => index === 0 ? { ...item, ...result } : item));
+          } else {
+            remainingFallbackItems.push(...hostItems.slice(1));
+          }
+        }
+
+        if (remainingFallbackItems.length) {
+          await runPool(remainingFallbackItems, async (item) => {
+            patchPreview(item.id, { state: "loading", error: null, method: "edge-fallback-queued" });
+            const result = await fetchPreview(item.url, { allowBrowserFallback: true, privacy });
+            patchPreview(item.id, {
+              ...result,
+              state: result.clientOk ? "ready" : "failed",
+              error: result.clientOk ? result.error || null : result.error || `HTTP ${result.clientStatus}`
+            });
+            if (result.clientOk && needsAuthorizedSiteRetry(result)) autoSessionItems.push({ ...item, ...result });
+          }, BROWSER_FALLBACK_CONCURRENCY);
+        }
       }
-    } finally { setProcessing(false); }
+    } finally {
+      setProcessing(false);
+      if (autoSessionItems.length) queueAutomaticSiteRecovery(autoSessionItems);
+    }
   }
 
   async function processSinglePreview(item, extraPatch = {}) {
@@ -350,6 +408,53 @@ function App() {
       error: result.clientOk ? result.error || null : result.error || `HTTP ${result.clientStatus}`
     });
     return result;
+  }
+
+  function queueAutomaticSiteRecovery(items) {
+    if (!privacy.browserFallback || !privacy.interactiveAuthorization) return;
+    const byHost = new Map();
+    for (const item of items) {
+      const host = siteKeyFor(item.url);
+      if (!host || autoSiteRecoveryHostsRef.current.has(host)) continue;
+      if (!byHost.has(host)) byHost.set(host, []);
+      byHost.get(host).push(item);
+    }
+    for (const [host, hostItems] of byHost) {
+      autoSiteRecoveryHostsRef.current.add(host);
+      autoSiteRecoveryQueueRef.current.push({ host, items: hostItems });
+    }
+    void drainAutomaticSiteRecovery();
+  }
+
+  async function drainAutomaticSiteRecovery() {
+    if (autoSiteRecoveryRunningRef.current) return;
+    autoSiteRecoveryRunningRef.current = true;
+    try {
+      while (autoSiteRecoveryQueueRef.current.length) {
+        const task = autoSiteRecoveryQueueRef.current.shift();
+        const first = task.items[0];
+        if (!first) continue;
+        patchPreview(first.id, { authorizationState: "launching", authorizationMessage: `Automatically opening one reusable site session for ${task.host}…` });
+        const launch = await authorizePreviewHost(first.url, { privacy });
+        if (!launch.clientOk) {
+          patchPreview(first.id, { authorizationState: "failed", authorizationMessage: launch.error || "Automatic site session failed to open." });
+          continue;
+        }
+        let success = false;
+        for (let attempt = 0; attempt < 8; attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 2200 : 1600));
+          const result = await processSinglePreview(first, { authorizationState: "auto-retry", authorizationMessage: `Automatically reusing ${task.host} site session…` });
+          if (result?.clientOk && result.image) { success = true; break; }
+        }
+        if (success) {
+          const siblings = task.items.slice(1);
+          for (const sibling of siblings) await processSinglePreview(sibling, { authorizationState: "site-retry", authorizationMessage: `Automatically reusing ${task.host} site session…` });
+          patchPreview(first.id, { authorizationState: "site-ready", authorizationMessage: `Site session active for ${task.host}; unresolved links from this host were retried automatically.` });
+        } else {
+          patchPreview(first.id, { authorizationState: "needs-attention", authorizationMessage: `Automatic refresh/ordinary consent did not finish this site. If the visible window shows CAPTCHA, age confirmation, login, or another access-control prompt, complete it once and press Retry.` });
+        }
+      }
+    } finally { autoSiteRecoveryRunningRef.current = false; }
   }
 
   async function handleSubmit(event) {
@@ -378,12 +483,12 @@ function App() {
       return next;
     });
   }
-  function selectAll() { setSelected(new Set(previews.map((item) => item.id))); }
+  function selectAll() { setSelected(new Set(visiblePreviews.map((item) => item.id))); }
   function clearSelection() { setSelected(new Set()); }
   function invertSelection() {
     setSelected((current) => {
       const next = new Set();
-      for (const item of previews) if (!current.has(item.id)) next.add(item.id);
+      for (const item of visiblePreviews) if (!current.has(item.id)) next.add(item.id);
       return next;
     });
   }
@@ -405,7 +510,7 @@ function App() {
   }
   async function retryFailed() {
     if (processing) return;
-    await processItems(previews.filter((item) => item.state === "failed"));
+    await processItems(visiblePreviews.filter((item) => item.state === "failed" || item.deadLink));
   }
 
   function queueSelectedVersionSearches() {
@@ -453,7 +558,8 @@ function App() {
       sourceSignals: result.sourceSignals || null,
       tools: result.tools || null,
       searchPolicy: result.searchPolicy || null,
-      queryEvidence: result.queryEvidence || []
+      queryEvidence: result.queryEvidence || [],
+      archiveRecovery: result.archiveRecovery || null
     });
   }
 
@@ -471,7 +577,7 @@ function App() {
   }, [finderJobs]);
 
   function retryFinderJob(job) {
-    patchFinderJob(job.id, { state: "queued", privacy: { ...privacy }, results: [], lowRelevanceResults: [], rawDiscovered: [], rawDiscoveredCount: 0, error: null, diagnostics: [], queryEvidence: [], cached: false, batchCompareState: "idle", batchCompareProgress: null });
+    patchFinderJob(job.id, { state: "queued", privacy: { ...privacy }, results: [], lowRelevanceResults: [], rawDiscovered: [], rawDiscoveredCount: 0, error: null, diagnostics: [], queryEvidence: [], archiveRecovery: null, cached: false, batchCompareState: "idle", batchCompareProgress: null });
   }
   function removeFinderJob(id) { setFinderJobs((current) => current.filter((job) => job.id !== id)); }
   function clearCompletedFinderJobs() { setFinderJobs((current) => current.filter((job) => ["queued", "running"].includes(job.state))); }
@@ -640,13 +746,15 @@ function App() {
               <div className="privacy-group"><h3>Preview browsing</h3>
                 <PrivacyToggle checked={privacy.remoteThumbnails} onChange={(v) => setPrivacyOption("remoteThumbnails", v)} title="Load remote thumbnails" detail="Downloads discovered poster/thumbnail images through the localhost safety proxy." />
                 <PrivacyToggle checked={privacy.browserFallback} onChange={(v) => setPrivacyOption("browserFallback", v)} title="Edge browser fallback" detail="Lets Sandbox Edge load difficult video pages when lightweight metadata is insufficient." />
-                <PrivacyToggle checked={privacy.interactiveAuthorization} onChange={(v) => setPrivacyOption("interactiveAuthorization", v)} title="Interactive site session" detail="Allows a visible Sandbox Edge window so you can manually pass challenge, consent, age, cookie, or Accept prompts and reuse that session for the site." />
+                <PrivacyToggle checked={privacy.interactiveAuthorization} onChange={(v) => setPrivacyOption("interactiveAuthorization", v)} title="Automatic site session recovery" detail="Automatically opens one reusable Sandbox Edge session after a no-thumbnail browser failure, refreshes once, and clicks recognized cookie/privacy consent. CAPTCHA, age, login, and other access-control prompts remain manual." />
               </div>
               <div className="privacy-group"><h3>Version Finder — destinations</h3>
                 <PrivacyToggle checked={privacy.mediaTools} onChange={(v) => setPrivacyOption("mediaTools", v)} title="Media-tool probing" detail="Allows yt-dlp/Deno to inspect selected and candidate public video pages/CDNs inside Sandbox." />
                 <PrivacyToggle checked={privacy.searchDuckDuckGo} onChange={(v) => setPrivacyOption("searchDuckDuckGo", v)} title="DuckDuckGo search" detail="Sends enabled finder queries to DuckDuckGo's public search endpoint." />
                 <PrivacyToggle checked={privacy.searchBing} onChange={(v) => setPrivacyOption("searchBing", v)} title="Bing search" detail="Sends enabled finder queries to Bing's public search endpoint." />
                 <PrivacyToggle checked={privacy.searchMojeek} onChange={(v) => setPrivacyOption("searchMojeek", v)} title="Mojeek search" detail="Sends enabled finder queries to Mojeek's public search endpoint." />
+                <PrivacyToggle checked={privacy.searchBrave} onChange={(v) => setPrivacyOption("searchBrave", v)} title="Brave Search" detail="Uses Brave's independent web index with Safe Search explicitly requested off." />
+                <PrivacyToggle checked={privacy.archiveLookups} onChange={(v) => setPrivacyOption("archiveLookups", v)} title="Archive discovery" detail="Queries Archive.org media search plus Wayback/Common Crawl captures to recover dead or poorly indexed source clues and archived outbound embeds." />
               </div>
               <div className="privacy-group"><h3>Version Finder — query contents</h3>
                 <PrivacyToggle checked={privacy.searchTitleUploader} onChange={(v) => setPrivacyOption("searchTitleUploader", v)} title="Title & uploader" detail="May send the video's title and uploader/channel name to enabled search engines." />
@@ -664,7 +772,8 @@ function App() {
       </section>
 
       <nav className="workspace-tabs" aria-label="Workspace">
-        <button type="button" className={activeTab === "previews" ? "active" : ""} onClick={() => setActiveTab("previews")}>Previews <span>{previews.length}</span></button>
+        <button type="button" className={activeTab === "previews" ? "active" : ""} onClick={() => setActiveTab("previews")}>Previews <span>{livePreviews.length}</span></button>
+        <button type="button" className={activeTab === "dead" ? "active" : ""} onClick={() => setActiveTab("dead")}>Dead Links <span>{deadPreviews.length}</span></button>
         <button type="button" className={activeTab === "finder" ? "active" : ""} onClick={() => setActiveTab("finder")}>
           Version Finder <span>{finderJobs.length}</span>
           {(finderStats.running > 0 || finderStats.queued > 0) && <i>{finderStats.running + finderStats.queued}</i>}
@@ -673,18 +782,18 @@ function App() {
 
       {copyStatus && <div className="copy-toast workspace-toast">{copyStatus}</div>}
 
-      {activeTab === "previews" && (
+      {(activeTab === "previews" || activeTab === "dead") && (
         <>
-          {previews.length > 0 && (
+          {visiblePreviews.length > 0 && (
             <>
               <section className="status-strip">
                 <div className="progress-copy">
-                  <strong>{stats.ready + stats.failed} / {stats.total}</strong> processed
-                  {stats.loading > 0 && <span> · {stats.loading} active</span>}
-                  {stats.queued > 0 && <span> · {stats.queued} queued</span>}
-                  {stats.failed > 0 && <span className="failed-text"> · {stats.failed} failed</span>}
+                  <strong>{visibleStats.ready + visibleStats.failed} / {visibleStats.total}</strong> processed
+                  {visibleStats.loading > 0 && <span> · {visibleStats.loading} active</span>}
+                  {visibleStats.queued > 0 && <span> · {visibleStats.queued} queued</span>}
+                  {visibleStats.failed > 0 && <span className="failed-text"> · {visibleStats.failed} failed</span>}
                 </div>
-                <div className="progress-track"><div className="progress-fill" style={{ width: `${stats.total ? ((stats.ready + stats.failed) / stats.total) * 100 : 0}%` }} /></div>
+                <div className="progress-track"><div className="progress-fill" style={{ width: `${visibleStats.total ? ((visibleStats.ready + visibleStats.failed) / visibleStats.total) * 100 : 0}%` }} /></div>
               </section>
 
               <section className="actionbar">
@@ -696,13 +805,13 @@ function App() {
                   <button type="button" onClick={copySelected} disabled={!selected.size}>Copy selected URLs</button>
                   <button type="button" onClick={queueSelectedVersionSearches} disabled={!selected.size || !finderSearchEnabled} title={finderSearchEnabled ? "Queue selected videos for independent background version searches" : "Enable a search engine and finder query signal in Privacy & network activity"}>Queue version search{selected.size > 1 ? ` (${selected.size})` : ""}</button>
                   <button type="button" onClick={removeSelected} disabled={!selected.size || processing}>Remove selected</button>
-                  {stats.failed > 0 && <button type="button" onClick={retryFailed} disabled={processing}>Retry failed</button>}
+                  {visibleStats.failed > 0 && <button type="button" onClick={retryFailed} disabled={processing}>Retry failed</button>}
                   <button type="button" onClick={clearAll} disabled={processing}>Clear all</button>
                 </div>
               </section>
 
               <section className="preview-grid">
-                {previews.map((preview) => {
+                {visiblePreviews.map((preview) => {
                   const isSelected = selected.has(preview.id);
                   const duration = formatDuration(preview.durationSeconds);
                   const siteSessionEligible = needsAuthorizedSiteRetry(preview);
@@ -723,6 +832,7 @@ function App() {
                         </div>
                         <h2>{preview.title || (preview.state === "failed" ? "Preview failed" : "Video preview")}</h2>
                         {preview.description && <p>{preview.description}</p>}
+                        {preview.deadLink && <p className="warning-message">{preview.deadHost ? `Host ${preview.deadHostName || domainFor(preview.url)} was confirmed unreachable; additional links on this host are skipped for this Sandbox session instead of repeatedly pinging it.` : "This individual URL returned 404/410. The host remains eligible for other links."} Version Finder can still use URL and archive clues.</p>}
                         {siteSessionEligible && preview.state !== "failed" && (
                           <div className="challenge-box">
                             <p className="warning-message">
@@ -765,6 +875,7 @@ function App() {
                               <div><dt>Fallback skipped</dt><dd>{preview.browserFallbackSkippedReason || "none"}</dd></div>
                               <div><dt>Client network</dt><dd>{preview.clientNetworkError || "none"}</dd></div>
                               <div><dt>Warning</dt><dd>{preview.warning || "none"}</dd></div>
+                              <div><dt>Dead link</dt><dd>{preview.deadLink ? (preview.deadHost ? `host unreachable${preview.hostSuppressed ? " · suppressed" : ""}` : preview.deadReason || "yes") : "no"}</dd></div>
                               <div><dt>Error</dt><dd>{preview.error || "none"}</dd></div>
                             </dl>
                           </details>
@@ -776,7 +887,7 @@ function App() {
               </section>
             </>
           )}
-          {!previews.length && <section className="empty-workspace"><strong>No previews yet</strong><p>Paste video URLs above to begin.</p></section>}
+          {!visiblePreviews.length && <section className="empty-workspace"><strong>{activeTab === "dead" ? "No dead links" : "No previews yet"}</strong><p>{activeTab === "dead" ? "Confirmed unreachable hosts and individual 404/410 URLs are moved here automatically. They can still be queued into Version Finder using URL/archive clues." : "Paste video URLs above to begin."}</p></section>}
         </>
       )}
 
@@ -897,7 +1008,7 @@ function App() {
                       <details className="alternate-diagnostics">
                         <summary>Discovery diagnostics</summary>
                         <p>{job.note}</p>
-                        {job.privacy && <div className="alternate-diagnostic-row"><strong>Privacy snapshot</strong><span>{[job.privacy.searchDuckDuckGo && "DDG", job.privacy.searchBing && "Bing", job.privacy.searchMojeek && "Mojeek"].filter(Boolean).join("+") || "no search engines"}</span><span>{job.privacy.mediaTools ? "media tools on" : "media tools off"}</span><code>{[job.privacy.searchTranscript && "transcript", job.privacy.searchDescription && "description", job.privacy.searchMediaIds && "media IDs", job.privacy.searchTitleUploader && "title/uploader"].filter(Boolean).join(" · ") || "no query signals"}</code></div>}
+                        {job.privacy && <div className="alternate-diagnostic-row"><strong>Privacy snapshot</strong><span>{[job.privacy.searchDuckDuckGo && "DDG", job.privacy.searchBing && "Bing", job.privacy.searchMojeek && "Mojeek", job.privacy.searchBrave && "Brave", job.privacy.archiveLookups && "Archives"].filter(Boolean).join("+") || "no search engines"}</span><span>{job.privacy.mediaTools ? "media tools on" : "media tools off"}</span><code>{[job.privacy.searchTranscript && "transcript", job.privacy.searchDescription && "description", job.privacy.searchMediaIds && "media IDs", job.privacy.searchTitleUploader && "title/uploader"].filter(Boolean).join(" · ") || "no query signals"}</code></div>}
                         {job.tools && (
                           <div className="alternate-diagnostic-row discovery-tool-row">
                             <strong>Media tools</strong><span>{job.tools.installed ? "installed" : "not found"}</span>
@@ -905,7 +1016,10 @@ function App() {
                             <code>{job.tools.sourceMode || "—"}{job.tools.sourceExtractor ? ` / ${job.tools.sourceExtractor}` : ""}</code>
                           </div>
                         )}
-                        {job.searchPolicy && <div className="alternate-diagnostic-row"><strong>Search filtering</strong><span>DDG off requested</span><span>Bing off requested · Mojeek off requested</span><code>{job.searchPolicy.note}</code></div>}
+                        {job.searchPolicy && <div className="alternate-diagnostic-row"><strong>Search filtering</strong><span>DDG · Bing · Mojeek · Brave: Safe Search off requested</span><span>Archives: no app SafeSearch filter</span><code>{job.searchPolicy.note}</code></div>}
+                        {job.sourceSignals?.urlClues && <div className="alternate-diagnostic-row"><strong>URL clues</strong><span>{job.sourceSignals.urlClues.slugPhrase || "no readable slug"}</span><span>{(job.sourceSignals.urlClues.ids || []).length} IDs</span><code>{(job.sourceSignals.urlClues.phrases || []).join(" · ") || "—"}</code></div>}
+                        {job.sourceSignals?.archivedSource && <div className="alternate-diagnostic-row"><strong>Archived source</strong><span>{job.sourceSignals.archivedSource.provider || "archive"}</span><span>{job.sourceSignals.archivedSource.directCandidates || 0} outbound candidates</span><code>{job.sourceSignals.archivedSource.recoveredTitle || job.sourceSignals.archivedSource.capture || "metadata recovered"}</code></div>}
+                        {job.archiveRecovery && <div className="alternate-diagnostic-row"><strong>Archive recovery</strong><span>{job.archiveRecovery.ok ? "recovered" : "not recovered"}</span><span>{job.archiveRecovery.provider || "Wayback + Common Crawl"}</span><code>{(job.archiveRecovery.attempts || []).map((item) => `${item.provider}:${item.ok ? "ok" : item.error || "miss"}`).join(" · ") || job.archiveRecovery.error || "—"}</code></div>}
                         {job.sourceSignals?.transcript?.phrase && <div className="alternate-diagnostic-row"><strong>Transcript</strong><span>{job.sourceSignals.transcript.lang || "unknown"}</span><span>{job.sourceSignals.transcript.automatic ? "automatic" : "subtitle"}</span><code>“{job.sourceSignals.transcript.phrase}”</code></div>}
                         {(job.queryEvidence || []).map((entry, index) => <div className="alternate-diagnostic-row" key={`query-${entry.kind}-${index}`}><strong>{entry.kind}</strong><span>{Math.round((entry.weight || 0) * 100)}% query priority</span><span>discovery only</span><code>{entry.query}</code></div>)}
                         {(job.diagnostics || []).map((entry, index) => <div className="alternate-diagnostic-row" key={`${entry.engine}-${entry.kind}-${index}`}><strong>{entry.engine}</strong><span>{entry.status || "network"}</span><span>{entry.found || 0} results</span><code>{entry.query}</code>{entry.error && <span className="failed-text">{entry.error}</span>}</div>)}

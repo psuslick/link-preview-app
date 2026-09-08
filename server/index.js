@@ -10,6 +10,7 @@ import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs/promises";
+import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 
 const PORT = 3000;
@@ -40,6 +41,10 @@ const ALTERNATE_RAW_DISCOVERY_LIMIT = 1000;
 const ALTERNATE_CANDIDATE_CONCURRENCY = 3;
 const ALTERNATE_CACHE_TTL_MS = 10 * 60 * 1000;
 const ALTERNATE_CACHE_MAX_ENTRIES = 100;
+const ARCHIVE_LOOKUP_TIMEOUT_MS = 8000;
+const ARCHIVE_CAPTURE_LIMIT = 3;
+const HOST_DEAD_TTL_MS = 30 * 60 * 1000;
+const HOST_ALIVE_TTL_MS = 5 * 60 * 1000;
 
 // Browser fallback is deliberately much narrower than metadata fetching.
 const BROWSER_FALLBACK_LIMIT = 1;
@@ -85,6 +90,9 @@ const previewCache = new Map();
 const alternateCache = new Map();
 const browserChallengeHosts = new Map();
 const authorizedBrowserProfiles = new Map();
+const hostReachability = new Map();
+const hostReachabilityChecks = new Map();
+const hostFirstRequestFlights = new Map();
 
 const DEFAULT_PRIVACY = Object.freeze({
   browserFallback: true,
@@ -93,6 +101,8 @@ const DEFAULT_PRIVACY = Object.freeze({
   searchDuckDuckGo: true,
   searchBing: true,
   searchMojeek: true,
+  searchBrave: true,
+  archiveLookups: true,
   searchTitleUploader: true,
   searchMediaIds: true,
   searchDescription: true,
@@ -105,6 +115,128 @@ function normalizePrivacy(value) {
   return Object.fromEntries(
     Object.entries(DEFAULT_PRIVACY).map(([key, defaultValue]) => [key, typeof input[key] === "boolean" ? input[key] : defaultValue])
   );
+}
+
+
+function reachabilityKey(rawUrl) {
+  try { return new URL(rawUrl).hostname.toLowerCase().replace(/^www\./, ""); }
+  catch { return ""; }
+}
+
+function reachabilityStateFor(rawUrl) {
+  const key = reachabilityKey(rawUrl);
+  if (!key) return null;
+  const state = hostReachability.get(key);
+  if (!state) return null;
+  if (state.until <= Date.now()) { hostReachability.delete(key); return null; }
+  return state;
+}
+
+function isNetworkUnavailableError(value) {
+  const text = String(value || "").toLowerCase();
+  return /(?:enotfound|eai_again|econnrefused|econnreset|enetunreach|ehostunreach|request_timeout|socket hang up|network timeout|tls|certificate|fetch failed)/.test(text);
+}
+
+async function confirmHostReachability(rawUrl, triggerResult = null) {
+  const target = validateUrl(rawUrl);
+  const key = reachabilityKey(target.toString());
+  const existing = reachabilityStateFor(target.toString());
+  if (existing) return existing;
+  if (hostReachabilityChecks.has(key)) return await hostReachabilityChecks.get(key);
+
+  const check = (async () => {
+    const schemes = target.protocol === "https:" ? ["https:", "http:"] : ["http:", "https:"];
+    const roots = [...new Set(schemes.map((scheme) => `${scheme}//${target.host}/`))];
+    const attempts = [];
+    for (const root of roots) {
+      const result = await fetchBounded(root, { kind: "html", timeoutMs: 3500, retries: 0 });
+      attempts.push({ url: root, status: result.status || 0, error: result.error || null });
+      // Any HTTP response proves the host is reachable, even 401/403/404/5xx.
+      if (result.status > 0) {
+        const state = { state: "alive", host: key, until: Date.now() + HOST_ALIVE_TTL_MS, attempts };
+        hostReachability.set(key, state);
+        return state;
+      }
+    }
+    const triggerNetworkFailure = triggerResult?.status === 0 && isNetworkUnavailableError(triggerResult?.error);
+    const allNetworkFailures = attempts.length > 0 && attempts.every((item) => item.status === 0 && isNetworkUnavailableError(item.error));
+    const state = (triggerNetworkFailure || allNetworkFailures)
+      ? { state: "dead", host: key, until: Date.now() + HOST_DEAD_TTL_MS, attempts, reason: triggerResult?.error || attempts[0]?.error || "host_unreachable" }
+      : { state: "unknown", host: key, until: Date.now() + 60_000, attempts };
+    if (state.state !== "unknown") hostReachability.set(key, state);
+    return state;
+  })().finally(() => hostReachabilityChecks.delete(key));
+
+  hostReachabilityChecks.set(key, check);
+  return await check;
+}
+
+async function fetchHostAwareInitialHtml(targetUrl) {
+  const key = reachabilityKey(targetUrl);
+  const known = reachabilityStateFor(targetUrl);
+  if (known?.state === "dead") return { deadState: known, htmlResult: null };
+  if (known?.state === "alive" || !key) {
+    return { deadState: null, htmlResult: await fetchBounded(targetUrl, { kind: "html" }) };
+  }
+
+  // For a previously-unknown host, allow only one URL to establish whether the
+  // site is reachable. Hundreds of sibling URLs then wait for that answer rather
+  // than all creating DNS/TCP attempts against a dead domain at once.
+  const existingFlight = hostFirstRequestFlights.get(key);
+  if (existingFlight) {
+    await existingFlight.catch(() => {});
+    const after = reachabilityStateFor(targetUrl);
+    if (after?.state === "dead") return { deadState: after, htmlResult: null };
+    return { deadState: null, htmlResult: await fetchBounded(targetUrl, { kind: "html" }) };
+  }
+
+  let releaseFlight;
+  const flight = new Promise((resolve) => { releaseFlight = resolve; });
+  hostFirstRequestFlights.set(key, flight);
+  try {
+    const htmlResult = await fetchBounded(targetUrl, { kind: "html" });
+    if (htmlResult.status > 0) {
+      hostReachability.set(key, { state: "alive", host: key, until: Date.now() + HOST_ALIVE_TTL_MS, attempts: [{ url: targetUrl, status: htmlResult.status, error: null }] });
+      return { deadState: null, htmlResult };
+    }
+    const reachability = await confirmHostReachability(targetUrl, htmlResult);
+    if (reachability?.state === "dead") return { deadState: reachability, htmlResult };
+    return { deadState: null, htmlResult };
+  } finally {
+    try { releaseFlight(); } catch {}
+    hostFirstRequestFlights.delete(key);
+  }
+}
+
+function deadHostPreview(targetUrl, started, state, { skipped = true } = {}) {
+  return {
+    url: targetUrl,
+    title: null,
+    description: null,
+    image: null,
+    images: [],
+    provider: null,
+    durationSeconds: null,
+    method: skipped ? "dead-host-skipped" : "dead-host-confirmed",
+    upstreamStatus: 0,
+    bytesRead: 0,
+    elapsedMs: Date.now() - started,
+    cached: false,
+    warning: "host_unreachable",
+    error: null,
+    deadLink: true,
+    deadHost: true,
+    hostSuppressed: skipped,
+    deadReason: state?.reason || "host_unreachable",
+    deadHostName: state?.host || reachabilityKey(targetUrl),
+    siteSessionRecommended: false,
+    browserFallback: false,
+    browserFallbackAttempted: false,
+    browserFallbackError: null,
+    needsBrowserFallback: false,
+    extractorStats: null,
+    browserExtractorStats: null
+  };
 }
 
 function getHostSemaphore(hostname) {
@@ -1202,6 +1334,9 @@ async function createPreview(rawUrl, { allowBrowserFallback = true } = {}) {
   const cached = cacheGet(cacheKey);
   if (cached) return { ...cached, elapsedMs: Date.now() - started };
 
+  const knownReachability = reachabilityStateFor(targetUrl);
+  if (knownReachability?.state === "dead") return deadHostPreview(targetUrl, started, knownReachability, { skipped: true });
+
   const provider = knownProvider(targetUrl);
   const derivedImages = providerDerivedImages(targetUrl);
   let providerMetadata = null;
@@ -1256,7 +1391,11 @@ async function createPreview(rawUrl, { allowBrowserFallback = true } = {}) {
     return value;
   }
 
-  const htmlResult = await fetchBounded(targetUrl, { kind: "html" });
+  const initialHostFetch = await fetchHostAwareInitialHtml(targetUrl);
+  if (initialHostFetch.deadState) {
+    return deadHostPreview(targetUrl, started, initialHostFetch.deadState, { skipped: !initialHostFetch.htmlResult });
+  }
+  const htmlResult = initialHostFetch.htmlResult;
   const httpChallenge = detectChallengePage(htmlResult.text, htmlResult.status);
   if (httpChallenge) markChallengeCircuit(targetUrl);
   const httpMetadata = htmlResult.ok && !httpChallenge
@@ -1382,10 +1521,15 @@ async function createPreview(rawUrl, { allowBrowserFallback = true } = {}) {
     ),
     needsBrowserFallback: needsBrowserFallback && !allowBrowserFallback,
     extractorStats: httpMetadata?.extractorStats || null,
-    browserExtractorStats
+    browserExtractorStats,
+    deadLink: Boolean([404, 410].includes(htmlResult.status)),
+    deadHost: false,
+    hostSuppressed: false,
+    deadReason: [404, 410].includes(htmlResult.status) ? `url_gone_${htmlResult.status}` : null,
+    deadHostName: null
   };
 
-  if ((value.image || value.title) && !value.needsBrowserFallback) cacheSet(cacheKey, value);
+  if ((value.image || value.title) && !value.needsBrowserFallback && !value.deadLink) cacheSet(cacheKey, value);
   return value;
 }
 
@@ -1573,6 +1717,223 @@ function parseMojeekResults(html) {
   });
   return results.slice(0, 30);
 }
+
+function urlDiscoveryClues(rawUrl) {
+  try {
+    const url = validateUrl(rawUrl);
+    const decodedSegments = url.pathname.split("/").filter(Boolean).map((part) => {
+      try { return decodeURIComponent(part); } catch { return part; }
+    });
+    const generic = new Set(["video","videos","watch","view","embed","player","media","clip","clips","content","index","html","htm","php"]);
+    const phrases = [];
+    const ids = [];
+    const filenames = [];
+    for (const segment of decodedSegments) {
+      const stem = segment.replace(/\.(?:html?|php|aspx?|mp4|m4v|mov|webm|mkv|m3u8|mpd)$/i, "");
+      const phrase = stem.replace(/[._+~-]+/g, " ").replace(/\s+/g, " ").trim();
+      if (phrase && phrase.length >= 3 && !generic.has(phrase.toLowerCase())) phrases.push(phrase);
+      const id = signalIdCandidate(stem);
+      if (id && !generic.has(id.toLowerCase())) ids.push(id);
+      const fileStem = mediaFilenameStem(`${url.origin}/${segment}`);
+      if (fileStem) filenames.push(fileStem);
+    }
+    for (const [key, value] of url.searchParams) {
+      if (/^(?:title|name|video|video_id|videoid|media|media_id|mediaid|asset|asset_id|assetid|clip|clip_id|clipid|id|slug|file|filename)$/i.test(key)) {
+        const decoded = String(value || "").replace(/[._+~-]+/g, " ").replace(/\s+/g, " ").trim();
+        if (decoded.length >= 3) phrases.push(decoded);
+        const id = signalIdCandidate(value);
+        if (id) ids.push(id);
+      }
+    }
+    const scored = [...new Set(phrases)].sort((a, b) => {
+      const score = (v) => (/[\p{L}]/u.test(v) ? 20 : 0) + Math.min(v.length, 80) + (v.split(/\s+/).length >= 3 ? 20 : 0);
+      return score(b) - score(a);
+    });
+    return {
+      slugPhrase: scored[0] || null,
+      phrases: scored.slice(0, 6),
+      ids: [...new Set(ids)].slice(0, 16),
+      filenames: [...new Set(filenames)].slice(0, 8),
+      host: url.hostname.toLowerCase().replace(/^www\./, "")
+    };
+  } catch {
+    return { slugPhrase: null, phrases: [], ids: [], filenames: [], host: "" };
+  }
+}
+
+function unwrapArchivedUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    if (url.hostname === "web.archive.org") {
+      const match = url.pathname.match(/^\/web\/[^/]+\/(https?:\/\/.*)$/i);
+      if (match) return validateUrl(match[1] + url.search + url.hash).toString();
+    }
+    return validateUrl(url.toString()).toString();
+  } catch { return null; }
+}
+
+function archiveOutgoingCandidates(html, pageUrl, sourceHost) {
+  const $ = cheerio.load(html || "");
+  const out = [];
+  const seen = new Set();
+  const add = (value) => {
+    if (!value || out.length >= 60) return;
+    let resolved;
+    try { resolved = new URL(value, pageUrl).toString(); } catch { return; }
+    resolved = unwrapArchivedUrl(resolved) || resolveUrl(resolved, pageUrl);
+    if (!resolved) return;
+    try {
+      const target = validateUrl(resolved);
+      const host = target.hostname.toLowerCase().replace(/^www\./, "");
+      if (!host || host === sourceHost || host === "web.archive.org" || host.endsWith(".archive.org") || host.endsWith(".commoncrawl.org")) return;
+      const key = canonicalDiscoveryUrl(target.toString()).toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key); out.push(target.toString());
+    } catch {}
+  };
+  $("a[href],iframe[src],embed[src],video[src],source[src]").slice(0, 600).each((_, el) => add($(el).attr("href") || $(el).attr("src")));
+  return out;
+}
+
+async function lookupWaybackSource(rawUrl) {
+  const cdx = `https://web.archive.org/cdx/search/cdx?url=${encodeURIComponent(rawUrl)}&output=json&fl=timestamp,original,statuscode,mimetype,digest&filter=statuscode:200&filter=mimetype:text/html&collapse=digest&limit=-${ARCHIVE_CAPTURE_LIMIT}`;
+  const index = await fetchBounded(cdx, { kind: "json", timeoutMs: ARCHIVE_LOOKUP_TIMEOUT_MS, retries: 1 });
+  if (!index.ok || !index.text) return { ok: false, provider: "Wayback", error: index.error || `status_${index.status}`, captures: [] };
+  let rows;
+  try { rows = JSON.parse(index.text); } catch { return { ok: false, provider: "Wayback", error: "wayback_invalid_json", captures: [] }; }
+  if (!Array.isArray(rows) || rows.length < 2) return { ok: false, provider: "Wayback", error: "wayback_no_capture", captures: [] };
+  const headers = rows[0];
+  const captures = rows.slice(1).map((row) => Object.fromEntries(headers.map((key, i) => [key, row[i]]))).reverse();
+  for (const capture of captures) {
+    const original = capture.original || rawUrl;
+    const snapshotUrl = `https://web.archive.org/web/${capture.timestamp}id_/${original}`;
+    const page = await fetchBounded(snapshotUrl, { kind: "media-page", timeoutMs: ARCHIVE_LOOKUP_TIMEOUT_MS, retries: 0 });
+    if (!page.ok || !page.text) continue;
+    const metadata = extractHtmlMetadata(page.text, original);
+    const signals = extractMediaDiscoverySignals(page.text, original);
+    const candidates = archiveOutgoingCandidates(page.text, original, discoveryHost(rawUrl));
+    return { ok: true, provider: "Wayback", capture: capture.timestamp, snapshotUrl, metadata, signals, candidates };
+  }
+  return { ok: false, provider: "Wayback", error: "wayback_capture_fetch_failed", captures };
+}
+
+async function fetchRangeRecord(rawUrl, offset, length) {
+  const url = validateUrl(rawUrl);
+  if (!Number.isFinite(offset) || !Number.isFinite(length) || length <= 0 || length > 4 * 1024 * 1024) throw new Error("archive_record_too_large");
+  const hostname = url.hostname.toLowerCase();
+  const releaseGlobal = await globalNetwork.acquire();
+  const releaseHost = await getHostSemaphore(hostname).acquire();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ARCHIVE_LOOKUP_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      method: "GET", redirect: "manual", signal: controller.signal, agent: agentFor,
+      headers: browserLikeHeaders("json", { Range: `bytes=${offset}-${offset + length - 1}`, "Accept-Encoding": "identity" })
+    });
+    if (!(response.ok || response.status === 206)) return null;
+    const body = await readLimitedBody(response.body, Math.min(length + 1024, 4 * 1024 * 1024), false);
+    return body.buffer;
+  } catch { return null; }
+  finally { clearTimeout(timer); releaseHost(); releaseGlobal(); }
+}
+
+function extractCommonCrawlHtml(buffer) {
+  if (!buffer?.length) return null;
+  let raw;
+  try { raw = zlib.gunzipSync(buffer); } catch { return null; }
+  const text = raw.toString("utf8");
+  const httpStart = Math.max(text.indexOf("\r\n\r\nHTTP/"), text.indexOf("\n\nHTTP/"));
+  const slice = httpStart >= 0 ? text.slice(httpStart + (text.startsWith("\r\n\r\n", httpStart) ? 4 : 2)) : text;
+  const split = slice.indexOf("\r\n\r\n") >= 0 ? slice.indexOf("\r\n\r\n") + 4 : slice.indexOf("\n\n") + 2;
+  return split > 1 ? slice.slice(split) : slice;
+}
+
+async function lookupCommonCrawlSource(rawUrl) {
+  const info = await fetchBounded("https://index.commoncrawl.org/collinfo.json", { kind: "json", timeoutMs: ARCHIVE_LOOKUP_TIMEOUT_MS, retries: 0 });
+  if (!info.ok || !info.text) return { ok: false, provider: "Common Crawl", error: info.error || `status_${info.status}` };
+  let collections;
+  try { collections = JSON.parse(info.text); } catch { return { ok: false, provider: "Common Crawl", error: "commoncrawl_invalid_collections" }; }
+  for (const collection of (collections || []).slice(0, 4)) {
+    const id = collection.id;
+    if (!id) continue;
+    const queryUrl = `https://index.commoncrawl.org/${id}-index?url=${encodeURIComponent(rawUrl)}&output=json&filter=status:200&filter=mime:text/html&collapse=digest`;
+    const index = await fetchBounded(queryUrl, { kind: "json", timeoutMs: ARCHIVE_LOOKUP_TIMEOUT_MS, retries: 0 });
+    if (!index.ok || !index.text.trim()) continue;
+    const lines = index.text.trim().split(/\r?\n/).filter(Boolean);
+    for (const line of lines.slice(-2).reverse()) {
+      let record;
+      try { record = JSON.parse(line); } catch { continue; }
+      const length = Number(record.length), offset = Number(record.offset);
+      if (!record.filename || !Number.isFinite(length) || !Number.isFinite(offset)) continue;
+      const segment = await fetchRangeRecord(`https://data.commoncrawl.org/${record.filename}`, offset, length);
+      const html = extractCommonCrawlHtml(segment);
+      if (!html) continue;
+      const metadata = extractHtmlMetadata(html, rawUrl);
+      const signals = extractMediaDiscoverySignals(html, rawUrl);
+      const candidates = archiveOutgoingCandidates(html, rawUrl, discoveryHost(rawUrl));
+      return { ok: true, provider: "Common Crawl", capture: record.timestamp || id, metadata, signals, candidates };
+    }
+  }
+  return { ok: false, provider: "Common Crawl", error: "commoncrawl_no_capture" };
+}
+
+async function recoverArchivedSource(rawUrl) {
+  const wayback = await lookupWaybackSource(rawUrl).catch((error) => ({ ok: false, provider: "Wayback", error: error?.message || "wayback_failed" }));
+  if (wayback.ok && (wayback.metadata?.title || wayback.signals?.ids?.length || wayback.signals?.mediaUrls?.length || wayback.candidates?.length)) {
+    return { ...wayback, attempts: [wayback] };
+  }
+  const common = await lookupCommonCrawlSource(rawUrl).catch((error) => ({ ok: false, provider: "Common Crawl", error: error?.message || "commoncrawl_failed" }));
+  return common.ok ? { ...common, attempts: [wayback, common] } : { ok: false, provider: null, error: common.error || wayback.error || "archive_not_found", attempts: [wayback, common] };
+}
+
+function parseBraveResults(html) {
+  const $ = cheerio.load(html || "");
+  const results = [];
+  const seen = new Set();
+  $("a[href]").each((_, anchorEl) => {
+    if (results.length >= 30) return false;
+    const anchor = $(anchorEl);
+    const titleNode = anchor.find(".snippet-title").first();
+    if (!titleNode.length) return;
+    const url = unwrapSearchResultHref(anchor.attr("href"), "https://search.brave.com/search");
+    if (!url) return;
+    const host = discoveryHost(url);
+    if (!host || host === "search.brave.com" || host.endsWith(".brave.com")) return;
+    const key = canonicalDiscoveryUrl(url).toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    const container = anchor.closest(".snippet, .result, [data-type='web']");
+    const title = titleNode.text().replace(/\s+/g, " ").trim();
+    const snippet = container.find(".snippet-description, .snippet-content, p").first().text().replace(/\s+/g, " ").trim();
+    results.push({ url, searchTitle: title || null, snippet: snippet || null, engine: "Brave" });
+  });
+  return results;
+}
+
+async function searchBrave(query) {
+  const url = `https://search.brave.com/search?q=${encodeURIComponent(query)}&safesearch=off&source=web`;
+  const response = await fetchBounded(url, { kind: "search", timeoutMs: ALTERNATE_SEARCH_TIMEOUT_MS, retries: 1, headers: { Referer: "https://search.brave.com/", Cookie: "safesearch=off" } });
+  if (!response.ok) return { ok: false, status: response.status, results: [], error: response.error || `search_status_${response.status}` };
+  return { ok: true, status: response.status, results: parseBraveResults(response.text) };
+}
+
+async function searchInternetArchive(query) {
+  const q = `${query} AND mediatype:movies`;
+  const url = `https://archive.org/advancedsearch.php?q=${encodeURIComponent(q)}&fl%5B%5D=identifier&fl%5B%5D=title&fl%5B%5D=description&rows=30&page=1&output=json`;
+  const response = await fetchBounded(url, { kind: "json", timeoutMs: ALTERNATE_SEARCH_TIMEOUT_MS, retries: 1 });
+  if (!response.ok || !response.text) return { ok: false, status: response.status, results: [], error: response.error || `search_status_${response.status}` };
+  try {
+    const data = JSON.parse(response.text);
+    const results = (data?.response?.docs || []).map((doc) => ({
+      url: `https://archive.org/details/${encodeURIComponent(doc.identifier)}`,
+      searchTitle: Array.isArray(doc.title) ? doc.title[0] : doc.title || doc.identifier,
+      snippet: Array.isArray(doc.description) ? doc.description[0] : doc.description || null,
+      engine: "Internet Archive"
+    }));
+    return { ok: true, status: response.status, results };
+  } catch { return { ok: false, status: response.status, results: [], error: "archive_search_invalid_json" }; }
+}
+
 
 async function searchMojeek(query) {
   const url = `https://www.mojeek.com/search?q=${encodeURIComponent(query)}&hp=minimal&autocomp=0&safe=0`;
@@ -2018,6 +2379,9 @@ function buildDiscoveryQueries(source, signals, transcript, privacy = DEFAULT_PR
   // Subject-first queries. These are deliberately evaluated before raw identifiers so
   // the visible candidate set remains about the same video/topic rather than arbitrary
   // pages that happen to share an opaque ID.
+  if (privacy.searchTitleUploader && source?.urlClues?.slugPhrase) {
+    add("url-slug", quote(source.urlClues.slugPhrase), 0.97, source.urlClues.slugPhrase);
+  }
   if (privacy.searchTitleUploader && title) {
     add("title-exact", quote(title), 1.0, title);
     if (anchorPhrase && anchorPhrase.toLowerCase() !== title.toLowerCase()) add("subject-anchor", anchorPhrase, 0.94, anchorPhrase);
@@ -2064,7 +2428,7 @@ function buildDiscoveryQueries(source, signals, transcript, privacy = DEFAULT_PR
   } catch {}
 
   const familyOrder = [
-    "title-exact", "uploader-title", "subject-anchor", "transcript", "transcript-subject",
+    "url-slug", "title-exact", "uploader-title", "subject-anchor", "transcript", "transcript-subject",
     "description", "description-subject", "longer-title", "media-id-subject", "media-filename-subject",
     "media-id", "media-filename", "url-path-subject", "url-fallback"
   ];
@@ -2166,22 +2530,36 @@ async function findAlternates({ url, title, description, provider, durationSecon
   const privacy = normalizePrivacy(privacyInput);
   const sourceUrl = validateUrl(url).toString();
   const toolsDir = privacy.mediaTools ? await findToolsDir() : null;
-  const sourcePage = await probePublicPageSignals(sourceUrl);
-  const sourceTool = privacy.mediaTools ? await runMediaToolProbe(sourceUrl, toolsDir) : null;
+  const urlClues = urlDiscoveryClues(sourceUrl);
+  const reachability = reachabilityStateFor(sourceUrl);
+  const skipSourceNetwork = reachability?.state === "dead";
+  const sourcePage = skipSourceNetwork
+    ? { ok: false, status: 0, error: "host_unreachable", metadata: null, signals: { ids: [], filenames: [], mediaUrls: [], embedUrls: [] } }
+    : await probePublicPageSignals(sourceUrl);
+  const sourceTool = privacy.mediaTools && !skipSourceNetwork ? await runMediaToolProbe(sourceUrl, toolsDir) : null;
+  const archivedSource = privacy.archiveLookups ? await recoverArchivedSource(sourceUrl) : null;
   const toolInfo = sourceTool?.result || null;
+  const archiveMeta = archivedSource?.metadata || null;
 
   let source = {
     url: sourceUrl,
-    title: cleanSearchTitle(toolInfo?.title || title || sourcePage.metadata?.title),
-    description: toolInfo?.description || description || sourcePage.metadata?.description || null,
-    provider: provider || sourcePage.metadata?.provider || toolInfo?.extractor || null,
+    title: cleanSearchTitle(toolInfo?.title || title || sourcePage.metadata?.title || archiveMeta?.title || urlClues.slugPhrase),
+    description: toolInfo?.description || description || sourcePage.metadata?.description || archiveMeta?.description || null,
+    provider: provider || sourcePage.metadata?.provider || archiveMeta?.provider || toolInfo?.extractor || null,
     uploader: toolInfo?.uploader || null,
-    durationSeconds: Number(toolInfo?.durationSeconds || durationSeconds || sourcePage.metadata?.durationSeconds) || null
+    durationSeconds: Number(toolInfo?.durationSeconds || durationSeconds || sourcePage.metadata?.durationSeconds || archiveMeta?.durationSeconds) || null,
+    urlClues,
+    deadHost: skipSourceNetwork
   };
 
-  let sourceSignals = mergeDiscoverySignals(sourcePage.signals, signalsFromToolResult(sourceTool));
+  let sourceSignals = mergeDiscoverySignals(
+    sourcePage.signals,
+    signalsFromToolResult(sourceTool),
+    archivedSource?.signals,
+    { ids: urlClues.ids, filenames: urlClues.filenames, mediaUrls: [], embedUrls: [] }
+  );
   let sourceEdge = null;
-  if (privacy.browserFallback && !sourceSignals.ids.length && !sourceSignals.filenames.length && !sourceSignals.mediaUrls.length) {
+  if (!skipSourceNetwork && privacy.browserFallback && !sourceSignals.ids.length && !sourceSignals.filenames.length && !sourceSignals.mediaUrls.length) {
     sourceEdge = await renderMetadataWithEdge(sourceUrl);
     if (sourceEdge?.ok) {
       sourceSignals = mergeDiscoverySignals(sourceSignals, sourceEdge.mediaSignals);
@@ -2240,6 +2618,14 @@ async function findAlternates({ url, title, description, provider, durationSecon
     }
   };
 
+  if (privacy.archiveLookups && archivedSource?.ok && Array.isArray(archivedSource.candidates)) {
+    addResults(
+      archivedSource.candidates.map((candidateUrl) => ({ url: candidateUrl, searchTitle: null, snippet: "Linked or embedded from an archived copy of the original page", engine: archivedSource.provider || "Archive" })),
+      { kind: "archive-link", query: `archived source ${sourceUrl}`, weight: 0.99, signal: archivedSource.capture || sourceUrl },
+      archivedSource.provider || "Archive"
+    );
+  }
+
   // Every enabled engine gets every generated query. Search engines may still apply
   // their own jurisdiction/account/index policies, but our code does not selectively
   // skip an engine because another engine returned "enough" results.
@@ -2248,6 +2634,8 @@ async function findAlternates({ url, title, description, provider, durationSecon
     if (privacy.searchDuckDuckGo) tasks.push(["DuckDuckGo", () => searchDuckDuckGo(querySpec.query)]);
     if (privacy.searchBing) tasks.push(["Bing", () => searchBing(querySpec.query)]);
     if (privacy.searchMojeek) tasks.push(["Mojeek", () => searchMojeek(querySpec.query)]);
+    if (privacy.searchBrave) tasks.push(["Brave", () => searchBrave(querySpec.query)]);
+    if (privacy.archiveLookups) tasks.push(["Internet Archive", () => searchInternetArchive(querySpec.query)]);
 
     const responses = await Promise.all(tasks.map(async ([engine, run]) => {
       try { return [engine, await run()]; }
@@ -2400,7 +2788,9 @@ async function findAlternates({ url, title, description, provider, durationSecon
       filenames: sourceSignals.filenames.slice(0, 8),
       mediaHosts: [...new Set(sourceSignals.mediaUrls.map(discoveryHost).filter(Boolean))].slice(0, 8),
       transcript: transcript ? { phrase: transcript.phrase, lang: transcript.lang, automatic: transcript.automatic } : null,
-      subjectAnchors: subjectAnchors.slice(0, 8)
+      subjectAnchors: subjectAnchors.slice(0, 8),
+      urlClues: { slugPhrase: urlClues.slugPhrase, phrases: urlClues.phrases.slice(0, 4), ids: urlClues.ids.slice(0, 8) },
+      archivedSource: archivedSource?.ok ? { provider: archivedSource.provider, capture: archivedSource.capture || null, recoveredTitle: archivedSource.metadata?.title || null, directCandidates: archivedSource.candidates?.length || 0 } : null
     },
     privacy,
     tools: {
@@ -2423,7 +2813,9 @@ async function findAlternates({ url, title, description, provider, durationSecon
       duckDuckGoSafeSearch: "off-requested twice (kp=-2 + !safeoff)",
       bingSafeSearch: "off-requested (adlt=off, adlt_set=off, safeSearch=Off)",
       mojeekSafeSearch: "off-requested (safe=0)",
-      note: "DuckDuckGo is explicitly requested with kp=-2 and !safeoff; Mojeek with safe=0. Bing is requested with multiple off parameters. Any provider may still enforce jurisdiction/account/age policy outside this app."
+      braveSafeSearch: "off-requested (safesearch=off)",
+      internetArchive: "media catalog + Wayback/Common Crawl source recovery; no app SafeSearch filter",
+      note: "DuckDuckGo is explicitly requested with kp=-2 and !safeoff; Mojeek with safe=0; Bing with multiple off parameters; Brave with safesearch=off. Archive.org media search and archived source recovery are also used when enabled. Providers may still enforce their own jurisdiction/account/index policy outside this app."
     },
     candidateCount: gathered.length,
     rawDiscoveredCount: gathered.length,
@@ -2432,6 +2824,7 @@ async function findAlternates({ url, title, description, provider, durationSecon
     evaluatedCount: prioritized.length,
     toolEvaluatedCount: toolTargets.length,
     manualSearchUrl: privacy.searchDuckDuckGo && queries[0] ? `https://duckduckgo.com/?q=${encodeURIComponent(`${queries[0].query} !safeoff`)}&kp=-2` : null,
+    archiveRecovery: archivedSource ? { ok: Boolean(archivedSource.ok), provider: archivedSource.provider || null, capture: archivedSource.capture || null, error: archivedSource.error || null, attempts: (archivedSource.attempts || []).map((item) => ({ provider: item.provider, ok: Boolean(item.ok), error: item.error || null })) } : null,
     cached: false,
     note: toolsDir
       ? "Discovery is host-agnostic: yt-dlp native and forced-generic extraction, raw page/embed/media identifiers, optional subtitle phrases, and general web search are combined. Unknown hosts are not rejected. Search provenance is used only for discovery/inspection priority; it can no longer create a likely-match label by itself. Unknown hosts are retained. Ranked results are subject-focused, while low-relevance inspected results and raw discovery remain visible separately so relevance filtering never becomes hidden censorship. Candidate identity labels require evidence recovered from the candidate itself, and frame comparison is available for verification."
@@ -2506,7 +2899,7 @@ app.use(express.json({ limit: "1mb" }));
 app.get("/api/status", (_req, res) => {
   res.json({
     ok: true,
-    version: "2.5.0",
+    version: "2.6.0",
     limits: {
       globalNetwork: GLOBAL_NETWORK_LIMIT,
       perHostNetwork: PER_HOST_NETWORK_LIMIT,
@@ -2658,7 +3051,7 @@ app.get("/api/preview", previewHandler);
 app.post("/api/preview", previewHandler);
 
 app.listen(PORT, "127.0.0.1", () => {
-  console.log(`Video preview engine v2.4.0 listening on http://127.0.0.1:${PORT}`);
+  console.log(`Video preview engine v2.6.0 listening on http://127.0.0.1:${PORT}`);
   console.log(`Network limits: ${GLOBAL_NETWORK_LIMIT} global / ${PER_HOST_NETWORK_LIMIT} per host.`);
   console.log(`Edge fallback: ${BROWSER_FALLBACK_LIMIT} isolated helper worker; helper proxy limit ${BROWSER_PROXY_NETWORK_LIMIT}.`);
 });
