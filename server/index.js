@@ -12,6 +12,7 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
+import { ensureLocalSearxng, localSearxngRuntimeStatus } from "./searxng-local.js";
 
 const PORT = 3000;
 const USER_AGENT =
@@ -200,7 +201,9 @@ function normalizeSearxngResults(data) {
 }
 
 async function searchSearxng(query, endpoint = SEARXNG_DEFAULT_ENDPOINT) {
-  const response = await fetchSearxngJson(endpoint, "search", {
+  const normalizedEndpoint = normalizeSearxngEndpoint(endpoint);
+  if (isLoopbackSearxngEndpoint(normalizedEndpoint)) await ensureLocalSearxng();
+  const response = await fetchSearxngJson(normalizedEndpoint, "search", {
     q: query,
     format: "json",
     safesearch: 0,
@@ -222,8 +225,10 @@ async function searchSearxng(query, endpoint = SEARXNG_DEFAULT_ENDPOINT) {
 
 async function probeSearxng(endpoint = SEARXNG_DEFAULT_ENDPOINT) {
   const base = normalizeSearxngEndpoint(endpoint);
+  let localRuntime = null;
+  if (isLoopbackSearxngEndpoint(base)) localRuntime = await localSearxngRuntimeStatus({ autostart: true });
   const response = await fetchSearxngJson(base, "config");
-  if (!response.ok) return { ok: false, endpoint: base, status: response.status, error: response.error, local: isLoopbackSearxngEndpoint(base) };
+  if (!response.ok) return { ok: false, endpoint: base, status: response.status, error: localRuntime?.error || response.error, local: isLoopbackSearxngEndpoint(base), localRuntime };
   const data = response.data || {};
   const enabledEngines = (Array.isArray(data.engines) ? data.engines : []).filter((engine) => engine?.enabled !== false).map((engine) => engine.name).filter(Boolean);
   return {
@@ -234,7 +239,8 @@ async function probeSearxng(endpoint = SEARXNG_DEFAULT_ENDPOINT) {
     instanceName: data.instance_name || "SearXNG",
     safeSearchDefault: Number.isFinite(Number(data.safe_search)) ? Number(data.safe_search) : null,
     enabledEngines: enabledEngines.slice(0, 100),
-    engineCount: enabledEngines.length
+    engineCount: enabledEngines.length,
+    localRuntime
   };
 }
 
@@ -3217,6 +3223,15 @@ app.get("/api/image", async (req, res) => {
 });
 
 
+app.get("/api/searxng/local-runtime", async (_req, res) => {
+  try {
+    const result = await localSearxngRuntimeStatus({ autostart: true });
+    return res.status(result.ok ? 200 : 503).json(result);
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error?.message || "searxng_local_runtime_failed" });
+  }
+});
+
 app.get("/api/searxng/status", async (req, res) => {
   try {
     const endpoint = typeof req.query.endpoint === "string" ? req.query.endpoint : SEARXNG_DEFAULT_ENDPOINT;
@@ -3324,7 +3339,12 @@ app.get("/api/preview", previewHandler);
 app.post("/api/preview", previewHandler);
 
 app.listen(PORT, "127.0.0.1", () => {
-  console.log(`Video preview engine v2.6.0 listening on http://127.0.0.1:${PORT}`);
+  console.log(`Video preview engine v2.7.1 listening on http://127.0.0.1:${PORT}`);
   console.log(`Network limits: ${GLOBAL_NETWORK_LIMIT} global / ${PER_HOST_NETWORK_LIMIT} per host.`);
   console.log(`Edge fallback: ${BROWSER_FALLBACK_LIMIT} isolated helper worker; helper proxy limit ${BROWSER_PROXY_NETWORK_LIMIT}.`);
+  ensureLocalSearxng().then((status) => {
+    if (status.ok) console.log(`SearXNG local service ready at ${SEARXNG_DEFAULT_ENDPOINT} (${status.root || "existing process"}).`);
+    else if (status.state === "package_missing") console.log("SearXNG local package not found; Finder will use direct-engine fallback.");
+    else console.warn(`SearXNG local startup failed: ${status.error || status.state}`);
+  }).catch((error) => console.warn(`SearXNG local startup error: ${error?.message || error}`));
 });
