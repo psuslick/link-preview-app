@@ -35,6 +35,9 @@ const CACHE_MAX_ENTRIES = 1500;
 // Alternate/mirror discovery is intentionally small and user-triggered. It reuses
 // the same bounded network stack as previews instead of becoming a second crawler.
 const ALTERNATE_SEARCH_TIMEOUT_MS = 8000;
+const SEARXNG_DEFAULT_ENDPOINT = "http://127.0.0.1:8888";
+const SEARXNG_TIMEOUT_MS = 10_000;
+const SEARXNG_JSON_LIMIT_BYTES = 1024 * 1024;
 const ALTERNATE_SEARCH_MAX_RESULTS = 60;
 const ALTERNATE_CANDIDATE_PREVIEW_LIMIT = 72;
 const ALTERNATE_RAW_DISCOVERY_LIMIT = 1000;
@@ -84,6 +87,7 @@ const globalNetwork = new Semaphore(GLOBAL_NETWORK_LIMIT);
 const imageNetwork = new Semaphore(IMAGE_NETWORK_LIMIT);
 const browserFallback = new Semaphore(BROWSER_FALLBACK_LIMIT);
 const frameCompare = new Semaphore(1);
+const bingSearchGate = new Semaphore(1);
 const hostSemaphores = new Map();
 const hostThrottleState = new Map();
 const previewCache = new Map();
@@ -93,11 +97,13 @@ const authorizedBrowserProfiles = new Map();
 const hostReachability = new Map();
 const hostReachabilityChecks = new Map();
 const hostFirstRequestFlights = new Map();
+const bingSession = { state: "unverified", evidence: null, verifiedAt: null };
 
 const DEFAULT_PRIVACY = Object.freeze({
   browserFallback: true,
   interactiveAuthorization: true,
   mediaTools: true,
+  searchSearxng: true,
   searchDuckDuckGo: true,
   searchBing: true,
   searchMojeek: true,
@@ -117,6 +123,120 @@ function normalizePrivacy(value) {
   );
 }
 
+
+function normalizeSearxngEndpoint(raw) {
+  const value = String(raw || SEARXNG_DEFAULT_ENDPOINT).trim();
+  let url;
+  try { url = new URL(value); } catch { throw new Error("invalid_searxng_endpoint"); }
+  if (!["http:", "https:"].includes(url.protocol)) throw new Error("invalid_searxng_endpoint_protocol");
+  if (url.username || url.password) throw new Error("searxng_endpoint_credentials_not_allowed");
+  url.hash = "";
+  url.search = "";
+  url.pathname = `${url.pathname.replace(/\/+$/, "") || ""}/`;
+  return url.toString();
+}
+
+function isLoopbackSearxngEndpoint(endpoint) {
+  try {
+    const host = new URL(endpoint).hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    return host === "localhost" || host === "127.0.0.1" || host === "::1";
+  } catch { return false; }
+}
+
+async function fetchSearxngJson(endpoint, relativePath, params = {}) {
+  const base = normalizeSearxngEndpoint(endpoint);
+  const target = new URL(relativePath.replace(/^\//, ""), base);
+  for (const [key, value] of Object.entries(params)) if (value !== undefined && value !== null) target.searchParams.set(key, String(value));
+
+  if (!isLoopbackSearxngEndpoint(base)) {
+    if (target.protocol !== "https:") return { ok: false, status: 0, error: "remote_searxng_requires_https", data: null };
+    const response = await fetchBounded(target.toString(), { kind: "media-page", timeoutMs: SEARXNG_TIMEOUT_MS, retries: 0, headers: { Accept: "application/json" } });
+    if (!response.ok) return { ok: false, status: response.status || 0, error: response.error || `searxng_status_${response.status || 0}`, data: null };
+    try { return { ok: true, status: response.status, data: JSON.parse(response.text || "{}") }; }
+    catch { return { ok: false, status: response.status, error: "searxng_invalid_json", data: null }; }
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SEARXNG_TIMEOUT_MS);
+  try {
+    const response = await fetch(target, {
+      method: "GET",
+      redirect: "manual",
+      signal: controller.signal,
+      headers: { "User-Agent": USER_AGENT, Accept: "application/json", "Accept-Language": "en-US,en;q=0.9" }
+    });
+    const body = await readLimitedBody(response.body, SEARXNG_JSON_LIMIT_BYTES, false);
+    const text = body.buffer.toString("utf8");
+    if (!response.ok) return { ok: false, status: response.status, error: response.status === 403 ? "searxng_json_api_disabled" : `searxng_status_${response.status}`, data: null };
+    try { return { ok: true, status: response.status, data: JSON.parse(text || "{}") }; }
+    catch { return { ok: false, status: response.status, error: "searxng_invalid_json", data: null }; }
+  } catch (error) {
+    return { ok: false, status: 0, error: error?.name === "AbortError" ? "searxng_timeout" : error?.message || "searxng_unreachable", data: null };
+  } finally { clearTimeout(timer); }
+}
+
+function normalizeSearxngResults(data) {
+  const results = [];
+  const seen = new Set();
+  for (const item of Array.isArray(data?.results) ? data.results : []) {
+    const rawUrl = item?.url;
+    if (typeof rawUrl !== "string") continue;
+    let normalized;
+    try { normalized = validateUrl(rawUrl).toString(); } catch { continue; }
+    const key = canonicalDiscoveryUrl(normalized).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const engines = [...new Set([...(Array.isArray(item.engines) ? item.engines : []), item.engine].filter(Boolean).map(String))];
+    results.push({
+      url: normalized,
+      searchTitle: cleanSearchTitle(item.title || "") || null,
+      snippet: typeof item.content === "string" ? item.content.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim() : null,
+      engine: engines.length ? `SearXNG:${engines.slice(0, 6).join("+")}` : "SearXNG",
+      searxngEngines: engines
+    });
+    if (results.length >= 60) break;
+  }
+  return results;
+}
+
+async function searchSearxng(query, endpoint = SEARXNG_DEFAULT_ENDPOINT) {
+  const response = await fetchSearxngJson(endpoint, "search", {
+    q: query,
+    format: "json",
+    safesearch: 0,
+    categories: "general,videos",
+    language: "all",
+    pageno: 1
+  });
+  if (!response.ok) return { ok: false, status: response.status, results: [], error: response.error, endpoint: normalizeSearxngEndpoint(endpoint) };
+  const data = response.data || {};
+  return {
+    ok: true,
+    status: response.status,
+    results: normalizeSearxngResults(data),
+    endpoint: normalizeSearxngEndpoint(endpoint),
+    unresponsiveEngines: Array.isArray(data.unresponsive_engines) ? data.unresponsive_engines.slice(0, 30) : [],
+    suggestions: Array.isArray(data.suggestions) ? data.suggestions.slice(0, 10) : []
+  };
+}
+
+async function probeSearxng(endpoint = SEARXNG_DEFAULT_ENDPOINT) {
+  const base = normalizeSearxngEndpoint(endpoint);
+  const response = await fetchSearxngJson(base, "config");
+  if (!response.ok) return { ok: false, endpoint: base, status: response.status, error: response.error, local: isLoopbackSearxngEndpoint(base) };
+  const data = response.data || {};
+  const enabledEngines = (Array.isArray(data.engines) ? data.engines : []).filter((engine) => engine?.enabled !== false).map((engine) => engine.name).filter(Boolean);
+  return {
+    ok: true,
+    endpoint: base,
+    status: response.status,
+    local: isLoopbackSearxngEndpoint(base),
+    instanceName: data.instance_name || "SearXNG",
+    safeSearchDefault: Number.isFinite(Number(data.safe_search)) ? Number(data.safe_search) : null,
+    enabledEngines: enabledEngines.slice(0, 100),
+    engineCount: enabledEngines.length
+  };
+}
 
 function reachabilityKey(rawUrl) {
   try { return new URL(rawUrl).hostname.toLowerCase().replace(/^www\./, ""); }
@@ -1114,6 +1234,7 @@ const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const EDGE_HELPER_PATH = path.join(SERVER_DIR, "edge-fallback.js");
 const EDGE_AUTH_HELPER_PATH = path.join(SERVER_DIR, "edge-authorize.js");
 const EDGE_SESSION_HELPER_PATH = path.join(SERVER_DIR, "edge-session-probe.js");
+const BING_STATE_HELPER_PATH = path.join(SERVER_DIR, "edge-bing-state.js");
 const FRAME_COMPARE_HELPER_PATH = path.join(SERVER_DIR, "media-frame-compare.js");
 
 async function renderMetadataFromAuthorizedSession(targetUrl, debugPort) {
@@ -1955,11 +2076,101 @@ async function searchDuckDuckGo(query) {
   return { ok: true, status: response.status, results: parseDuckDuckGoResults(response.text) };
 }
 
+async function renderRawHtmlFromAuthorizedSession(targetUrl, debugPort) {
+  return await new Promise((resolve) => {
+    const child = spawn(process.execPath, ["--experimental-websocket", EDGE_SESSION_HELPER_PATH, targetUrl, String(debugPort), String(BROWSER_DOM_LIMIT_BYTES)], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    const chunks = [];
+    let bytes = 0;
+    let settled = false;
+    const finish = (value) => { if (settled) return; settled = true; clearTimeout(timer); resolve(value); };
+    const timer = setTimeout(() => { try { child.kill(); } catch {} finish({ ok: false, error: "bing_live_session_timeout" }); }, 10_000);
+    child.stdout.on("data", (chunk) => {
+      bytes += chunk.length;
+      if (bytes > BROWSER_DOM_LIMIT_BYTES * 2 + 256 * 1024) { try { child.kill(); } catch {} finish({ ok: false, error: "bing_live_session_output_too_large" }); return; }
+      chunks.push(chunk);
+    });
+    child.once("error", (error) => finish({ ok: false, error: error?.message || "bing_live_session_launch_failed" }));
+    child.once("close", () => {
+      if (settled) return;
+      try {
+        const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+        finish(parsed?.ok ? { ok: true, html: String(parsed.html || "") } : { ok: false, error: parsed?.error || "bing_live_session_failed" });
+      } catch { finish({ ok: false, error: "bing_live_session_invalid_output" }); }
+    });
+  });
+}
+
+async function renderRawHtmlWithAuthorizedProfile(targetUrl, profileDir) {
+  return await new Promise((resolve) => {
+    const child = spawn(process.execPath, [EDGE_HELPER_PATH, targetUrl, "9000", String(BROWSER_PROXY_NETWORK_LIMIT), String(PER_HOST_NETWORK_LIMIT), String(BROWSER_DOM_LIMIT_BYTES), profileDir], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    const chunks = [];
+    let bytes = 0;
+    let settled = false;
+    const finish = (value) => { if (settled) return; settled = true; clearTimeout(timer); resolve(value); };
+    const timer = setTimeout(() => {
+      if (process.platform === "win32" && child.pid) spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+      else try { child.kill("SIGKILL"); } catch {}
+      finish({ ok: false, error: "bing_profile_search_timeout" });
+    }, 11_000);
+    child.stdout.on("data", (chunk) => { bytes += chunk.length; if (bytes <= BROWSER_DOM_LIMIT_BYTES * 2 + 256 * 1024) chunks.push(chunk); });
+    child.once("error", (error) => finish({ ok: false, error: error?.message || "bing_profile_search_launch_failed" }));
+    child.once("close", () => {
+      if (settled) return;
+      try {
+        const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+        finish(parsed?.ok ? { ok: true, html: String(parsed.html || "") } : { ok: false, error: parsed?.error || "bing_profile_search_failed" });
+      } catch { finish({ ok: false, error: "bing_profile_search_invalid_output" }); }
+    });
+  });
+}
+
+async function probeBingSafeSearchState() {
+  const entry = authorizationEntryFor("https://www.bing.com/");
+  if (!entry) return { state: bingSession.state, evidence: bingSession.evidence, verifiedAt: bingSession.verifiedAt, session: "none" };
+  if (entry.status === "authorizing" && Number.isInteger(entry.debugPort)) {
+    const result = await new Promise((resolve) => {
+      const child = spawn(process.execPath, ["--experimental-websocket", BING_STATE_HELPER_PATH, String(entry.debugPort)], { windowsHide: true, stdio: ["ignore", "pipe", "ignore"] });
+      const chunks = [];
+      let settled = false;
+      const finish = (value) => { if (settled) return; settled = true; clearTimeout(timer); resolve(value); };
+      const timer = setTimeout(() => { try { child.kill(); } catch {} finish({ ok: false, state: "unverified", error: "bing_state_probe_timeout" }); }, 6000);
+      child.stdout.on("data", (chunk) => chunks.push(chunk));
+      child.once("error", (error) => finish({ ok: false, state: "unverified", error: error?.message || "bing_state_probe_failed" }));
+      child.once("close", () => { if (settled) return; try { finish(JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}")); } catch { finish({ ok: false, state: "unverified", error: "bing_state_probe_invalid_output" }); } });
+    });
+    if (result.ok && ["off", "moderate", "strict"].includes(result.state)) {
+      bingSession.state = result.state;
+      bingSession.evidence = result.evidence || null;
+      bingSession.verifiedAt = Date.now();
+    }
+    return { state: result.state || bingSession.state, evidence: result.evidence || bingSession.evidence, verifiedAt: bingSession.verifiedAt, session: "live", error: result.error || null };
+  }
+  return { state: bingSession.state, evidence: bingSession.evidence, verifiedAt: bingSession.verifiedAt, session: entry.status || "profile" };
+}
+
+async function launchBingSafeSearchConfiguration() {
+  const result = await launchAuthorizationBrowser("https://www.bing.com/account?adlt_set=off&pref_sbmt=1");
+  return { ...result, settingsUrl: "https://www.bing.com/account?adlt_set=off&pref_sbmt=1" };
+}
+
 async function searchBing(query) {
-  const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=25&setlang=en-US&adlt=off&adlt_set=off&safeSearch=Off`;
-  const response = await fetchBounded(url, { kind: "search", timeoutMs: ALTERNATE_SEARCH_TIMEOUT_MS, retries: 1 });
-  if (!response.ok) return { ok: false, status: response.status, results: [], error: response.error || `search_status_${response.status}` };
-  return { ok: true, status: response.status, results: parseBingResults(response.text) };
+  const release = await bingSearchGate.acquire();
+  try {
+    const state = await probeBingSafeSearchState();
+    if (state.state !== "off") return { ok: false, status: 0, results: [], error: `bing_safesearch_${state.state || "unverified"}_not_off`, safeSearchState: state.state || "unverified" };
+    const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=25&setlang=en-US`;
+    const live = authorizationLiveSessionFor("https://www.bing.com/");
+    const profile = authorizationProfileFor("https://www.bing.com/");
+    const rendered = live
+      ? await renderRawHtmlFromAuthorizedSession(url, live.debugPort)
+      : profile
+        ? await renderRawHtmlWithAuthorizedProfile(url, profile)
+        : { ok: false, error: "bing_profile_unavailable" };
+    if (!rendered.ok) return { ok: false, status: 0, results: [], error: rendered.error || "bing_session_search_failed", safeSearchState: state.state };
+    return { ok: true, status: 200, results: parseBingResults(rendered.html), safeSearchState: state.state, via: live ? "verified-live-edge-session" : "verified-edge-profile" };
+  } finally {
+    release();
+  }
 }
 
 async function runLimited(items, concurrency, worker) {
@@ -2526,8 +2737,9 @@ function balancedCandidateSelection(gatheredMap, searchBuckets, sourceTitle, lim
   return selected;
 }
 
-async function findAlternates({ url, title, description, provider, durationSeconds, privacy: privacyInput }) {
+async function findAlternates({ url, title, description, provider, durationSeconds, privacy: privacyInput, searxngEndpoint: searxngEndpointInput }) {
   const privacy = normalizePrivacy(privacyInput);
+  const searxngEndpoint = normalizeSearxngEndpoint(searxngEndpointInput || SEARXNG_DEFAULT_ENDPOINT);
   const sourceUrl = validateUrl(url).toString();
   const toolsDir = privacy.mediaTools ? await findToolsDir() : null;
   const urlClues = urlDiscoveryClues(sourceUrl);
@@ -2582,7 +2794,8 @@ async function findAlternates({ url, title, description, provider, durationSecon
   }
 
   const privacyKey = Object.entries(privacy).sort(([a],[b]) => a.localeCompare(b)).map(([key, value]) => `${key}:${value ? 1 : 0}`).join(",");
-  const cacheKey = `${canonicalDiscoveryUrl(sourceUrl)}|${source.title || ""}|${source.durationSeconds || 0}|${privacyKey}|${queries.map((q) => q.query).join("|")}`;
+  const bingStateForCache = privacy.searchBing ? (await probeBingSafeSearchState()).state : "disabled";
+  const cacheKey = `${canonicalDiscoveryUrl(sourceUrl)}|${source.title || ""}|${source.durationSeconds || 0}|${privacyKey}|bing:${bingStateForCache}|searxng:${privacy.searchSearxng ? searxngEndpoint : "disabled"}|${queries.map((q) => q.query).join("|")}`;
   const cached = alternateCacheGet(cacheKey);
   if (cached) return cached;
 
@@ -2629,12 +2842,36 @@ async function findAlternates({ url, title, description, provider, durationSecon
   // Every enabled engine gets every generated query. Search engines may still apply
   // their own jurisdiction/account/index policies, but our code does not selectively
   // skip an engine because another engine returned "enough" results.
+  let searxngEverHealthy = false;
   for (const querySpec of queries) {
+    let searxngResponse = null;
+    if (privacy.searchSearxng) {
+      try { searxngResponse = await searchSearxng(querySpec.query, searxngEndpoint); }
+      catch (error) { searxngResponse = { ok: false, status: 0, results: [], error: error?.message || "searxng_search_failed" }; }
+      searxngEverHealthy ||= Boolean(searxngResponse.ok);
+      searchDiagnostics.push({
+        engine: "SearXNG",
+        kind: querySpec.kind,
+        query: querySpec.query,
+        status: searxngResponse.status || 0,
+        error: searxngResponse.error || null,
+        found: searxngResponse.results?.length || 0,
+        safeSearchState: "0/off requested",
+        via: searxngResponse.endpoint || searxngEndpoint,
+        unresponsiveEngines: searxngResponse.unresponsiveEngines || []
+      });
+      addResults(searxngResponse.results || [], querySpec, "SearXNG");
+    }
+
+    // When SearXNG is healthy and returns useful results, let it replace our fragile
+    // direct DDG/Mojeek/Brave scrapers. If it is unavailable/sparse, fall back to the
+    // direct paths automatically. Verified-session Bing remains separate by design.
+    const useDirectFallback = !privacy.searchSearxng || !searxngResponse?.ok || (searxngResponse.results?.length || 0) < 3;
     const tasks = [];
-    if (privacy.searchDuckDuckGo) tasks.push(["DuckDuckGo", () => searchDuckDuckGo(querySpec.query)]);
+    if (useDirectFallback && privacy.searchDuckDuckGo) tasks.push(["DuckDuckGo", () => searchDuckDuckGo(querySpec.query)]);
     if (privacy.searchBing) tasks.push(["Bing", () => searchBing(querySpec.query)]);
-    if (privacy.searchMojeek) tasks.push(["Mojeek", () => searchMojeek(querySpec.query)]);
-    if (privacy.searchBrave) tasks.push(["Brave", () => searchBrave(querySpec.query)]);
+    if (useDirectFallback && privacy.searchMojeek) tasks.push(["Mojeek", () => searchMojeek(querySpec.query)]);
+    if (useDirectFallback && privacy.searchBrave) tasks.push(["Brave", () => searchBrave(querySpec.query)]);
     if (privacy.archiveLookups) tasks.push(["Internet Archive", () => searchInternetArchive(querySpec.query)]);
 
     const responses = await Promise.all(tasks.map(async ([engine, run]) => {
@@ -2649,7 +2886,9 @@ async function findAlternates({ url, title, description, provider, durationSecon
         query: querySpec.query,
         status: response.status || 0,
         error: response.error || null,
-        found: response.results?.length || 0
+        found: response.results?.length || 0,
+        safeSearchState: response.safeSearchState || null,
+        via: response.via || null
       });
       addResults(response.results || [], querySpec, engine);
     }
@@ -2811,11 +3050,13 @@ async function findAlternates({ url, title, description, provider, durationSecon
     searchDiagnostics,
     searchPolicy: {
       duckDuckGoSafeSearch: "off-requested twice (kp=-2 + !safeoff)",
-      bingSafeSearch: "off-requested (adlt=off, adlt_set=off, safeSearch=Off)",
+      bingSafeSearch: "requires verified Bing Edge session with ADLT=OFF; Finder skips Bing otherwise",
       mojeekSafeSearch: "off-requested (safe=0)",
       braveSafeSearch: "off-requested (safesearch=off)",
+      searxngSafeSearch: privacy.searchSearxng ? "off-requested (safesearch=0)" : "disabled",
+      searxngEndpoint: privacy.searchSearxng ? searxngEndpoint : null,
       internetArchive: "media catalog + Wayback/Common Crawl source recovery; no app SafeSearch filter",
-      note: "DuckDuckGo is explicitly requested with kp=-2 and !safeoff; Mojeek with safe=0; Bing with multiple off parameters; Brave with safesearch=off. Archive.org media search and archived source recovery are also used when enabled. Providers may still enforce their own jurisdiction/account/index policy outside this app."
+      note: `SearXNG ${privacy.searchSearxng ? (searxngEverHealthy ? "was healthy and served as the primary metasearch discovery backend with safesearch=0" : "was enabled but unavailable/sparse, so direct-engine fallback was used") : "is disabled"}. DuckDuckGo is explicitly requested with kp=-2 and !safeoff; Mojeek with safe=0; Brave with safesearch=off. Bing is only queried through a Sandbox Edge profile after SafeSearch Off is verified from Bing session cookies; otherwise Bing is skipped rather than silently searching Moderate. Archive.org media search and archived source recovery are also used when enabled.`
     },
     candidateCount: gathered.length,
     rawDiscoveredCount: gathered.length,
@@ -2824,6 +3065,7 @@ async function findAlternates({ url, title, description, provider, durationSecon
     evaluatedCount: prioritized.length,
     toolEvaluatedCount: toolTargets.length,
     manualSearchUrl: privacy.searchDuckDuckGo && queries[0] ? `https://duckduckgo.com/?q=${encodeURIComponent(`${queries[0].query} !safeoff`)}&kp=-2` : null,
+    searxng: { enabled: privacy.searchSearxng, endpoint: searxngEndpoint, healthy: searxngEverHealthy },
     archiveRecovery: archivedSource ? { ok: Boolean(archivedSource.ok), provider: archivedSource.provider || null, capture: archivedSource.capture || null, error: archivedSource.error || null, attempts: (archivedSource.attempts || []).map((item) => ({ provider: item.provider, ok: Boolean(item.ok), error: item.error || null })) } : null,
     cached: false,
     note: toolsDir
@@ -2899,7 +3141,7 @@ app.use(express.json({ limit: "1mb" }));
 app.get("/api/status", (_req, res) => {
   res.json({
     ok: true,
-    version: "2.6.0",
+    version: "2.7.0",
     limits: {
       globalNetwork: GLOBAL_NETWORK_LIMIT,
       perHostNetwork: PER_HOST_NETWORK_LIMIT,
@@ -2974,6 +3216,36 @@ app.get("/api/image", async (req, res) => {
   }
 });
 
+
+app.get("/api/searxng/status", async (req, res) => {
+  try {
+    const endpoint = typeof req.query.endpoint === "string" ? req.query.endpoint : SEARXNG_DEFAULT_ENDPOINT;
+    const result = await probeSearxng(endpoint);
+    return res.status(result.ok ? 200 : 503).json(result);
+  } catch (error) {
+    return res.status(400).json({ ok: false, error: error?.message || "searxng_status_failed" });
+  }
+});
+
+app.get("/api/bing-session/status", async (_req, res) => {
+  try {
+    const state = await probeBingSafeSearchState();
+    const entry = authorizationEntryFor("https://www.bing.com/");
+    return res.json({ ok: true, ...state, browserStatus: entry?.status || "none", live: entry?.status === "authorizing" && Number.isInteger(entry?.debugPort) });
+  } catch (error) {
+    return res.status(500).json({ ok: false, state: "unverified", error: error?.message || "bing_session_status_failed" });
+  }
+});
+
+app.post("/api/bing-session/configure", async (_req, res) => {
+  try {
+    const result = await launchBingSafeSearchConfiguration();
+    return res.json({ ok: true, ...result, note: "Configure Bing SafeSearch Off in this Sandbox-only Edge profile. Keep the window open until the app reports Off verified. Finder Bing searches will reuse this exact profile/session." });
+  } catch (error) {
+    return res.status(400).json({ ok: false, error: error?.message || "bing_session_configuration_failed" });
+  }
+});
+
 app.post("/api/authorize-host", async (req, res) => {
   const privacy = normalizePrivacy(req.body?.privacy);
   if (!privacy.interactiveAuthorization) return res.status(403).json({ error: "privacy_interactive_authorization_disabled" });
@@ -3030,7 +3302,8 @@ app.post("/api/alternates", async (req, res) => {
       description: req.body?.description,
       provider: req.body?.provider,
       durationSeconds: req.body?.durationSeconds,
-      privacy: req.body?.privacy
+      privacy: req.body?.privacy,
+      searxngEndpoint: req.body?.searxngEndpoint
     });
     return res.json(result);
   } catch (error) {

@@ -39,7 +39,7 @@ export async function fetchPreview(url, { signal, allowBrowserFallback = true, p
   }
 }
 
-export async function fetchAlternates(source, { signal, privacy } = {}) {
+export async function fetchAlternates(source, { signal, privacy, searxngEndpoint } = {}) {
   const started = performance.now();
   try {
     const response = await fetch(`${API_BASE}/alternates`, {
@@ -51,7 +51,8 @@ export async function fetchAlternates(source, { signal, privacy } = {}) {
         description: source.description || null,
         provider: source.provider || null,
         durationSeconds: source.durationSeconds || null,
-        privacy: privacy || null
+        privacy: privacy || null,
+        searxngEndpoint: searxngEndpoint || null
       }),
       signal
     });
@@ -135,5 +136,39 @@ export async function authorizationStatus(url) {
     return { ...data, clientStatus: response.status, clientOk: response.ok };
   } catch (error) {
     return { status: "unknown", ready: false, clientOk: false, error: error?.message || "Failed to fetch" };
+  }
+}
+
+export async function bingSessionStatus() {
+  try {
+    const response = await fetch(`${API_BASE}/bing-session/status`);
+    const data = await response.json();
+    return { ...data, clientStatus: response.status, clientOk: response.ok };
+  } catch (error) {
+    return { ok: false, state: "unverified", clientOk: false, error: error?.message || "Failed to fetch" };
+  }
+}
+
+export async function configureBingSession() {
+  try {
+    const response = await fetch(`${API_BASE}/bing-session/configure`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    const data = await response.json();
+    return { ...data, clientStatus: response.status, clientOk: response.ok };
+  } catch (error) {
+    return { ok: false, state: "unverified", clientOk: false, error: error?.message || "Failed to fetch" };
+  }
+}
+
+
+export async function searxngStatus(endpoint) {
+  try {
+    const params = new URLSearchParams();
+    if (endpoint) params.set("endpoint", endpoint);
+    const response = await fetch(`${API_BASE}/searxng/status?${params.toString()}`);
+    let data;
+    try { data = await response.json(); } catch { data = { error: "invalid_json_response" }; }
+    return { ...data, clientStatus: response.status, clientOk: response.ok };
+  } catch (error) {
+    return { ok: false, clientOk: false, error: error?.message || "Failed to fetch" };
   }
 }

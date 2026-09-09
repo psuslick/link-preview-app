@@ -2,10 +2,13 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   authorizationStatus,
   authorizePreviewHost,
+  bingSessionStatus,
+  configureBingSession,
   compareVideoSamples,
   fetchAlternates,
   fetchPreview,
-  imageProxyUrl
+  imageProxyUrl,
+  searxngStatus
 } from "./api.js";
 import "./App.css";
 
@@ -14,11 +17,14 @@ const BROWSER_FALLBACK_CONCURRENCY = 1;
 const FINDER_CONCURRENCY = 2;
 const BATCH_COMPARE_LIMIT = 5;
 const PRIVACY_STORAGE_KEY = "linkPreviewPrivacyV1";
+const SEARXNG_ENDPOINT_STORAGE_KEY = "linkPreviewSearxngEndpointV1";
+const DEFAULT_SEARXNG_ENDPOINT = "http://127.0.0.1:8888";
 const FULL_PRIVACY = Object.freeze({
   remoteThumbnails: true,
   browserFallback: true,
   interactiveAuthorization: true,
   mediaTools: true,
+  searchSearxng: true,
   searchDuckDuckGo: true,
   searchBing: true,
   searchMojeek: true,
@@ -38,6 +44,11 @@ function loadPrivacySettings() {
     if (saved && typeof saved === "object") return { ...FULL_PRIVACY, ...saved };
   } catch {}
   return { ...FULL_PRIVACY };
+}
+
+function loadSearxngEndpoint() {
+  try { return localStorage.getItem(SEARXNG_ENDPOINT_STORAGE_KEY) || DEFAULT_SEARXNG_ENDPOINT; }
+  catch { return DEFAULT_SEARXNG_ENDPOINT; }
 }
 
 function PrivacyToggle({ checked, onChange, title, detail }) {
@@ -271,14 +282,64 @@ function App() {
   const finderRunningRef = useRef(new Set());
   const [privacy, setPrivacy] = useState(loadPrivacySettings);
   const [privacyOpen, setPrivacyOpen] = useState(false);
+  const [bingState, setBingState] = useState({ state: "unverified", browserStatus: "none", live: false, evidence: null });
+  const [bingBusy, setBingBusy] = useState(false);
+  const [searxngEndpoint, setSearxngEndpoint] = useState(loadSearxngEndpoint);
+  const [searxngState, setSearxngState] = useState({ ok: false, status: 0, error: "not_checked", engineCount: 0, local: true });
+  const [searxngBusy, setSearxngBusy] = useState(false);
 
   useEffect(() => {
     try { localStorage.setItem(PRIVACY_STORAGE_KEY, JSON.stringify(privacy)); } catch {}
   }, [privacy]);
 
+  useEffect(() => {
+    try { localStorage.setItem(SEARXNG_ENDPOINT_STORAGE_KEY, searxngEndpoint); } catch {}
+  }, [searxngEndpoint]);
+
+
+  async function refreshSearxngState() {
+    setSearxngBusy(true);
+    const result = await searxngStatus(searxngEndpoint);
+    setSearxngState(result);
+    setSearxngBusy(false);
+    return result;
+  }
+
+
+  async function refreshBingState() {
+    const result = await bingSessionStatus();
+    setBingState(result);
+    return result;
+  }
+
+  async function openBingConfiguration() {
+    setBingBusy(true);
+    const result = await configureBingSession();
+    if (!result?.ok) {
+      setCopyStatus(`Could not open Bing configuration: ${result?.error || "unknown error"}`);
+      setTimeout(() => setCopyStatus(""), 3500);
+    } else {
+      setCopyStatus("Bing settings opened in the Sandbox profile. Set SafeSearch to Off and leave the window open until status says Off verified.");
+      setTimeout(() => setCopyStatus(""), 5000);
+    }
+    await refreshBingState();
+    setBingBusy(false);
+  }
+
+  useEffect(() => {
+    refreshBingState();
+    refreshSearxngState();
+  }, []);
+
+  useEffect(() => {
+    if (!privacy.searchBing) return undefined;
+    const timer = setInterval(() => { refreshBingState(); }, bingState?.live || bingState?.browserStatus === "authorizing" ? 2500 : 10000);
+    return () => clearInterval(timer);
+  }, [privacy.searchBing, bingState?.live, bingState?.browserStatus]);
+
   const enabledPrivacyCount = useMemo(() => Object.values(privacy).filter(Boolean).length, [privacy]);
   const finderSearchEnabled = useMemo(() =>
-    (privacy.searchDuckDuckGo || privacy.searchBing || privacy.searchMojeek || privacy.searchBrave || privacy.archiveLookups) &&
+    (privacy.searchSearxng || privacy.searchDuckDuckGo || privacy.searchBing || privacy.searchMojeek || privacy.searchBrave || privacy.archiveLookups) &&
     (privacy.searchTitleUploader || privacy.searchMediaIds || privacy.searchDescription || privacy.searchTranscript), [privacy]);
   function setPrivacyOption(key, value) { setPrivacy((current) => ({ ...current, [key]: Boolean(value) })); }
 
@@ -496,7 +557,7 @@ function App() {
     );
     const jobs = sources.filter((source) => !activeSourceUrls.has(source.url.toLowerCase())).map((source, index) => ({
       id: `finder-${now}-${index}-${Math.random().toString(36).slice(2, 7)}`,
-      source: { ...source }, privacy: { ...privacy }, state: "queued", results: [], lowRelevanceResults: [], error: null, queuedAt: Date.now(),
+      source: { ...source }, privacy: { ...privacy }, searxngEndpoint, state: "queued", results: [], lowRelevanceResults: [], error: null, queuedAt: Date.now(),
       note: null, diagnostics: [], queryEvidence: [], candidateCount: 0, rawDiscovered: [], rawDiscoveredCount: 0, evaluatedCount: 0, toolEvaluatedCount: 0, batchCompareState: "idle", batchCompareProgress: null
     }));
     if (!jobs.length) { setCopyStatus("Selected videos are already queued/running"); setTimeout(() => setCopyStatus(""), 2200); return; }
@@ -507,7 +568,7 @@ function App() {
 
   async function executeFinderJob(job) {
     patchFinderJob(job.id, { state: "running", startedAt: Date.now(), error: null });
-    const result = await fetchAlternates(job.source, { privacy: job.privacy || privacy });
+    const result = await fetchAlternates(job.source, { privacy: job.privacy || privacy, searxngEndpoint: job.searxngEndpoint || searxngEndpoint });
     if (!result.clientOk) {
       patchFinderJob(job.id, { state: "failed", finishedAt: Date.now(), error: result.error || `Search failed (${result.clientStatus || "network"})`, clientMs: result.clientMs });
       return;
@@ -532,7 +593,8 @@ function App() {
       tools: result.tools || null,
       searchPolicy: result.searchPolicy || null,
       queryEvidence: result.queryEvidence || [],
-      archiveRecovery: result.archiveRecovery || null
+      archiveRecovery: result.archiveRecovery || null,
+      searxng: result.searxng || null
     });
   }
 
@@ -550,7 +612,7 @@ function App() {
   }, [finderJobs]);
 
   function retryFinderJob(job) {
-    patchFinderJob(job.id, { state: "queued", privacy: { ...privacy }, results: [], lowRelevanceResults: [], rawDiscovered: [], rawDiscoveredCount: 0, error: null, diagnostics: [], queryEvidence: [], archiveRecovery: null, cached: false, batchCompareState: "idle", batchCompareProgress: null });
+    patchFinderJob(job.id, { state: "queued", privacy: { ...privacy }, searxngEndpoint, results: [], lowRelevanceResults: [], rawDiscovered: [], rawDiscoveredCount: 0, error: null, diagnostics: [], queryEvidence: [], archiveRecovery: null, cached: false, batchCompareState: "idle", batchCompareProgress: null });
   }
   function removeFinderJob(id) { setFinderJobs((current) => current.filter((job) => job.id !== id)); }
   function clearCompletedFinderJobs() { setFinderJobs((current) => current.filter((job) => ["queued", "running"].includes(job.state))); }
@@ -748,8 +810,30 @@ function App() {
               </div>
               <div className="privacy-group"><h3>Version Finder — destinations</h3>
                 <PrivacyToggle checked={privacy.mediaTools} onChange={(v) => setPrivacyOption("mediaTools", v)} title="Media-tool probing" detail="Allows yt-dlp/Deno to inspect selected and candidate public video pages/CDNs inside Sandbox." />
+                <PrivacyToggle checked={privacy.searchSearxng} onChange={(v) => setPrivacyOption("searchSearxng", v)} title="SearXNG metasearch" detail="Uses a SearXNG JSON API as the primary general-web discovery layer with Safe Search requested off (0). Direct DDG/Mojeek/Brave remain automatic fallback when SearXNG is unavailable or sparse." />
+                {privacy.searchSearxng && (
+                  <div className={`searxng-control ${searxngState?.ok ? "ready" : "unavailable"}`}>
+                    <div><strong>SearXNG</strong><span>{searxngState?.ok ? `${searxngState.instanceName || "SearXNG"} · ${searxngState.engineCount || 0} engines` : "Unavailable"}</span></div>
+                    <small>{searxngState?.ok ? `${searxngState.local ? "Local Sandbox endpoint" : "Remote endpoint"} · instance default SafeSearch ${searxngState.safeSearchDefault ?? "unknown"}; Finder still sends safesearch=0 on every query.` : (searxngState?.error || "Start a SearXNG instance or change the endpoint. Finder will fall back automatically while it is unavailable.")}</small>
+                    <div className="searxng-endpoint-row">
+                      <input value={searxngEndpoint} onChange={(event) => setSearxngEndpoint(event.target.value)} spellCheck="false" aria-label="SearXNG endpoint" />
+                      <button type="button" onClick={refreshSearxngState} disabled={searxngBusy}>{searxngBusy ? "Testing…" : "Test"}</button>
+                    </div>
+                    {!/^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?(?:\/|$)/i.test(searxngEndpoint) && <small className="warning-text">Remote SearXNG endpoints receive your Finder queries and are operated by a third party. Local 127.0.0.1:8888 is preferred.</small>}
+                  </div>
+                )}
                 <PrivacyToggle checked={privacy.searchDuckDuckGo} onChange={(v) => setPrivacyOption("searchDuckDuckGo", v)} title="DuckDuckGo search" detail="Sends enabled finder queries to DuckDuckGo's public search endpoint." />
-                <PrivacyToggle checked={privacy.searchBing} onChange={(v) => setPrivacyOption("searchBing", v)} title="Bing search" detail="Sends enabled finder queries to Bing's public search endpoint." />
+                <PrivacyToggle checked={privacy.searchBing} onChange={(v) => setPrivacyOption("searchBing", v)} title="Bing search" detail="Uses a dedicated Sandbox Edge/Bing profile. Finder skips Bing unless SafeSearch Off has been verified for that session." />
+                {privacy.searchBing && (
+                  <div className={`bing-session-control ${bingState?.state || "unverified"}`}>
+                    <div><strong>Bing SafeSearch</strong><span>{bingState?.state === "off" ? "Off verified" : bingState?.state === "moderate" ? "Moderate detected" : bingState?.state === "strict" ? "Strict detected" : "Unverified"}</span></div>
+                    <small>{bingState?.evidence || "Configure the disposable Sandbox Bing profile once per Sandbox session. Finder will not use Bing while Off is unverified."}</small>
+                    <div className="bing-session-actions">
+                      <button type="button" onClick={openBingConfiguration} disabled={bingBusy}>{bingBusy ? "Opening…" : "Configure Bing Off"}</button>
+                      <button type="button" onClick={refreshBingState}>Refresh status</button>
+                    </div>
+                  </div>
+                )}
                 <PrivacyToggle checked={privacy.searchMojeek} onChange={(v) => setPrivacyOption("searchMojeek", v)} title="Mojeek search" detail="Sends enabled finder queries to Mojeek's public search endpoint." />
                 <PrivacyToggle checked={privacy.searchBrave} onChange={(v) => setPrivacyOption("searchBrave", v)} title="Brave Search" detail="Uses Brave's independent web index with Safe Search explicitly requested off." />
                 <PrivacyToggle checked={privacy.archiveLookups} onChange={(v) => setPrivacyOption("archiveLookups", v)} title="Archive discovery" detail="Queries Archive.org media search plus Wayback/Common Crawl captures to recover dead or poorly indexed source clues and archived outbound embeds." />
@@ -1017,7 +1101,7 @@ function App() {
                       <details className="alternate-diagnostics">
                         <summary>Discovery diagnostics</summary>
                         <p>{job.note}</p>
-                        {job.privacy && <div className="alternate-diagnostic-row"><strong>Privacy snapshot</strong><span>{[job.privacy.searchDuckDuckGo && "DDG", job.privacy.searchBing && "Bing", job.privacy.searchMojeek && "Mojeek", job.privacy.searchBrave && "Brave", job.privacy.archiveLookups && "Archives"].filter(Boolean).join("+") || "no search engines"}</span><span>{job.privacy.mediaTools ? "media tools on" : "media tools off"}</span><code>{[job.privacy.searchTranscript && "transcript", job.privacy.searchDescription && "description", job.privacy.searchMediaIds && "media IDs", job.privacy.searchTitleUploader && "title/uploader"].filter(Boolean).join(" · ") || "no query signals"}</code></div>}
+                        {job.privacy && <div className="alternate-diagnostic-row"><strong>Privacy snapshot</strong><span>{[job.privacy.searchSearxng && "SearXNG", job.privacy.searchDuckDuckGo && "DDG", job.privacy.searchBing && "Bing", job.privacy.searchMojeek && "Mojeek", job.privacy.searchBrave && "Brave", job.privacy.archiveLookups && "Archives"].filter(Boolean).join("+") || "no search engines"}</span><span>{job.privacy.mediaTools ? "media tools on" : "media tools off"}</span><code>{[job.privacy.searchTranscript && "transcript", job.privacy.searchDescription && "description", job.privacy.searchMediaIds && "media IDs", job.privacy.searchTitleUploader && "title/uploader"].filter(Boolean).join(" · ") || "no query signals"}</code></div>}
                         {job.tools && (
                           <div className="alternate-diagnostic-row discovery-tool-row">
                             <strong>Media tools</strong><span>{job.tools.installed ? "installed" : "not found"}</span>
@@ -1025,7 +1109,8 @@ function App() {
                             <code>{job.tools.sourceMode || "—"}{job.tools.sourceExtractor ? ` / ${job.tools.sourceExtractor}` : ""}</code>
                           </div>
                         )}
-                        {job.searchPolicy && <div className="alternate-diagnostic-row"><strong>Search filtering</strong><span>DDG · Bing · Mojeek · Brave: Safe Search off requested</span><span>Archives: no app SafeSearch filter</span><code>{job.searchPolicy.note}</code></div>}
+                        {job.searxng && <div className="alternate-diagnostic-row"><strong>SearXNG</strong><span>{job.searxng.healthy ? "healthy" : "fallback used"}</span><span>{job.searxng.endpoint || job.searxngEndpoint || "—"}</span><code>{job.searxng.enabled ? "primary metasearch when healthy" : "disabled"}</code></div>}
+                        {job.searchPolicy && <div className="alternate-diagnostic-row"><strong>Search filtering</strong><span>SearXNG: safesearch=0 · DDG/Mojeek/Brave: off requested · Bing: verified Off session required</span><span>Archives: no app SafeSearch filter</span><code>{job.searchPolicy.note}</code></div>}
                         {job.sourceSignals?.urlClues && <div className="alternate-diagnostic-row"><strong>URL clues</strong><span>{job.sourceSignals.urlClues.slugPhrase || "no readable slug"}</span><span>{(job.sourceSignals.urlClues.ids || []).length} IDs</span><code>{(job.sourceSignals.urlClues.phrases || []).join(" · ") || "—"}</code></div>}
                         {job.sourceSignals?.archivedSource && <div className="alternate-diagnostic-row"><strong>Archived source</strong><span>{job.sourceSignals.archivedSource.provider || "archive"}</span><span>{job.sourceSignals.archivedSource.directCandidates || 0} outbound candidates</span><code>{job.sourceSignals.archivedSource.recoveredTitle || job.sourceSignals.archivedSource.capture || "metadata recovered"}</code></div>}
                         {job.archiveRecovery && <div className="alternate-diagnostic-row"><strong>Archive recovery</strong><span>{job.archiveRecovery.ok ? "recovered" : "not recovered"}</span><span>{job.archiveRecovery.provider || "Wayback + Common Crawl"}</span><code>{(job.archiveRecovery.attempts || []).map((item) => `${item.provider}:${item.ok ? "ok" : item.error || "miss"}`).join(" · ") || job.archiveRecovery.error || "—"}</code></div>}

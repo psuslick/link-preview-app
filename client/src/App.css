@@ -1149,3 +1149,73 @@ button:disabled { opacity: 0.42; cursor: default; }
   overflow-wrap: anywhere;
 }
 .warning-text { color: #d6b874 !important; }
+
+.bing-session-control {
+  margin: 8px 10px 12px;
+  padding: 10px 12px;
+  border: 1px solid #263547;
+  border-radius: 8px;
+  background: #111923;
+}
+.bing-session-control > div:first-child {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+}
+.bing-session-control strong { color: #d6e0ec; }
+.bing-session-control span { color: #9aa9bb; font-size: 0.78rem; }
+.bing-session-control.off span { color: #9fd4ad; }
+.bing-session-control.moderate span,
+.bing-session-control.strict span { color: #e0b477; }
+.bing-session-control small {
+  display: block;
+  margin-top: 5px;
+  color: #8190a3;
+  line-height: 1.35;
+}
+.bing-session-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 9px;
+}
+
+.searxng-control {
+  margin: 8px 10px 12px;
+  padding: 10px 12px;
+  border: 1px solid #263547;
+  border-radius: 8px;
+  background: #111923;
+}
+.searxng-control > div:first-child {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+}
+.searxng-control strong { color: #d6e0ec; }
+.searxng-control span { color: #9aa9bb; font-size: 0.78rem; }
+.searxng-control.ready span { color: #9fd4ad; }
+.searxng-control.unavailable span { color: #e0b477; }
+.searxng-control small {
+  display: block;
+  margin-top: 5px;
+  color: #8190a3;
+  line-height: 1.35;
+}
+.searxng-endpoint-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 9px;
+}
+.searxng-endpoint-row input {
+  min-width: 0;
+  flex: 1;
+  border: 1px solid #2b3b4e;
+  border-radius: 6px;
+  background: #0c131c;
+  color: #d6e0ec;
+  padding: 7px 9px;
+  font: inherit;
+  font-size: 0.82rem;
+}
