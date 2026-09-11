@@ -1,12 +1,12 @@
 const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:3000/api";
 
-export async function fetchPreview(url, { signal, allowBrowserFallback = true, privacy } = {}) {
+export async function fetchPreview(url, { signal, allowBrowserFallback = true, privacy, forceReachability = false } = {}) {
   const started = performance.now();
   try {
     const response = await fetch(`${API_BASE}/preview`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url, allowBrowserFallback, privacy: privacy || null }),
+      body: JSON.stringify({ url, allowBrowserFallback, privacy: privacy || null, forceReachability: Boolean(forceReachability) }),
       signal
     });
 

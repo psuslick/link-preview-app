@@ -47,8 +47,10 @@ const ALTERNATE_CACHE_TTL_MS = 10 * 60 * 1000;
 const ALTERNATE_CACHE_MAX_ENTRIES = 100;
 const ARCHIVE_LOOKUP_TIMEOUT_MS = 8000;
 const ARCHIVE_CAPTURE_LIMIT = 3;
-const HOST_DEAD_TTL_MS = 30 * 60 * 1000;
+const HOST_DEAD_TTL_MS = 10 * 60 * 1000;
 const HOST_ALIVE_TTL_MS = 5 * 60 * 1000;
+const HOST_REACHABILITY_CONFIRM_DELAY_MS = 850;
+const HOST_REACHABILITY_TIMEOUT_MS = 6000;
 
 // Browser fallback is deliberately much narrower than metadata fetching.
 const BROWSER_FALLBACK_LIMIT = 1;
@@ -263,9 +265,24 @@ function isNetworkUnavailableError(value) {
   return /(?:enotfound|eai_again|econnrefused|econnreset|enetunreach|ehostunreach|request_timeout|socket hang up|network timeout|tls|certificate|fetch failed)/.test(text);
 }
 
-async function confirmHostReachability(rawUrl, triggerResult = null) {
+// Only hard address/routing failures are strong enough to quarantine an entire host.
+// Timeouts, TLS/certificate problems, resets and generic fetch failures can all happen
+// transiently or because a site dislikes our lightweight client; those remain "unknown".
+function isHardHostUnreachableError(value) {
+  const text = String(value || "").toLowerCase();
+  return /(?:enotfound|econnrefused|enetunreach|ehostunreach|name[_ -]?not[_ -]?resolved|no such host)/.test(text);
+}
+
+function clearReachabilityState(rawUrl) {
+  const key = reachabilityKey(rawUrl);
+  if (!key) return;
+  hostReachability.delete(key);
+}
+
+async function confirmHostReachability(rawUrl, triggerResult = null, { force = false } = {}) {
   const target = validateUrl(rawUrl);
   const key = reachabilityKey(target.toString());
+  if (force) clearReachabilityState(target.toString());
   const existing = reachabilityStateFor(target.toString());
   if (existing) return existing;
   if (hostReachabilityChecks.has(key)) return await hostReachabilityChecks.get(key);
@@ -274,22 +291,54 @@ async function confirmHostReachability(rawUrl, triggerResult = null) {
     const schemes = target.protocol === "https:" ? ["https:", "http:"] : ["http:", "https:"];
     const roots = [...new Set(schemes.map((scheme) => `${scheme}//${target.host}/`))];
     const attempts = [];
-    for (const root of roots) {
-      const result = await fetchBounded(root, { kind: "html", timeoutMs: 3500, retries: 0 });
-      attempts.push({ url: root, status: result.status || 0, error: result.error || null });
-      // Any HTTP response proves the host is reachable, even 401/403/404/5xx.
-      if (result.status > 0) {
-        const state = { state: "alive", host: key, until: Date.now() + HOST_ALIVE_TTL_MS, attempts };
-        hostReachability.set(key, state);
-        return state;
+
+    const runRound = async (round) => {
+      const roundAttempts = [];
+      for (const root of roots) {
+        const result = await fetchBounded(root, { kind: "html", timeoutMs: HOST_REACHABILITY_TIMEOUT_MS, retries: 0 });
+        const attempt = { round, url: root, status: result.status || 0, error: result.error || null };
+        attempts.push(attempt);
+        roundAttempts.push(attempt);
+        // Any HTTP response proves the host exists/replied, even 401/403/404/5xx.
+        if (result.status > 0) {
+          const state = { state: "alive", host: key, until: Date.now() + HOST_ALIVE_TTL_MS, attempts, confirmations: round };
+          hostReachability.set(key, state);
+          return { state, roundAttempts };
+        }
       }
+      return { state: null, roundAttempts };
+    };
+
+    const first = await runRound(1);
+    if (first.state) return first.state;
+
+    const triggerHardFailure = triggerResult?.status === 0 && isHardHostUnreachableError(triggerResult?.error);
+    const firstRoundAllHard = first.roundAttempts.length > 0 && first.roundAttempts.every((item) => item.status === 0 && isHardHostUnreachableError(item.error));
+
+    // Never quarantine a host because of a timeout/reset/TLS problem or a single failed
+    // page request. Those are common on video hosts and anti-bot front doors.
+    if (!triggerHardFailure || !firstRoundAllHard) {
+      return { state: "unknown", host: key, until: Date.now() + 60_000, attempts, reason: triggerResult?.error || first.roundAttempts[0]?.error || "reachability_unconfirmed" };
     }
-    const triggerNetworkFailure = triggerResult?.status === 0 && isNetworkUnavailableError(triggerResult?.error);
-    const allNetworkFailures = attempts.length > 0 && attempts.every((item) => item.status === 0 && isNetworkUnavailableError(item.error));
-    const state = (triggerNetworkFailure || allNetworkFailures)
-      ? { state: "dead", host: key, until: Date.now() + HOST_DEAD_TTL_MS, attempts, reason: triggerResult?.error || attempts[0]?.error || "host_unreachable" }
-      : { state: "unknown", host: key, until: Date.now() + 60_000, attempts };
-    if (state.state !== "unknown") hostReachability.set(key, state);
+
+    await sleep(HOST_REACHABILITY_CONFIRM_DELAY_MS);
+    const second = await runRound(2);
+    if (second.state) return second.state;
+    const secondRoundAllHard = second.roundAttempts.length > 0 && second.roundAttempts.every((item) => item.status === 0 && isHardHostUnreachableError(item.error));
+
+    if (!secondRoundAllHard) {
+      return { state: "unknown", host: key, until: Date.now() + 60_000, attempts, reason: "reachability_unconfirmed" };
+    }
+
+    const state = {
+      state: "dead",
+      host: key,
+      until: Date.now() + HOST_DEAD_TTL_MS,
+      attempts,
+      confirmations: 2,
+      reason: triggerResult?.error || first.roundAttempts[0]?.error || "host_unreachable_confirmed"
+    };
+    hostReachability.set(key, state);
     return state;
   })().finally(() => hostReachabilityChecks.delete(key));
 
@@ -297,8 +346,9 @@ async function confirmHostReachability(rawUrl, triggerResult = null) {
   return await check;
 }
 
-async function fetchHostAwareInitialHtml(targetUrl) {
+async function fetchHostAwareInitialHtml(targetUrl, { forceReachability = false } = {}) {
   const key = reachabilityKey(targetUrl);
+  if (forceReachability) clearReachabilityState(targetUrl);
   const known = reachabilityStateFor(targetUrl);
   if (known?.state === "dead") return { deadState: known, htmlResult: null };
   if (known?.state === "alive" || !key) {
@@ -325,7 +375,7 @@ async function fetchHostAwareInitialHtml(targetUrl) {
       hostReachability.set(key, { state: "alive", host: key, until: Date.now() + HOST_ALIVE_TTL_MS, attempts: [{ url: targetUrl, status: htmlResult.status, error: null }] });
       return { deadState: null, htmlResult };
     }
-    const reachability = await confirmHostReachability(targetUrl, htmlResult);
+    const reachability = await confirmHostReachability(targetUrl, htmlResult, { force: forceReachability });
     if (reachability?.state === "dead") return { deadState: reachability, htmlResult };
     return { deadState: null, htmlResult };
   } finally {
@@ -355,6 +405,8 @@ function deadHostPreview(targetUrl, started, state, { skipped = true } = {}) {
     hostSuppressed: skipped,
     deadReason: state?.reason || "host_unreachable",
     deadHostName: state?.host || reachabilityKey(targetUrl),
+    reachabilityAttempts: Array.isArray(state?.attempts) ? state.attempts : [],
+    reachabilityConfirmations: state?.confirmations || 0,
     siteSessionRecommended: false,
     browserFallback: false,
     browserFallbackAttempted: false,
@@ -1454,10 +1506,14 @@ async function renderMetadataWithEdge(targetUrl) {
   }
 }
 
-async function createPreview(rawUrl, { allowBrowserFallback = true } = {}) {
+async function createPreview(rawUrl, { allowBrowserFallback = true, forceReachability = false } = {}) {
   const started = Date.now();
   const targetUrl = validateUrl(rawUrl).toString();
   const cacheKey = normalizeCacheKey(targetUrl);
+  if (forceReachability) {
+    clearReachabilityState(targetUrl);
+    previewCache.delete(cacheKey);
+  }
   const cached = cacheGet(cacheKey);
   if (cached) return { ...cached, elapsedMs: Date.now() - started };
 
@@ -1518,13 +1574,24 @@ async function createPreview(rawUrl, { allowBrowserFallback = true } = {}) {
     return value;
   }
 
-  const initialHostFetch = await fetchHostAwareInitialHtml(targetUrl);
+  const initialHostFetch = await fetchHostAwareInitialHtml(targetUrl, { forceReachability });
   if (initialHostFetch.deadState) {
     return deadHostPreview(targetUrl, started, initialHostFetch.deadState, { skipped: !initialHostFetch.htmlResult });
   }
   const htmlResult = initialHostFetch.htmlResult;
   const httpChallenge = detectChallengePage(htmlResult.text, htmlResult.status);
   if (httpChallenge) markChallengeCircuit(targetUrl);
+
+  let confirmedGoneStatus = 0;
+  let goneConfirmation = null;
+  if (!httpChallenge && [404, 410].includes(htmlResult.status)) {
+    // A single 404 can be a consent/session edge case on video hosts. Confirm the
+    // exact URL once more before moving it to Dead Links.
+    await sleep(250);
+    goneConfirmation = await fetchBounded(targetUrl, { kind: "html", timeoutMs: 6000, retries: 0 });
+    const confirmationChallenge = detectChallengePage(goneConfirmation.text, goneConfirmation.status);
+    if (goneConfirmation.status === htmlResult.status && !confirmationChallenge) confirmedGoneStatus = htmlResult.status;
+  }
   const httpMetadata = htmlResult.ok && !httpChallenge
     ? extractHtmlMetadata(htmlResult.text, htmlResult.finalUrl || targetUrl)
     : null;
@@ -1643,17 +1710,19 @@ async function createPreview(rawUrl, { allowBrowserFallback = true } = {}) {
         httpChallenge ||
         browserChallenge ||
         needsBrowserFallback ||
-        (browserFallbackAttempted && browserError)
+        (browserFallbackAttempted && browserError) ||
+        ([404, 410].includes(htmlResult.status) && !confirmedGoneStatus)
       )
     ),
     needsBrowserFallback: needsBrowserFallback && !allowBrowserFallback,
     extractorStats: httpMetadata?.extractorStats || null,
     browserExtractorStats,
-    deadLink: Boolean([404, 410].includes(htmlResult.status)),
+    deadLink: Boolean(confirmedGoneStatus),
     deadHost: false,
     hostSuppressed: false,
-    deadReason: [404, 410].includes(htmlResult.status) ? `url_gone_${htmlResult.status}` : null,
-    deadHostName: null
+    deadReason: confirmedGoneStatus ? `url_gone_${confirmedGoneStatus}_confirmed` : null,
+    deadHostName: null,
+    goneConfirmationStatus: goneConfirmation?.status || null
   };
 
   if ((value.image || value.title) && !value.needsBrowserFallback && !value.deadLink) cacheSet(cacheKey, value);
@@ -3179,7 +3248,8 @@ async function previewHandler(req, res) {
     const privacy = normalizePrivacy(req.method === "POST" ? req.body?.privacy : null);
     const allowBrowserFallback = privacy.browserFallback &&
       (req.method === "POST" ? req.body?.allowBrowserFallback !== false : req.query.browser !== "0");
-    const preview = await createPreview(targetUrl.trim(), { allowBrowserFallback });
+    const forceReachability = req.method === "POST" ? req.body?.forceReachability === true : req.query.force === "1";
+    const preview = await createPreview(targetUrl.trim(), { allowBrowserFallback, forceReachability });
     return res.json(preview);
   } catch (error) {
     const message = error?.message || "preview_failed";
@@ -3339,7 +3409,7 @@ app.get("/api/preview", previewHandler);
 app.post("/api/preview", previewHandler);
 
 app.listen(PORT, "127.0.0.1", () => {
-  console.log(`Video preview engine v2.7.1 listening on http://127.0.0.1:${PORT}`);
+  console.log(`Video preview engine v2.7.2 listening on http://127.0.0.1:${PORT}`);
   console.log(`Network limits: ${GLOBAL_NETWORK_LIMIT} global / ${PER_HOST_NETWORK_LIMIT} per host.`);
   console.log(`Edge fallback: ${BROWSER_FALLBACK_LIMIT} isolated helper worker; helper proxy limit ${BROWSER_PROXY_NETWORK_LIMIT}.`);
   ensureLocalSearxng().then((status) => {

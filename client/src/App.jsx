@@ -400,7 +400,7 @@ function App() {
     }));
   }
 
-  async function processItems(items) {
+  async function processItems(items, { forceReachability = false } = {}) {
     if (!items.length) return;
     setProcessing(true);
     const browserFallbackItems = [];
@@ -408,7 +408,7 @@ function App() {
     try {
       await runPool(items, async (item) => {
         patchPreview(item.id, { state: "loading", error: null });
-        const result = await fetchPreview(item.url, { allowBrowserFallback: false, privacy });
+        const result = await fetchPreview(item.url, { allowBrowserFallback: false, privacy, forceReachability: forceReachability && Boolean(item.deadLink) });
         patchPreview(item.id, {
           ...result,
           state: result.clientOk ? "ready" : "failed",
@@ -433,7 +433,7 @@ function App() {
         for (const [host, hostItems] of fallbackGroups) {
           const first = hostItems[0];
           patchPreview(first.id, { state: "loading", error: null, method: "edge-fallback-queued" });
-          const result = await fetchPreview(first.url, { allowBrowserFallback: true, privacy });
+          const result = await fetchPreview(first.url, { allowBrowserFallback: true, privacy, forceReachability: forceReachability && Boolean(first.deadLink) });
           patchPreview(first.id, {
             ...result,
             state: result.clientOk ? "ready" : "failed",
@@ -458,7 +458,7 @@ function App() {
         if (remainingFallbackItems.length) {
           await runPool(remainingFallbackItems, async (item) => {
             patchPreview(item.id, { state: "loading", error: null, method: "edge-fallback-queued" });
-            const result = await fetchPreview(item.url, { allowBrowserFallback: true, privacy });
+            const result = await fetchPreview(item.url, { allowBrowserFallback: true, privacy, forceReachability: forceReachability && Boolean(item.deadLink) });
             patchPreview(item.id, {
               ...result,
               state: result.clientOk ? "ready" : "failed",
@@ -480,9 +480,9 @@ function App() {
     }
   }
 
-  async function processSinglePreview(item, extraPatch = {}) {
+  async function processSinglePreview(item, extraPatch = {}, { forceReachability = false } = {}) {
     patchPreview(item.id, { state: "loading", error: null, method: "retrying", ...extraPatch });
-    const result = await fetchPreview(item.url, { allowBrowserFallback: privacy.browserFallback, privacy });
+    const result = await fetchPreview(item.url, { allowBrowserFallback: privacy.browserFallback, privacy, forceReachability });
     patchPreview(item.id, {
       ...result,
       state: result.clientOk ? "ready" : "failed",
@@ -544,7 +544,17 @@ function App() {
   }
   async function retryFailed() {
     if (processing) return;
-    await processItems(visiblePreviews.filter((item) => item.state === "failed" || item.deadLink));
+    await processItems(visiblePreviews.filter((item) => item.state === "failed" || item.deadLink), { forceReachability: true });
+  }
+
+  async function recheckDeadPreview(preview) {
+    if (processing) return;
+    setProcessing(true);
+    try {
+      await processSinglePreview(preview, { authorizationMessage: "Rechecking URL/host reachability…" }, { forceReachability: true });
+    } finally {
+      setProcessing(false);
+    }
   }
 
   function queueSelectedVersionSearches() {
@@ -916,7 +926,12 @@ function App() {
                         </div>
                         <h2>{preview.title || (preview.state === "failed" ? "Preview failed" : "Video preview")}</h2>
                         {preview.description && <p>{preview.description}</p>}
-                        {preview.deadLink && <p className="warning-message">{preview.deadHost ? `Host ${preview.deadHostName || domainFor(preview.url)} was confirmed unreachable; additional links on this host are skipped for this Sandbox session instead of repeatedly pinging it.` : "This individual URL returned 404/410. The host remains eligible for other links."} Version Finder can still use URL and archive clues.</p>}
+                        {preview.deadLink && (
+                          <div className="challenge-box">
+                            <p className="warning-message">{preview.deadHost ? `Host ${preview.deadHostName || domainFor(preview.url)} was confirmed unreachable after repeated hard network failures; sibling links were suppressed to avoid repeated network traffic.` : "This individual URL returned the same 404/410 twice. The host itself remains eligible for other links."} Version Finder can still use URL and archive clues.</p>
+                            <div className="challenge-actions"><button type="button" onClick={() => recheckDeadPreview(preview)} disabled={processing}>Recheck URL/host</button></div>
+                          </div>
+                        )}
                         {siteSessionEligible && preview.state !== "failed" && (
                           <div className="challenge-box">
                             <p className="warning-message">
@@ -969,6 +984,7 @@ function App() {
                               <div><dt>Client network</dt><dd>{preview.clientNetworkError || "none"}</dd></div>
                               <div><dt>Warning</dt><dd>{preview.warning || "none"}</dd></div>
                               <div><dt>Dead link</dt><dd>{preview.deadLink ? (preview.deadHost ? `host unreachable${preview.hostSuppressed ? " · suppressed" : ""}` : preview.deadReason || "yes") : "no"}</dd></div>
+                              <div><dt>Host reachability confirmations</dt><dd>{preview.reachabilityConfirmations || "—"}</dd></div>
                               <div><dt>Error</dt><dd>{preview.error || "none"}</dd></div>
                             </dl>
                           </details>
@@ -980,7 +996,7 @@ function App() {
               </section>
             </>
           )}
-          {!visiblePreviews.length && <section className="empty-workspace"><strong>{activeTab === "dead" ? "No dead links" : "No previews yet"}</strong><p>{activeTab === "dead" ? "Confirmed unreachable hosts and individual 404/410 URLs are moved here automatically. They can still be queued into Version Finder using URL/archive clues." : "Paste video URLs above to begin."}</p></section>}
+          {!visiblePreviews.length && <section className="empty-workspace"><strong>{activeTab === "dead" ? "No dead links" : "No previews yet"}</strong><p>{activeTab === "dead" ? "Hosts confirmed unreachable by repeated hard network failures and individual URLs confirmed 404/410 twice are moved here automatically. They can still be queued into Version Finder using URL/archive clues." : "Paste video URLs above to begin."}</p></section>}
         </>
       )}
 
