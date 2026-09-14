@@ -172,3 +172,14 @@ export async function searxngStatus(endpoint) {
     return { ok: false, clientOk: false, error: error?.message || "Failed to fetch" };
   }
 }
+
+export async function networkStatus() {
+  try {
+    const response = await fetch(`${API_BASE}/network-status`, { cache: "no-store" });
+    let data;
+    try { data = await response.json(); } catch { data = { error: "invalid_json_response" }; }
+    return { ...data, clientStatus: response.status, clientOk: response.ok };
+  } catch (error) {
+    return { ok: false, clientOk: false, error: error?.message || "Failed to fetch" };
+  }
+}

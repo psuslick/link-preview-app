@@ -6,6 +6,7 @@ import http from "node:http";
 import https from "node:https";
 import net from "node:net";
 import dns from "node:dns";
+import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -13,6 +14,7 @@ import fs from "node:fs/promises";
 import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { ensureLocalSearxng, localSearxngRuntimeStatus } from "./searxng-local.js";
+import { DnsGovernor } from "./dns-governor.js";
 
 const PORT = 3000;
 const USER_AGENT =
@@ -32,6 +34,20 @@ const MAX_REDIRECTS = 5;
 const MAX_RETRIES = 2;
 const CACHE_TTL_MS = 30 * 60 * 1000;
 const CACHE_MAX_ENTRIES = 1500;
+
+// DNS is governed independently from HTTP concurrency. Large video imports can
+// otherwise create a benchmark-like burst of new host resolutions even while
+// socket concurrency remains bounded. Successful public resolutions are cached
+// briefly and concurrent requests for the same hostname share one lookup.
+const DNS_BASE_RATE_PER_SECOND = 6;
+const DNS_MAX_RATE_PER_SECOND = 8;
+const DNS_MIN_RATE_PER_SECOND = 2;
+const DNS_BURST = 10;
+const DNS_CACHE_TTL_MS = 30_000;
+const DNS_PRESSURE_COOLDOWN_MS = 30_000;
+const DNS_GOVERNOR_TOKEN = crypto.randomBytes(24).toString("hex");
+process.env.LINK_PREVIEW_DNS_GOVERNOR_TOKEN = DNS_GOVERNOR_TOKEN;
+process.env.LINK_PREVIEW_DNS_GOVERNOR_PORT = String(PORT);
 
 // Alternate/mirror discovery is intentionally small and user-triggered. It reuses
 // the same bounded network stack as previews instead of becoming a second crawler.
@@ -532,30 +548,45 @@ function validateUrl(raw) {
   return url;
 }
 
+function validatePublicDnsAddresses(addresses) {
+  if (!Array.isArray(addresses) || !addresses.length || addresses.some((entry) => isBlockedAddress(entry.address))) {
+    const error = new Error("private_network_dns_blocked");
+    error.code = "PRIVATE_NETWORK_DNS_BLOCKED";
+    throw error;
+  }
+  return addresses.map((entry) => ({ address: entry.address, family: entry.family }));
+}
+
+const dnsGovernor = new DnsGovernor({
+  baseRate: DNS_BASE_RATE_PER_SECOND,
+  maxRate: DNS_MAX_RATE_PER_SECOND,
+  minRate: DNS_MIN_RATE_PER_SECOND,
+  burst: DNS_BURST,
+  cacheTtlMs: DNS_CACHE_TTL_MS,
+  pressureCooldownMs: DNS_PRESSURE_COOLDOWN_MS,
+  validateAddresses: validatePublicDnsAddresses
+});
+
+async function resolvePublicAddresses(hostname) {
+  const normalized = validateHostname(hostname);
+  if (net.isIP(normalized)) return [{ address: normalized, family: net.isIP(normalized) }];
+  return await dnsGovernor.resolve(normalized);
+}
+
 function safeLookup(hostname, options, callback) {
   const opts = typeof options === "number" ? { family: options } : { ...(options || {}) };
-  dns.lookup(hostname, { ...opts, all: true }, (error, addresses) => {
-    if (error) return callback(error);
-    const publicAddresses = addresses.filter((entry) => !isBlockedAddress(entry.address));
-    if (publicAddresses.length !== addresses.length || publicAddresses.length === 0) {
-      return callback(new Error("private_network_dns_blocked"));
-    }
+  resolvePublicAddresses(hostname).then((publicAddresses) => {
     if (opts.all) return callback(null, publicAddresses);
     const preferred = opts.family
       ? publicAddresses.find((entry) => entry.family === opts.family)
       : publicAddresses[0];
     if (!preferred) return callback(new Error("no_public_address_for_family"));
     return callback(null, preferred.address, preferred.family);
-  });
+  }).catch((error) => callback(error));
 }
 
 async function resolvePublicAddress(hostname) {
-  validateHostname(hostname);
-  if (net.isIP(hostname)) return { address: hostname, family: net.isIP(hostname) };
-  const addresses = await dns.promises.lookup(hostname, { all: true });
-  if (!addresses.length || addresses.some((entry) => isBlockedAddress(entry.address))) {
-    throw new Error("private_network_dns_blocked");
-  }
+  const addresses = await resolvePublicAddresses(hostname);
   return addresses[0];
 }
 
@@ -3213,10 +3244,44 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
+// Internal-only resolver used by isolated Edge/yt-dlp/FFmpeg helper processes.
+// The server itself is bound to 127.0.0.1 and a per-launch token prevents an
+// unrelated local page from using this as a DNS oracle. Helper processes fail
+// closed if the governor is unavailable.
+app.get("/internal/dns-resolve", async (req, res) => {
+  if (req.get("X-Link-Preview-DNS-Token") !== DNS_GOVERNOR_TOKEN) return res.status(403).json({ ok: false, error: "forbidden" });
+  const hostname = typeof req.query.host === "string" ? req.query.host : "";
+  try {
+    const addresses = await resolvePublicAddresses(hostname);
+    return res.json({ ok: true, addresses });
+  } catch (error) {
+    return res.status(String(error?.message || "").includes("private_network") ? 400 : 502).json({
+      ok: false,
+      error: error?.message || "dns_resolution_failed",
+      code: error?.code || null
+    });
+  }
+});
+
+app.get("/api/network-status", (_req, res) => {
+  res.json({
+    ok: true,
+    dns: dnsGovernor.status(),
+    http: {
+      active: globalNetwork.active,
+      queued: globalNetwork.waiters.length,
+      limit: GLOBAL_NETWORK_LIMIT,
+      imageActive: imageNetwork.active,
+      imageQueued: imageNetwork.waiters.length,
+      imageLimit: IMAGE_NETWORK_LIMIT
+    }
+  });
+});
+
 app.get("/api/status", (_req, res) => {
   res.json({
     ok: true,
-    version: "2.7.0",
+    version: "2.7.3",
     limits: {
       globalNetwork: GLOBAL_NETWORK_LIMIT,
       perHostNetwork: PER_HOST_NETWORK_LIMIT,
@@ -3226,8 +3291,14 @@ app.get("/api/status", (_req, res) => {
       htmlBytes: HTML_LIMIT_BYTES,
       imageBytes: IMAGE_LIMIT_BYTES,
       timeoutMs: REQUEST_TIMEOUT_MS,
-      retries: MAX_RETRIES
+      retries: MAX_RETRIES,
+      dnsBaseRatePerSecond: DNS_BASE_RATE_PER_SECOND,
+      dnsMaxRatePerSecond: DNS_MAX_RATE_PER_SECOND,
+      dnsMinRatePerSecond: DNS_MIN_RATE_PER_SECOND,
+      dnsBurst: DNS_BURST,
+      dnsCacheTtlMs: DNS_CACHE_TTL_MS
     },
+    dns: dnsGovernor.status(),
     activeNetwork: globalNetwork.active,
     queuedNetwork: globalNetwork.waiters.length,
     activeImages: imageNetwork.active,
@@ -3409,8 +3480,9 @@ app.get("/api/preview", previewHandler);
 app.post("/api/preview", previewHandler);
 
 app.listen(PORT, "127.0.0.1", () => {
-  console.log(`Video preview engine v2.7.2 listening on http://127.0.0.1:${PORT}`);
+  console.log(`Video preview engine v2.7.3 listening on http://127.0.0.1:${PORT}`);
   console.log(`Network limits: ${GLOBAL_NETWORK_LIMIT} global / ${PER_HOST_NETWORK_LIMIT} per host.`);
+  console.log(`DNS governor: ${DNS_BASE_RATE_PER_SECOND}/s base, ${DNS_MAX_RATE_PER_SECOND}/s max, burst ${DNS_BURST}, ${DNS_CACHE_TTL_MS / 1000}s validated cache.`);
   console.log(`Edge fallback: ${BROWSER_FALLBACK_LIMIT} isolated helper worker; helper proxy limit ${BROWSER_PROXY_NETWORK_LIMIT}.`);
   ensureLocalSearxng().then((status) => {
     if (status.ok) console.log(`SearXNG local service ready at ${SEARXNG_DEFAULT_ENDPOINT} (${status.root || "existing process"}).`);

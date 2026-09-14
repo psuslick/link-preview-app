@@ -1219,3 +1219,33 @@ button:disabled { opacity: 0.42; cursor: default; }
   font: inherit;
   font-size: 0.82rem;
 }
+
+/* v2.7.3 DNS governor telemetry */
+.dns-badge.normal { border-color: #315645; color: #a7d8b9; }
+.dns-badge.elevated { border-color: #705d2f; color: #e7cb7f; }
+.dns-badge.throttled { border-color: #7a3e43; color: #f1a7ae; }
+
+.dns-health-strip {
+  margin-top: 10px;
+  padding: 11px 14px;
+  border: 1px solid #263245;
+  background: rgba(12, 18, 26, 0.94);
+  border-radius: 10px;
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto;
+  align-items: center;
+  gap: 12px 22px;
+}
+.dns-health-strip.elevated { border-color: #665529; }
+.dns-health-strip.throttled { border-color: #743940; }
+.dns-health-strip strong { display: block; text-transform: capitalize; }
+.dns-health-strip small { display: block; margin-top: 3px; color: #93a0b1; }
+.dns-health-strip dl { margin: 0; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px 18px; }
+.dns-health-strip dl div { min-width: 76px; }
+.dns-health-strip dt { color: #7f8b9b; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.05em; }
+.dns-health-strip dd { margin: 2px 0 0; font-size: 0.86rem; font-weight: 650; }
+.dns-health-strip p { grid-column: 1 / -1; margin: -2px 0 0; color: #e5c77c; font-size: 0.78rem; }
+@media (max-width: 900px) {
+  .dns-health-strip { grid-template-columns: 1fr; }
+  .dns-health-strip dl { justify-content: flex-start; }
+}

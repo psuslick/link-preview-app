@@ -8,6 +8,7 @@ import {
   fetchAlternates,
   fetchPreview,
   imageProxyUrl,
+  networkStatus,
   searxngStatus
 } from "./api.js";
 import "./App.css";
@@ -287,6 +288,7 @@ function App() {
   const [searxngEndpoint, setSearxngEndpoint] = useState(loadSearxngEndpoint);
   const [searxngState, setSearxngState] = useState({ ok: false, status: 0, error: "not_checked", engineCount: 0, local: true });
   const [searxngBusy, setSearxngBusy] = useState(false);
+  const [networkState, setNetworkState] = useState({ ok: false, dns: null, http: null });
 
   useEffect(() => {
     try { localStorage.setItem(PRIVACY_STORAGE_KEY, JSON.stringify(privacy)); } catch {}
@@ -312,6 +314,12 @@ function App() {
     return result;
   }
 
+  async function refreshNetworkState() {
+    const result = await networkStatus();
+    setNetworkState(result);
+    return result;
+  }
+
   async function openBingConfiguration() {
     setBingBusy(true);
     const result = await configureBingSession();
@@ -329,6 +337,9 @@ function App() {
   useEffect(() => {
     refreshBingState();
     refreshSearxngState();
+    refreshNetworkState();
+    const timer = setInterval(() => { refreshNetworkState(); }, 2000);
+    return () => clearInterval(timer);
   }, []);
 
   useEffect(() => {
@@ -784,6 +795,7 @@ function App() {
         </div>
         <div className="topbar-statuses">
           <div className="limit-badge">{CLIENT_CONCURRENCY} preview workers · {BROWSER_FALLBACK_CONCURRENCY} browser fallback</div>
+          {networkState?.dns && <div className={`limit-badge dns-badge ${networkState.dns.pressure || "normal"}`} title={`DNS: ${networkState.dns.active} active, ${networkState.dns.queued} queued, ${networkState.dns.averageLatencyMs} ms average, ${networkState.dns.errors} errors`}>DNS {networkState.dns.pressure || "normal"} · {networkState.dns.recentFreshLookupsPerSecond ?? 0}/s · cache {networkState.dns.cacheHitPercent ?? 0}%</div>}
           {finderStats.total > 0 && <div className="limit-badge finder-badge">Finder: {finderStats.running} running · {finderStats.queued} queued</div>}
         </div>
       </header>
@@ -800,6 +812,22 @@ function App() {
           </div>
         )}
       </section>
+
+      {networkState?.dns && (
+        <section className={`dns-health-strip ${networkState.dns.pressure || "normal"}`}>
+          <div><strong>DNS pressure: {networkState.dns.pressure || "unknown"}</strong><small>New hostname resolutions are globally governed before they reach Windows / NextDNS.</small></div>
+          <dl>
+            <div><dt>Fresh DNS</dt><dd>{networkState.dns.recentFreshLookupsPerSecond ?? 0}/s</dd></div>
+            <div><dt>Rate ceiling</dt><dd>{networkState.dns.currentRateLimitPerSecond ?? 0}/s</dd></div>
+            <div><dt>DNS queue</dt><dd>{networkState.dns.queued ?? 0}</dd></div>
+            <div><dt>Avg lookup</dt><dd>{networkState.dns.averageLatencyMs ?? 0} ms</dd></div>
+            <div><dt>Cache</dt><dd>{networkState.dns.cacheHitPercent ?? 0}%</dd></div>
+            <div><dt>Shared lookups</dt><dd>{networkState.dns.singleFlightShares ?? 0}</dd></div>
+            <div><dt>DNS errors</dt><dd>{networkState.dns.errors ?? 0}</dd></div>
+          </dl>
+          {networkState.dns.lastPressureReason && networkState.dns.pressure !== "normal" && <p>Adaptive throttle reason: {networkState.dns.lastPressureReason}. The app will ramp back up automatically after DNS recovers.</p>}
+        </section>
+      )}
 
       <section className={`privacy-panel ${privacyOpen ? "open" : ""}`}>
         <button type="button" className="privacy-panel-summary" onClick={() => setPrivacyOpen((value) => !value)} aria-expanded={privacyOpen}>

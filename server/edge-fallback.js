@@ -5,6 +5,7 @@ import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs/promises";
+import { resolveViaDnsGovernor } from "./dns-governor-client.js";
 
 const targetUrl = process.argv[2];
 const EDGE_TIMEOUT_MS = Math.max(4000, Number(process.argv[3]) || 7000);
@@ -107,9 +108,9 @@ function validateUrl(raw) {
 }
 
 async function resolvePublicAddress(hostname) {
-  validateHostname(hostname);
-  if (net.isIP(hostname)) return { address: hostname, family: net.isIP(hostname) };
-  const addresses = await dns.promises.lookup(hostname, { all: true });
+  const normalized = validateHostname(hostname);
+  if (net.isIP(normalized)) return { address: normalized, family: net.isIP(normalized) };
+  const addresses = await resolveViaDnsGovernor(normalized);
   if (!addresses.length || addresses.some((entry) => isBlockedAddress(entry.address))) {
     throw new Error("private_network_dns_blocked");
   }
