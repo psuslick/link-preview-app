@@ -52,6 +52,11 @@ function loadSearxngEndpoint() {
   catch { return DEFAULT_SEARXNG_ENDPOINT; }
 }
 
+function formatSessionTime(timestamp) {
+  if (!timestamp) return "—";
+  try { return new Date(timestamp).toLocaleString(); } catch { return "—"; }
+}
+
 function PrivacyToggle({ checked, onChange, title, detail }) {
   return (
     <label className="privacy-toggle">
@@ -289,6 +294,24 @@ function App() {
   const [searxngState, setSearxngState] = useState({ ok: false, status: 0, error: "not_checked", engineCount: 0, local: true });
   const [searxngBusy, setSearxngBusy] = useState(false);
   const [networkState, setNetworkState] = useState({ ok: false, dns: null, http: null });
+  const telemetryBaselineRef = useRef(null);
+  const [sessionTelemetry, setSessionTelemetry] = useState(() => ({
+    startedAt: Date.now(),
+    totalBatches: 0,
+    totalLinks: 0,
+    largestBatch: 0,
+    lastBatchAt: null,
+    lastBatchSize: 0,
+    peakDnsQueue: 0,
+    peakDnsRate: 0,
+    peakDnsLatencyMs: 0,
+    peakHttpActive: 0,
+    peakHttpQueue: 0,
+    dnsPressureEvents: 0,
+    dnsErrors: 0,
+    lastPressureAt: null,
+    lastPressureReason: null
+  }));
 
   useEffect(() => {
     try { localStorage.setItem(PRIVACY_STORAGE_KEY, JSON.stringify(privacy)); } catch {}
@@ -317,7 +340,72 @@ function App() {
   async function refreshNetworkState() {
     const result = await networkStatus();
     setNetworkState(result);
+    const dns = result?.dns;
+    const http = result?.http;
+    if (dns) {
+      if (!telemetryBaselineRef.current) {
+        telemetryBaselineRef.current = {
+          pressureEvents: Number(dns.pressureEvents) || 0,
+          errors: Number(dns.errors) || 0
+        };
+      }
+      const baseline = telemetryBaselineRef.current;
+      setSessionTelemetry((current) => {
+        const pressureEvents = Math.max(0, (Number(dns.pressureEvents) || 0) - baseline.pressureEvents);
+        const errors = Math.max(0, (Number(dns.errors) || 0) - baseline.errors);
+        const pressureActive = dns.pressure && dns.pressure !== "normal";
+        const pressureAdvanced = pressureEvents > current.dnsPressureEvents;
+        return {
+          ...current,
+          peakDnsQueue: Math.max(current.peakDnsQueue, Number(dns.queued) || 0),
+          peakDnsRate: Math.max(current.peakDnsRate, Number(dns.recentFreshLookupsPerSecond) || 0),
+          peakDnsLatencyMs: Math.max(current.peakDnsLatencyMs, Number(dns.averageLatencyMs) || 0, Number(dns.lastLatencyMs) || 0),
+          peakHttpActive: Math.max(current.peakHttpActive, Number(http?.active) || 0),
+          peakHttpQueue: Math.max(current.peakHttpQueue, Number(http?.queued) || 0),
+          dnsPressureEvents: pressureEvents,
+          dnsErrors: errors,
+          lastPressureAt: pressureAdvanced || (pressureActive && !current.lastPressureAt) ? Date.now() : current.lastPressureAt,
+          lastPressureReason: pressureActive && dns.lastPressureReason ? dns.lastPressureReason : current.lastPressureReason
+        };
+      });
+    }
     return result;
+  }
+
+  async function copySessionSnapshot() {
+    const dns = networkState?.dns || {};
+    const http = networkState?.http || {};
+    const lines = [
+      "Video Link Preview — memory-only session snapshot",
+      `Session started: ${formatSessionTime(sessionTelemetry.startedAt)}`,
+      `Last batch started: ${formatSessionTime(sessionTelemetry.lastBatchAt)}`,
+      `Last batch size: ${sessionTelemetry.lastBatchSize}`,
+      `Batches this session: ${sessionTelemetry.totalBatches}`,
+      `Links submitted this session: ${sessionTelemetry.totalLinks}`,
+      `Largest batch: ${sessionTelemetry.largestBatch}`,
+      `Current DNS pressure: ${dns.pressure || "unknown"}`,
+      `Current fresh DNS: ${dns.recentFreshLookupsPerSecond ?? 0}/s`,
+      `Current DNS queue: ${dns.queued ?? 0}`,
+      `Current DNS avg latency: ${dns.averageLatencyMs ?? 0} ms`,
+      `Current HTTP active/queued: ${http.active ?? 0}/${http.queued ?? 0}`,
+      `Peak DNS rate: ${sessionTelemetry.peakDnsRate}/s`,
+      `Peak DNS queue: ${sessionTelemetry.peakDnsQueue}`,
+      `Peak DNS latency: ${sessionTelemetry.peakDnsLatencyMs} ms`,
+      `Peak HTTP active: ${sessionTelemetry.peakHttpActive}`,
+      `Peak HTTP queue: ${sessionTelemetry.peakHttpQueue}`,
+      `DNS pressure events this UI session: ${sessionTelemetry.dnsPressureEvents}`,
+      `DNS errors this UI session: ${sessionTelemetry.dnsErrors}`,
+      `Last pressure time: ${formatSessionTime(sessionTelemetry.lastPressureAt)}`,
+      `Last pressure reason: ${sessionTelemetry.lastPressureReason || "none"}`,
+      "Privacy: aggregate counters/timestamps only; no URLs, hostnames, titles, IDs, or search terms included."
+    ];
+    try {
+      await navigator.clipboard.writeText(lines.join("\r\n"));
+      setCopyStatus("Copied memory-only network snapshot (no URLs or hostnames)");
+    } catch {
+      setCopyStatus("Snapshot copy failed");
+    }
+    setTimeout(() => setCopyStatus(""), 3000);
   }
 
   async function openBingConfiguration() {
@@ -514,6 +602,16 @@ function App() {
       id: `${stamp}-${index}`, url, state: "queued", title: null, description: null,
       image: null, provider: null, method: null, error: null
     }));
+    if (items.length) {
+      setSessionTelemetry((current) => ({
+        ...current,
+        totalBatches: current.totalBatches + 1,
+        totalLinks: current.totalLinks + items.length,
+        largestBatch: Math.max(current.largestBatch, items.length),
+        lastBatchAt: stamp,
+        lastBatchSize: items.length
+      }));
+    }
     setImportSummary({ added: items.length, duplicates: duplicateCount, invalid: parsed.invalid });
     setInputText("");
     if (!items.length) return;
@@ -825,6 +923,21 @@ function App() {
             <div><dt>Shared lookups</dt><dd>{networkState.dns.singleFlightShares ?? 0}</dd></div>
             <div><dt>DNS errors</dt><dd>{networkState.dns.errors ?? 0}</dd></div>
           </dl>
+          <div className="session-telemetry">
+            <div>
+              <strong>Memory-only session diagnostics</strong>
+              <small>Aggregate counters and timestamps only. No URLs, hostnames, titles, IDs, or search terms are recorded. Nothing is sent to any monitoring service or written to a diagnostic log.</small>
+            </div>
+            <dl>
+              <div><dt>Last batch</dt><dd>{sessionTelemetry.lastBatchAt ? `${sessionTelemetry.lastBatchSize} · ${new Date(sessionTelemetry.lastBatchAt).toLocaleTimeString()}` : "—"}</dd></div>
+              <div><dt>Largest batch</dt><dd>{sessionTelemetry.largestBatch}</dd></div>
+              <div><dt>Peak DNS queue</dt><dd>{sessionTelemetry.peakDnsQueue}</dd></div>
+              <div><dt>Peak DNS</dt><dd>{sessionTelemetry.peakDnsRate}/s</dd></div>
+              <div><dt>Peak latency</dt><dd>{sessionTelemetry.peakDnsLatencyMs} ms</dd></div>
+              <div><dt>Pressure events</dt><dd>{sessionTelemetry.dnsPressureEvents}</dd></div>
+            </dl>
+            <button type="button" className="telemetry-copy-button" onClick={copySessionSnapshot}>Copy aggregate snapshot</button>
+          </div>
           {networkState.dns.lastPressureReason && networkState.dns.pressure !== "normal" && <p>Adaptive throttle reason: {networkState.dns.lastPressureReason}. The app will ramp back up automatically after DNS recovers.</p>}
         </section>
       )}
@@ -886,7 +999,7 @@ function App() {
                 <PrivacyToggle checked={privacy.sampleComparison} onChange={(v) => setPrivacyOption("sampleComparison", v)} title="Perceptual sample comparison" detail="Allows FFmpeg to download small remote video samples for local frame comparison." />
               </div>
             </div>
-            <div className="privacy-footnote"><strong>Always local:</strong> selection state, queues, ranking, perceptual hashes, temporary browser profiles, and caches remain inside Windows Sandbox. <strong>Always required for basic previews:</strong> creating a preview contacts the pasted public video URL itself.</div>
+            <div className="privacy-footnote"><strong>Always local:</strong> selection state, queues, ranking, perceptual hashes, temporary browser profiles, and caches remain inside Windows Sandbox. <strong>Network diagnostics:</strong> aggregate telemetry is memory-only in the running UI/server process and is not written to a diagnostic log or exported to a monitoring service. <strong>Always required for basic previews:</strong> creating a preview contacts the pasted public video URL itself.</div>
           </div>
         )}
       </section>

@@ -1249,3 +1249,34 @@ button:disabled { opacity: 0.42; cursor: default; }
   .dns-health-strip { grid-template-columns: 1fr; }
   .dns-health-strip dl { justify-content: flex-start; }
 }
+
+
+/* v2.7.4 memory-only session diagnostics */
+.session-telemetry {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(240px, 1.2fr) minmax(320px, 2fr) auto;
+  align-items: center;
+  gap: 12px 18px;
+  margin-top: 2px;
+  padding-top: 10px;
+  border-top: 1px solid #263245;
+}
+.session-telemetry > div > strong { display: block; font-size: 0.82rem; }
+.session-telemetry > div > small { display: block; margin-top: 3px; color: #7f8b9b; font-size: 0.72rem; line-height: 1.35; }
+.session-telemetry dl { justify-content: flex-start; }
+.telemetry-copy-button {
+  border: 1px solid #34445a;
+  background: #131d29;
+  color: #d7e1ec;
+  border-radius: 7px;
+  padding: 7px 10px;
+  font: inherit;
+  font-size: 0.76rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.telemetry-copy-button:hover { background: #192636; }
+@media (max-width: 1050px) {
+  .session-telemetry { grid-template-columns: 1fr; }
+}
