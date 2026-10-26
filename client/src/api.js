@@ -82,6 +82,21 @@ export async function fetchAlternates(source, { signal, privacy, searxngEndpoint
   }
 }
 
+export async function recoverVideoMetadata(url, { privacy } = {}) {
+  try {
+    const response = await fetch(`${API_BASE}/recover-metadata`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url, privacy: privacy || null })
+    });
+    let data;
+    try { data = await response.json(); } catch { data = { error: "invalid_json_response" }; }
+    return { ...data, clientOk: response.ok, clientStatus: response.status };
+  } catch (error) {
+    return { ok: false, clientOk: false, error: error?.message || "backend_unreachable" };
+  }
+}
+
 export function imageProxyUrl(url, sourceUrl) {
   if (!url) return null;
   const params = new URLSearchParams({ url });

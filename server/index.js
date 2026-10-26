@@ -1,11 +1,9 @@
 import express from "express";
-import cors from "cors";
 import fetch from "node-fetch";
 import * as cheerio from "cheerio";
 import http from "node:http";
 import https from "node:https";
 import net from "node:net";
-import dns from "node:dns";
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import os from "node:os";
@@ -15,6 +13,10 @@ import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { ensureLocalSearxng, localSearxngRuntimeStatus } from "./searxng-local.js";
 import { DnsGovernor } from "./dns-governor.js";
+import { isBlockedAddress } from "./public-network-policy.js";
+import { checkLocalApiAccess } from "./local-api-access.js";
+import { imageRefererStrategies } from "./image-referer-policy.js";
+import { evaluateCandidateEvidence } from "./finder-relevance.js";
 
 const PORT = 3000;
 const USER_AGENT =
@@ -106,6 +108,7 @@ const globalNetwork = new Semaphore(GLOBAL_NETWORK_LIMIT);
 const imageNetwork = new Semaphore(IMAGE_NETWORK_LIMIT);
 const browserFallback = new Semaphore(BROWSER_FALLBACK_LIMIT);
 const frameCompare = new Semaphore(1);
+const archiveRecoveryGate = new Semaphore(2);
 const bingSearchGate = new Semaphore(1);
 const hostSemaphores = new Map();
 const hostThrottleState = new Map();
@@ -202,7 +205,7 @@ function normalizeSearxngResults(data) {
     if (typeof rawUrl !== "string") continue;
     let normalized;
     try { normalized = validateUrl(rawUrl).toString(); } catch { continue; }
-    const key = canonicalDiscoveryUrl(normalized).toLowerCase();
+    const key = canonicalDiscoveryUrl(normalized);
     if (seen.has(key)) continue;
     seen.add(key);
     const engines = [...new Set([...(Array.isArray(item.engines) ? item.engines : []), item.engine].filter(Boolean).map(String))];
@@ -478,44 +481,6 @@ function markHostHealthy(hostname) {
   const strikes = Math.max(0, state.strikes - 1);
   if (strikes === 0 && state.until <= Date.now()) hostThrottleState.delete(hostname);
   else hostThrottleState.set(hostname, { ...state, strikes });
-}
-
-function isBlockedIPv4(address) {
-  const parts = address.split(".").map(Number);
-  if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true;
-  const [a, b, c] = parts;
-  if (a === 0 || a === 10 || a === 127) return true;
-  if (a === 100 && b >= 64 && b <= 127) return true;
-  if (a === 169 && b === 254) return true;
-  if (a === 172 && b >= 16 && b <= 31) return true;
-  if (a === 192 && b === 168) return true;
-  if (a === 198 && (b === 18 || b === 19)) return true;
-  if (a >= 224) return true;
-  if (a === 192 && b === 0 && c === 2) return true;
-  if (a === 198 && b === 51 && c === 100) return true;
-  if (a === 203 && b === 0 && c === 113) return true;
-  return false;
-}
-
-function isBlockedIPv6(address) {
-  const lower = address.toLowerCase();
-  if (lower === "::" || lower === "::1") return true;
-  if (lower.startsWith("fc") || lower.startsWith("fd")) return true;
-  if (/^fe[89ab]/.test(lower)) return true;
-  if (lower.startsWith("ff")) return true;
-  if (lower.startsWith("2001:db8")) return true;
-  if (lower.startsWith("::ffff:")) {
-    const mapped = lower.slice("::ffff:".length);
-    if (net.isIP(mapped) === 4) return isBlockedIPv4(mapped);
-  }
-  return false;
-}
-
-function isBlockedAddress(address) {
-  const family = net.isIP(address);
-  if (family === 4) return isBlockedIPv4(address);
-  if (family === 6) return isBlockedIPv6(address);
-  return true;
 }
 
 function validateHostname(hostname) {
@@ -808,7 +773,7 @@ function uniqueUrls(values, baseUrl) {
   for (const value of values.flat(Infinity)) {
     const resolved = resolveUrl(value, baseUrl);
     if (!resolved) continue;
-    const key = resolved.toLowerCase();
+    const key = resolved;
     if (seen.has(key)) continue;
     seen.add(key);
     result.push(resolved);
@@ -1057,6 +1022,8 @@ function extractHtmlMetadata(html, pageUrl) {
     image: images[0] || null,
     images,
     provider: firstNonEmpty(meta('meta[property="og:site_name"]')),
+    uploader: firstNonEmpty(videoObject?.author?.name, typeof videoObject?.author === "string" ? videoObject.author : null, meta('meta[name="author"]')),
+    uploadDate: firstNonEmpty(videoObject?.uploadDate, videoObject?.datePublished, meta('meta[property="video:release_date"]'), meta('meta[property="article:published_time"]')),
     durationSeconds:
       parseDurationSeconds(videoObject?.duration) ||
       parseDurationSeconds(meta('meta[property="video:duration"]')) ||
@@ -1166,7 +1133,6 @@ async function fetchOEmbed(oembedUrl, targetUrl, providerFallback = null) {
 function normalizeCacheKey(rawUrl) {
   try {
     const url = validateUrl(rawUrl);
-    url.hash = "";
     return url.toString();
   } catch {
     return rawUrl;
@@ -1828,10 +1794,8 @@ function titleSimilarity(a, b) {
 function canonicalDiscoveryUrl(rawUrl) {
   try {
     const url = validateUrl(rawUrl);
-    url.hash = "";
-    for (const key of [...url.searchParams.keys()]) {
-      if (/^(?:utm_|fbclid$|gclid$|mc_|ref$|referrer$|source$)/i.test(key)) url.searchParams.delete(key);
-    }
+    // URL paths, queries and #routes can encode different video identities;
+    // only URL's built-in scheme/host normalization is safe across hosts.
     return url.toString();
   } catch {
     return rawUrl;
@@ -1891,7 +1855,7 @@ function parseDuckDuckGoResults(html) {
     const title = anchor.text().replace(/\s+/g, " ").trim();
     const snippet = $(element).find(".result__snippet, .result-snippet, [data-result='snippet']").first().text().replace(/\s+/g, " ").trim();
     if (!url) return;
-    const key = canonicalDiscoveryUrl(url).toLowerCase();
+    const key = canonicalDiscoveryUrl(url);
     if (seen.has(key)) return;
     seen.add(key);
     results.push({ url, searchTitle: title || null, snippet: snippet || null, engine: "DuckDuckGo" });
@@ -1909,7 +1873,7 @@ function parseBingResults(html) {
     const title = anchor.text().replace(/\s+/g, " ").trim();
     const snippet = $(element).find(".b_caption p, .b_lineclamp2, .b_lineclamp3").first().text().replace(/\s+/g, " ").trim();
     if (!url) return;
-    const key = canonicalDiscoveryUrl(url).toLowerCase();
+    const key = canonicalDiscoveryUrl(url);
     if (seen.has(key)) return;
     seen.add(key);
     results.push({ url, searchTitle: title || null, snippet: snippet || null, engine: "Bing" });
@@ -1935,7 +1899,7 @@ function parseMojeekResults(html) {
       if (host === "mojeek.com" || host.endsWith(".mojeek.com")) return;
       url = validateUrl(url.toString());
     } catch { return; }
-    const key = canonicalDiscoveryUrl(url.toString()).toLowerCase();
+    const key = canonicalDiscoveryUrl(url.toString());
     if (seen.has(key)) return;
     seen.add(key);
     const title = anchor.text().replace(/\s+/g, " ").trim();
@@ -2013,7 +1977,7 @@ function archiveOutgoingCandidates(html, pageUrl, sourceHost) {
       const target = validateUrl(resolved);
       const host = target.hostname.toLowerCase().replace(/^www\./, "");
       if (!host || host === sourceHost || host === "web.archive.org" || host.endsWith(".archive.org") || host.endsWith(".commoncrawl.org")) return;
-      const key = canonicalDiscoveryUrl(target.toString()).toLowerCase();
+      const key = canonicalDiscoveryUrl(target.toString());
       if (seen.has(key)) return;
       seen.add(key); out.push(target.toString());
     } catch {}
@@ -2031,6 +1995,8 @@ async function lookupWaybackSource(rawUrl) {
   if (!Array.isArray(rows) || rows.length < 2) return { ok: false, provider: "Wayback", error: "wayback_no_capture", captures: [] };
   const headers = rows[0];
   const captures = rows.slice(1).map((row) => Object.fromEntries(headers.map((key, i) => [key, row[i]]))).reverse();
+  let best = null;
+  let bestScore = -1;
   for (const capture of captures) {
     const original = capture.original || rawUrl;
     const snapshotUrl = `https://web.archive.org/web/${capture.timestamp}id_/${original}`;
@@ -2039,9 +2005,14 @@ async function lookupWaybackSource(rawUrl) {
     const metadata = extractHtmlMetadata(page.text, original);
     const signals = extractMediaDiscoverySignals(page.text, original);
     const candidates = archiveOutgoingCandidates(page.text, original, discoveryHost(rawUrl));
-    return { ok: true, provider: "Wayback", capture: capture.timestamp, snapshotUrl, metadata, signals, candidates };
+    const score = (metadata.title ? 4 : 0) + (metadata.description ? 3 : 0) +
+      (metadata.durationSeconds ? 4 : 0) + (metadata.uploader ? 2 : 0) +
+      Math.min(8, (signals.ids?.length || 0) * 2 + (signals.mediaUrls?.length || 0) * 3) +
+      Math.min(3, candidates.length);
+    if (score > bestScore) { bestScore = score; best = { ok: true, provider: "Wayback", capture: capture.timestamp, snapshotUrl, metadata, signals, candidates }; }
+    if (score >= 15) break;
   }
-  return { ok: false, provider: "Wayback", error: "wayback_capture_fetch_failed", captures };
+  return best || { ok: false, provider: "Wayback", error: "wayback_capture_fetch_failed", captures };
 }
 
 async function fetchRangeRecord(rawUrl, offset, length) {
@@ -2105,12 +2076,59 @@ async function lookupCommonCrawlSource(rawUrl) {
 }
 
 async function recoverArchivedSource(rawUrl) {
-  const wayback = await lookupWaybackSource(rawUrl).catch((error) => ({ ok: false, provider: "Wayback", error: error?.message || "wayback_failed" }));
-  if (wayback.ok && (wayback.metadata?.title || wayback.signals?.ids?.length || wayback.signals?.mediaUrls?.length || wayback.candidates?.length)) {
-    return { ...wayback, attempts: [wayback] };
+  const release = await archiveRecoveryGate.acquire();
+  try {
+    const wayback = await lookupWaybackSource(rawUrl).catch((error) => ({ ok: false, provider: "Wayback", error: error?.message || "wayback_failed" }));
+    if (wayback.ok && (wayback.metadata?.title || wayback.signals?.ids?.length || wayback.signals?.mediaUrls?.length || wayback.candidates?.length)) {
+      return { ...wayback, attempts: [wayback] };
+    }
+    const common = await lookupCommonCrawlSource(rawUrl).catch((error) => ({ ok: false, provider: "Common Crawl", error: error?.message || "commoncrawl_failed" }));
+    return common.ok ? { ...common, attempts: [wayback, common] } : { ok: false, provider: null, error: common.error || wayback.error || "archive_not_found", attempts: [wayback, common] };
+  } finally {
+    release();
   }
-  const common = await lookupCommonCrawlSource(rawUrl).catch((error) => ({ ok: false, provider: "Common Crawl", error: error?.message || "commoncrawl_failed" }));
-  return common.ok ? { ...common, attempts: [wayback, common] } : { ok: false, provider: null, error: common.error || wayback.error || "archive_not_found", attempts: [wayback, common] };
+}
+
+async function recoverHistoricalMetadata(rawUrl, privacy) {
+  const url = validateUrl(rawUrl).toString();
+  const clues = urlDiscoveryClues(url);
+  const archive = privacy.archiveLookups ? await recoverArchivedSource(url) : null;
+  const meta = archive?.ok ? archive.metadata || {} : {};
+  const title = cleanSearchTitle(meta.title) || null;
+  const historicalMentions = [];
+  // An exact old-URL query is useful when no HTML capture survived. It is an
+  // explicit on-demand lookup, gated by the user's search/identifier toggles.
+  // Search snippets remain unverified leads and are never promoted to a title.
+  if (!title && privacy.searchMediaIds && privacy.searchDuckDuckGo) {
+    const mentions = await searchDuckDuckGo(`"${url}"`).catch(() => ({ results: [] }));
+    for (const item of (mentions.results || []).slice(0, 10)) {
+      historicalMentions.push({ url: item.url, title: item.searchTitle || null, snippet: item.snippet || null, engine: "DuckDuckGo" });
+    }
+  }
+  return {
+    url,
+    ok: Boolean(archive?.ok && (title || meta.description || archive.signals?.ids?.length)),
+    title: title || clues.slugPhrase || null,
+    titleOrigin: title ? "archived_page" : clues.slugPhrase ? "url_clue_only" : "unknown",
+    description: meta.description || null,
+    uploader: meta.uploader || null,
+    uploadDate: meta.uploadDate || null,
+    provider: meta.provider || null,
+    durationSeconds: meta.durationSeconds || null,
+    images: (meta.images || []).slice(0, 4),
+    archive: archive ? {
+      ok: Boolean(archive.ok), provider: archive.provider || null, capture: archive.capture || null,
+      snapshotUrl: archive.snapshotUrl || null, error: archive.error || null,
+      attempts: (archive.attempts || []).map((entry) => ({ provider: entry.provider, ok: Boolean(entry.ok), error: entry.error || null }))
+    } : null,
+    urlClues: { slugPhrase: clues.slugPhrase, phrases: clues.phrases, ids: clues.ids },
+    archivedOutboundUrls: (archive?.candidates || []).slice(0, 15),
+    historicalMentions,
+    historicalSearchDisclosure: !title && privacy.searchMediaIds && privacy.searchDuckDuckGo ? "Queried DuckDuckGo with the original URL because the archive did not contain a title; snippets are unverified leads." : null,
+    note: title ? "Historical title extracted from a captured HTML page; verify it belongs to the original video." :
+      clues.slugPhrase ? "No archived title recovered; the displayed phrase is inferred from the URL, not verified video metadata." :
+      "No historical title found. Try manually entering a known title before searching for mirrors."
+  };
 }
 
 function parseBraveResults(html) {
@@ -2126,7 +2144,7 @@ function parseBraveResults(html) {
     if (!url) return;
     const host = discoveryHost(url);
     if (!host || host === "search.brave.com" || host.endsWith(".brave.com")) return;
-    const key = canonicalDiscoveryUrl(url).toLowerCase();
+    const key = canonicalDiscoveryUrl(url);
     if (seen.has(key)) return;
     seen.add(key);
     const container = anchor.closest(".snippet, .result, [data-type='web']");
@@ -2755,36 +2773,17 @@ function buildDiscoveryQueries(source, signals, transcript, privacy = DEFAULT_PR
 }
 
 function classifyEvidenceAlternate(source, candidate, similarity, overlap, searchSupport = {}) {
-  const sourceDuration = Number(source.durationSeconds) || 0;
-  const candidateDuration = Number(candidate.durationSeconds) || 0;
-  const sourceHost = discoveryHost(source.url);
-  const candidateHost = discoveryHost(candidate.url);
-  const differentSource = Boolean(sourceHost && candidateHost && sourceHost !== candidateHost);
-  const durationRatio = sourceDuration > 0 && candidateDuration > 0 ? candidateDuration / sourceDuration : null;
-  const longerWords = /\b(?:full|complete|extended|uncut|full[- ]?length|long(?:er)? version)\b/i;
-  const lexicalLongerHint = longerWords.test(candidate.title || "") && !longerWords.test(source.title || "");
-
-  // Search-engine provenance is discovery support, not identity evidence.
-  // "Likely" labels require evidence actually recovered from the candidate page/tool.
-  const engineCount = Number(searchSupport.engineCount) || 0;
-  const queryCount = Number(searchSupport.queryCount) || 0;
-  const provenanceBonus = Math.min(8, Math.max(0, engineCount - 1) * 2 + Math.max(0, queryCount - 1));
-  let confidence = similarity * 52 + overlap.score + provenanceBonus;
-  if (differentSource && similarity >= 0.45) confidence += 3;
-  if (durationRatio !== null) {
-    if (durationRatio >= 1.15) confidence += 8;
-    else if (durationRatio >= 0.88 && durationRatio <= 1.12) confidence += 7;
-  } else if (lexicalLongerHint && similarity >= 0.45) confidence += 3;
-  confidence = Math.max(0, Math.min(99, Math.round(confidence)));
-
-  const strongIdentity = overlap.score >= 22;
-  let relation = "Unverified candidate";
-  if (durationRatio !== null && durationRatio >= 1.15 && strongIdentity) relation = "Likely longer";
-  else if (durationRatio === null && lexicalLongerHint && strongIdentity) relation = "Possible longer";
-  else if (strongIdentity && (durationRatio === null || (durationRatio >= 0.82 && durationRatio <= 1.18))) relation = "Likely mirror";
-  else if (similarity >= 0.62 || overlap.score > 0) relation = "Possible match";
-  else if (confidence < 25) relation = "Weak match";
-  return { relation, confidence, durationRatio, differentSource, lexicalLongerHint, strongIdentity, provenanceBonus };
+  return evaluateCandidateEvidence({
+    sourceTitle: source.title,
+    candidateTitle: candidate.title,
+    titleVerified: candidate.metadataVerified,
+    overlap,
+    sourceDuration: source.durationSeconds,
+    candidateDuration: candidate.durationSeconds,
+    sourceHost: discoveryHost(source.url),
+    candidateHost: discoveryHost(candidate.url),
+    searchSupport
+  });
 }
 
 
@@ -2798,47 +2797,42 @@ function searchSupportFor(item) {
 function balancedCandidateSelection(gatheredMap, searchBuckets, sourceTitle, limit) {
   const selected = [];
   const selectedKeys = new Set();
-  const bucketEntries = [...searchBuckets.entries()]
-    .map(([bucket, keys]) => ({
-      bucket,
-      keys: keys.filter((key, index, all) => all.indexOf(key) === index)
-    }))
-    .filter((entry) => entry.keys.length);
-
-  // Round-robin across query+engine buckets so one noisy signal cannot crowd out
-  // later query families or independently indexed search engines.
-  let round = 0;
-  while (selected.length < limit) {
-    let addedThisRound = 0;
-    for (const bucket of bucketEntries) {
-      const key = bucket.keys[round];
-      if (!key || selectedKeys.has(key)) continue;
-      const item = gatheredMap.get(key);
-      if (!item) continue;
-      selectedKeys.add(key);
-      selected.push(item);
-      addedThisRound += 1;
-      if (selected.length >= limit) break;
-    }
-    if (!addedThisRound && bucketEntries.every((bucket) => round >= bucket.keys.length - 1)) break;
-    round += 1;
-    if (round > 100) break;
+  const ranked = [...gatheredMap.entries()].map(([key, item]) => {
+    const support = searchSupportFor(item);
+    const searchSimilarity = titleSimilarity(sourceTitle, item.searchTitle || "");
+    const sourceLink = item.evidence?.some((entry) => entry.kind === "archive-link");
+    const bestQueryWeight = Math.max(0, ...(item.evidence || []).map((entry) => entry.queryWeight || 0));
+    return { key, item, score: searchSimilarity * 62 + (sourceLink ? 48 : 0) + bestQueryWeight * 10 + Math.min(18, support.engineCount * 4 + support.queryCount * 2) };
+  }).sort((a, b) => b.score - a.score || a.item.discoveredOrder - b.item.discoveredOrder);
+  const seenHosts = new Map();
+  // Spend most page probes on title/archived-link leads, diversified across
+  // domains. Reserve some for exploration so less-obvious hosts remain visible.
+  const relevantBudget = Math.max(1, Math.ceil(limit * 0.83));
+  while (selected.length < relevantBudget && ranked.length) {
+    ranked.sort((a, b) => (b.score - (seenHosts.get(discoveryHost(b.item.url)) || 0) * 7) - (a.score - (seenHosts.get(discoveryHost(a.item.url)) || 0) * 7));
+    const next = ranked.shift();
+    selected.push(next.item);
+    selectedKeys.add(next.key);
+    const host = discoveryHost(next.item.url);
+    seenHosts.set(host, (seenHosts.get(host) || 0) + 1);
   }
-
-  // Fill any remaining capacity by lexical relevance + independent engine/query support.
-  if (selected.length < limit) {
-    const remaining = [...gatheredMap.entries()]
-      .filter(([key]) => !selectedKeys.has(key))
-      .map(([key, item]) => {
-        const support = searchSupportFor(item);
-        const searchSimilarity = titleSimilarity(sourceTitle, item.searchTitle || "");
-        return { key, item, score: searchSimilarity * 60 + Math.min(15, support.engineCount * 4 + support.queryCount * 2) };
-      })
-      .sort((a, b) => b.score - a.score);
-    for (const entry of remaining) {
-      selected.push(entry.item);
-      if (selected.length >= limit) break;
-    }
+  const exploratory = [];
+  for (const keys of searchBuckets.values()) {
+    const entry = keys.find((key) => !selectedKeys.has(key));
+    if (entry && !exploratory.includes(entry)) exploratory.push(entry);
+  }
+  for (const key of exploratory) {
+    if (selected.length >= limit) break;
+    const item = gatheredMap.get(key);
+    if (!item || selectedKeys.has(key)) continue;
+    selected.push(item);
+    selectedKeys.add(key);
+  }
+  for (const entry of ranked) {
+    if (selected.length >= limit) break;
+    if (selectedKeys.has(entry.key)) continue;
+    selected.push(entry.item);
+    selectedKeys.add(entry.key);
   }
   return selected;
 }
@@ -2908,7 +2902,7 @@ async function findAlternates({ url, title, description, provider, durationSecon
   const gatheredMap = new Map();
   const searchBuckets = new Map();
   const searchDiagnostics = [];
-  const sourceKey = canonicalDiscoveryUrl(sourceUrl).toLowerCase();
+  const sourceKey = canonicalDiscoveryUrl(sourceUrl);
 
   const addResults = (items, querySpec, engineName) => {
     const bucketKey = `${engineName}:${querySpec.kind}:${querySpec.query}`;
@@ -2916,7 +2910,7 @@ async function findAlternates({ url, title, description, provider, durationSecon
     const bucket = searchBuckets.get(bucketKey);
 
     for (const item of items) {
-      const key = canonicalDiscoveryUrl(item.url).toLowerCase();
+      const key = canonicalDiscoveryUrl(item.url);
       if (key === sourceKey) continue;
       const provenance = {
         kind: querySpec.kind,
@@ -3037,13 +3031,14 @@ async function findAlternates({ url, title, description, provider, durationSecon
       image: metadata.image || null,
       images: metadata.images || [],
       method: page.ok ? "page-media-probe" : "search-result",
+      metadataVerified: Boolean(page.ok && metadata.title),
       previewError: page.error || null,
       searchEngine: item.searchSupport.engines.join("+") || item.engine,
       discovery: item.evidence,
       searchSupport: item.searchSupport,
       pageSignals: page.signals
     };
-    const similarity = Math.max(item.searchSimilarity, titleSimilarity(source.title, candidate.title));
+    const similarity = candidate.metadataVerified ? titleSimilarity(source.title, candidate.title) : 0;
     const overlap = evidenceOverlap(sourceSignals, candidate.pageSignals);
     const subject = candidateSubjectRelevance(source, candidate, subjectAnchors);
     return { ...candidate, similarity, overlap, subject };
@@ -3057,7 +3052,7 @@ async function findAlternates({ url, title, description, provider, durationSecon
       const score = (candidate) =>
         candidate.overlap.score * 3 +
         candidate.similarity * 35 +
-        (candidate.subject?.score || 0) * 55 +
+        (candidate.metadataVerified ? (candidate.subject?.score || 0) * 55 : 0) +
         Math.min(10, candidate.searchSupport.engineCount * 3 + candidate.searchSupport.queryCount);
       return score(b) - score(a);
     })
@@ -3089,10 +3084,11 @@ async function findAlternates({ url, title, description, provider, durationSecon
         extractor: tool?.extractor || null,
         attempts: toolProbe.attempts || []
       } : null,
+      metadataVerified: Boolean(candidate.metadataVerified || tool?.title),
       overlap
     };
     updated.image = updated.images[0] || null;
-    updated.similarity = Math.max(candidate.similarity, titleSimilarity(source.title, updated.title));
+    updated.similarity = updated.metadataVerified ? titleSimilarity(source.title, updated.title) : 0;
     updated.subject = candidateSubjectRelevance(source, updated, subjectAnchors);
     return {
       ...updated,
@@ -3102,7 +3098,7 @@ async function findAlternates({ url, title, description, provider, durationSecon
 
   const rankedCandidates = candidates
     .filter(Boolean)
-    .filter((candidate) => canonicalDiscoveryUrl(candidate.url).toLowerCase() !== sourceKey)
+    .filter((candidate) => canonicalDiscoveryUrl(candidate.url) !== sourceKey)
     .sort((a, b) => {
       const rank = (value) =>
         value === "Likely longer" ? 6 :
@@ -3117,11 +3113,7 @@ async function findAlternates({ url, title, description, provider, durationSecon
         b.similarity - a.similarity;
     });
 
-  const isRelatedCandidate = (candidate) =>
-    candidate.overlap?.score > 0 ||
-    candidate.strongIdentity ||
-    (candidate.subject?.score || 0) >= 0.24 ||
-    candidate.similarity >= 0.32;
+  const isRelatedCandidate = (candidate) => candidate.related === true;
 
   const results = rankedCandidates.filter(isRelatedCandidate).slice(0, ALTERNATE_SEARCH_MAX_RESULTS);
   const lowRelevanceResults = rankedCandidates.filter((candidate) => !isRelatedCandidate(candidate)).slice(0, ALTERNATE_SEARCH_MAX_RESULTS);
@@ -3182,15 +3174,6 @@ async function findAlternates({ url, title, description, provider, durationSecon
   return value;
 }
 
-function originReferer(rawUrl) {
-  try {
-    const url = validateUrl(rawUrl);
-    return `${url.protocol}//${url.host}/`;
-  } catch {
-    return null;
-  }
-}
-
 function sniffImageContentType(buffer, declaredType = "") {
   const declared = String(declaredType || "").split(";")[0].trim().toLowerCase();
   if (declared.startsWith("image/")) return declared;
@@ -3205,25 +3188,7 @@ function sniffImageContentType(buffer, declaredType = "") {
 }
 
 async function fetchImageWithStrategies(imageUrl, sourceUrl = null) {
-  const imageOrigin = originReferer(imageUrl);
-  const sourceOrigin = sourceUrl ? originReferer(sourceUrl) : null;
-  const strategies = [];
-
-  if (sourceUrl) {
-    strategies.push({
-      name: "source-page",
-      headers: {
-        Referer: sourceUrl,
-        "Sec-Fetch-Dest": "image",
-        "Sec-Fetch-Mode": "no-cors",
-        "Sec-Fetch-Site": "cross-site"
-      }
-    });
-  }
-  if (sourceOrigin && sourceOrigin !== sourceUrl) strategies.push({ name: "source-origin", headers: { Referer: sourceOrigin } });
-  if (imageOrigin) strategies.push({ name: "image-origin", headers: { Referer: imageOrigin } });
-  strategies.push({ name: "no-referrer", headers: {} });
-
+  const strategies = imageRefererStrategies(imageUrl, sourceUrl);
   let lastResult = null;
   for (const strategy of strategies) {
     const result = await fetchBounded(imageUrl, {
@@ -3241,7 +3206,24 @@ async function fetchImageWithStrategies(imageUrl, sourceUrl = null) {
 }
 
 const app = express();
-app.use(cors());
+app.use((req, res, next) => {
+  const check = checkLocalApiAccess({
+    host: req.get("Host"),
+    origin: req.get("Origin"),
+    referer: req.get("Referer"),
+    fetchSite: req.get("Sec-Fetch-Site")
+  }, PORT);
+  if (!check.allowed) return res.status(403).send("local_api_access_denied");
+  if (check.origin) {
+    res.setHeader("Access-Control-Allow-Origin", check.origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  }
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  if (req.path !== "/api/image") res.setHeader("Cache-Control", "no-store");
+  next();
+});
 app.use(express.json({ limit: "1mb" }));
 
 // Internal-only resolver used by isolated Edge/yt-dlp/FFmpeg helper processes.
@@ -3281,7 +3263,7 @@ app.get("/api/network-status", (_req, res) => {
 app.get("/api/status", (_req, res) => {
   res.json({
     ok: true,
-    version: "2.7.4",
+    version: "2.7.6",
     limits: {
       globalNetwork: GLOBAL_NETWORK_LIMIT,
       perHostNetwork: PER_HOST_NETWORK_LIMIT,
@@ -3476,11 +3458,22 @@ app.post("/api/alternates", async (req, res) => {
   }
 });
 
+app.post("/api/recover-metadata", async (req, res) => {
+  if (typeof req.body?.url !== "string" || !req.body.url.trim()) return res.status(400).json({ error: "missing_url" });
+  try {
+    const privacy = normalizePrivacy(req.body?.privacy);
+    const result = await recoverHistoricalMetadata(req.body.url.trim(), privacy);
+    return res.json(result);
+  } catch (error) {
+    return res.status(400).json({ error: error?.message || "historical_recovery_failed" });
+  }
+});
+
 app.get("/api/preview", previewHandler);
 app.post("/api/preview", previewHandler);
 
 app.listen(PORT, "127.0.0.1", () => {
-  console.log(`Video preview engine v2.7.4 listening on http://127.0.0.1:${PORT}`);
+  console.log(`Video preview engine v2.7.6 listening on http://127.0.0.1:${PORT}`);
   console.log(`Network limits: ${GLOBAL_NETWORK_LIMIT} global / ${PER_HOST_NETWORK_LIMIT} per host.`);
   console.log(`DNS governor: ${DNS_BASE_RATE_PER_SECOND}/s base, ${DNS_MAX_RATE_PER_SECOND}/s max, burst ${DNS_BURST}, ${DNS_CACHE_TTL_MS / 1000}s validated cache.`);
   console.log(`Edge fallback: ${BROWSER_FALLBACK_LIMIT} isolated helper worker; helper proxy limit ${BROWSER_PROXY_NETWORK_LIMIT}.`);

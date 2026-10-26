@@ -1,0 +1,43 @@
+@echo off
+echo ============================================
+echo  RESTART SERVER + CLIENT (PATH-INJECTED)
+echo ============================================
+echo.
+
+REM --- Paths ---
+set ROOT=C:\Users\WDAGUtilityAccount\Desktop\SandboxBootstrap
+set NODEDIR=%ROOT%\node
+set NPMBIN=%NODEDIR%\node_modules\npm\bin
+set APP=C:\App
+set SERVER=%APP%\server
+set CLIENT=%APP%\client
+
+REM --- Construct PATH for child windows ---
+set CHILD_PATH=%NODEDIR%;%NPMBIN%;%PATH%
+
+echo [*] Killing any existing node processes...
+taskkill /IM node.exe /F >nul 2>&1
+echo.
+
+REM --- Create server launcher ---
+echo set PATH=%CHILD_PATH% > "%TEMP%\server-launch.cmd"
+echo cd /d "%SERVER%" >> "%TEMP%\server-launch.cmd"
+echo npm run dev >> "%TEMP%\server-launch.cmd"
+
+REM --- Create client launcher ---
+echo set PATH=%CHILD_PATH% > "%TEMP%\client-launch.cmd"
+echo cd /d "%CLIENT%" >> "%TEMP%\client-launch.cmd"
+echo npm run dev >> "%TEMP%\client-launch.cmd"
+
+echo [*] Launching SERVER window...
+start "SERVER" cmd /k "%TEMP%\server-launch.cmd"
+echo.
+
+echo [*] Launching CLIENT window...
+start "CLIENT" cmd /k "%TEMP%\client-launch.cmd"
+echo.
+
+echo ============================================
+echo  DONE — server and client windows stay open
+echo ============================================
+pause

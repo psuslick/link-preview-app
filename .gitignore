@@ -1,85 +1,78 @@
-# Logs
-logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-lerna-debug.log*
-
-node_modules
-dist
-dist-ssr
-*.local
-
-# Editor directories and files
-.vscode/*
-!.vscode/extensions.json
-.idea
-.DS_Store
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
-
-# Node
+# Node / Vite / generated files
 node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-
-# Environment files
-.env
-.env.local
-.env.*.local
-
-# Logs
-logs/
-*.log
-*.log.*
-debug.log
-
-# Build output
+**/node_modules/
 dist/
-build/
+dist-ssr/
 .cache/
 .vite/
+build/
+coverage/
+test-results/
+playwright-report/
 
-# OS junk
-.DS_Store
-Thumbs.db
-
-# Editor folders
-.vscode/
-.idea/
-
-# Temporary files
+# Local profiles, caches, secrets, logs, downloaded/scraped media
+.env
+.env.*
+!.env.example
+*.local
+*.log
+*.log.*
+logs/
+cache/
+caches/
+tmp/
+temp/
 *.tmp
 *.temp
 *.swp
 *.swo
-
-# Coverage
-coverage/
-
-# Prevent accidental persistence of scraped content
+*.bak
 *.png
 *.jpg
 *.jpeg
 *.webp
 *.mp4
+screenshots/
+*.key
+*.pem
+*.pfx
+*.p12
+*.crt
+
+# Metadata/text from scraping should not accidentally become repository source.
 *.json
 *.txt
+# Explicitly permit only source-controlled JSON manifests / npm metadata.
+!package.json
+!package-lock.json
+!**/package.json
+!**/package-lock.json
+!/edge-tab-collector/manifest.json
+!/server/index.json
 
-# Prevent accidental screenshot or metadata dumps
-screenshots/
-cache/
-tmp/
-temp/
-logs/
+# Do NOT check in personally customized Sandbox launchers, machine-specific
+# mappings, profiles or payloads. Place those under LOCAL-ONLY-DO-NOT-COMMIT.
+/LAUNCHER/LOCAL-ONLY-DO-NOT-COMMIT/
+/BOOTSTRAP/LOCAL-ONLY-DO-NOT-COMMIT/
+*.wsb
+!/LAUNCHER/linkPreviewApp-hardened.wsb
 
-# Playwright artifacts
-playwright-report/
-test-results/
+# No portable tools, binaries, caches or archives committed to source Git.
+/BOOTSTRAP/git/
+/BOOTSTRAP/node/
+/BOOTSTRAP/deps/
+/BOOTSTRAP/SearXNGforWindows*/
+*.zip
+*.exe
+*.msi
+
+# Local editor/system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

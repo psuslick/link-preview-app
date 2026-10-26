@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Sandbox Link Preview - Tab Collector",
+  "version": "1.0.0",
+  "description": "Collect open Edge tab URLs into the local Sandbox Link Preview app on request. No network calls or storage.",
+  "permissions": ["tabs"],
+  "background": { "service_worker": "worker.js" },
+  "content_scripts": [
+    {
+      "matches": ["http://localhost/*", "http://127.0.0.1/*"],
+      "js": ["bridge.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

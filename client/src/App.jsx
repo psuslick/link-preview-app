@@ -9,9 +9,12 @@ import {
   fetchPreview,
   imageProxyUrl,
   networkStatus,
+  recoverVideoMetadata,
   searxngStatus
 } from "./api.js";
 import "./App.css";
+import { extractVideoUrls, videoUrlIdentity } from "./url-identity.js";
+import { normalizeExcludedDomain, excludeUrls } from "./domain-exclusions.js";
 
 const CLIENT_CONCURRENCY = 12;
 const BROWSER_FALLBACK_CONCURRENCY = 1;
@@ -65,36 +68,6 @@ function PrivacyToggle({ checked, onChange, title, detail }) {
       <input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} />
     </label>
   );
-}
-
-function normalizeUrl(raw) {
-  try {
-    const url = new URL(raw.trim());
-    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
-    url.hash = "";
-    return url.toString();
-  } catch {
-    return null;
-  }
-}
-
-function extractUrls(text) {
-  const candidates = text
-    .split(/\s+/)
-    .map((value) => value.trim().replace(/^[<\[("']+|[>\])}"',;]+$/g, ""))
-    .filter(Boolean);
-  const seen = new Set();
-  const valid = [];
-  let invalid = 0;
-  for (const candidate of candidates) {
-    const normalized = normalizeUrl(candidate);
-    if (!normalized) { invalid += 1; continue; }
-    const key = normalized.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    valid.push(normalized);
-  }
-  return { urls: valid, invalid };
 }
 
 function domainFor(url) {
@@ -169,7 +142,7 @@ function LazyThumbnail({ sources, sourceUrl, title, allowRemoteImages = true }) 
           className="preview-image"
           loading="lazy"
           decoding="async"
-          referrerPolicy="no-referrer"
+          referrerPolicy="origin"
           onError={() => setCandidateIndex((index) => index + 1)}
         />
       ) : (
@@ -223,7 +196,7 @@ function FinderResult({ job, candidate, alreadyInList, onAdd, onCompare, privacy
       <div className="alternate-result-body">
         <div className="alternate-result-topline">
           <span className={`relation-badge ${/longer/i.test(relation) ? "longer" : /mirror|same footage/i.test(relation) ? "mirror" : "possible"}`}>{relation}</span>
-          <span className="confidence-badge">{candidate.confidence ?? 0}% rank</span>
+          <span className="confidence-badge" title="Heuristic evidence score, not a probability">{candidate.confidence ?? 0}/99 evidence</span>
           {candidateDuration && <span className="duration-badge">{candidateDuration}</span>}
           {longerBy && <span className="longer-by">+{longerBy}</span>}
         </div>
@@ -245,6 +218,7 @@ function FinderResult({ job, candidate, alreadyInList, onAdd, onCompare, privacy
         {candidate.subject && (
           <div className="search-support-note">Subject relevance: {Math.round((candidate.subject.score || 0) * 100)}%{candidate.subject.matched?.length ? ` · anchors: ${candidate.subject.matched.slice(0, 5).join(", ")}` : ""}</div>
         )}
+        {candidate.relevanceReasons?.length > 0 && <div className="search-support-note">Identity evidence: {candidate.relevanceReasons.join(" · ")}</div>}
         {candidate.description && <p>{candidate.description}</p>}
 
         {comparison?.state === "loading" && (
@@ -278,6 +252,13 @@ function FinderResult({ job, candidate, alreadyInList, onAdd, onCompare, privacy
 
 function App() {
   const [inputText, setInputText] = useState("");
+  const [excludedDomainInput, setExcludedDomainInput] = useState("");
+  const [excludedDomains, setExcludedDomains] = useState([]);
+  const [exclusionError, setExclusionError] = useState("");
+  const [collectedTabText, setCollectedTabText] = useState("");
+  const [tabCollectorStatus, setTabCollectorStatus] = useState("");
+  const [tabCollectorBusy, setTabCollectorBusy] = useState(false);
+  const pendingTabRequestRef = useRef(null);
   const [previews, setPreviews] = useState([]);
   const [selected, setSelected] = useState(() => new Set());
   const [processing, setProcessing] = useState(false);
@@ -320,6 +301,65 @@ function App() {
   useEffect(() => {
     try { localStorage.setItem(SEARXNG_ENDPOINT_STORAGE_KEY, searxngEndpoint); } catch {}
   }, [searxngEndpoint]);
+
+  useEffect(() => {
+    const handleCollectedTabs = (event) => {
+      if (event.source !== window || event.origin !== window.location.origin) return;
+      const response = event.data;
+      const pending = pendingTabRequestRef.current;
+      if (!pending || response?.source !== "sandbox-link-preview-tab-collector" || response?.type !== "SANDBOX_TAB_RESULTS_V1" || response.requestId !== pending.id) return;
+      window.clearTimeout(pending.timer);
+      pendingTabRequestRef.current = null;
+      setTabCollectorBusy(false);
+      if (response.error) { setTabCollectorStatus(`Edge tab collection failed: ${response.error}`); return; }
+      const urls = extractVideoUrls((response.urls || []).join("\n")).urls;
+      setCollectedTabText(urls.join("\n"));
+      setTabCollectorStatus(`${urls.length} distinct web tab URL${urls.length === 1 ? "" : "s"} collected in this Sandbox Edge profile (not host tabs).`);
+    };
+    window.addEventListener("message", handleCollectedTabs);
+    return () => {
+      window.removeEventListener("message", handleCollectedTabs);
+      if (pendingTabRequestRef.current) window.clearTimeout(pendingTabRequestRef.current.timer);
+    };
+  }, []);
+
+  function addExcludedDomain() {
+    const domain = normalizeExcludedDomain(excludedDomainInput);
+    if (!domain) { setExclusionError("Enter a valid domain, such as example.com or *.example.com."); return; }
+    setExcludedDomains((current) => current.includes(domain) ? current : [...current, domain]);
+    setExcludedDomainInput("");
+    setExclusionError("");
+  }
+
+  function collectOpenEdgeTabs() {
+    if (pendingTabRequestRef.current) return;
+    const id = crypto.randomUUID();
+    setTabCollectorBusy(true);
+    setTabCollectorStatus("Requesting web tab URLs from the optional Sandbox Edge extension…");
+    const timer = window.setTimeout(() => {
+      if (pendingTabRequestRef.current?.id !== id) return;
+      pendingTabRequestRef.current = null;
+      setTabCollectorBusy(false);
+      setTabCollectorStatus("Collector extension not detected. Load edge-tab-collector as an unpacked extension in this Sandbox Edge, then refresh this page.");
+    }, 6500);
+    pendingTabRequestRef.current = { id, timer };
+    window.postMessage({ source: "sandbox-link-preview-app", type: "SANDBOX_APP_COLLECT_TABS_V1", requestId: id }, window.location.origin);
+  }
+
+  function appendCollectedTabs() {
+    const parsed = extractVideoUrls(collectedTabText);
+    const filtered = excludeUrls(parsed.urls, excludedDomains);
+    if (!filtered.kept.length) { setTabCollectorStatus(`No importable URLs. ${filtered.removed.length} excluded by domain rules.`); return; }
+    setInputText((current) => [current.trim(), filtered.kept.join("\n")].filter(Boolean).join("\n"));
+    setTabCollectorStatus(`Added ${filtered.kept.length} tab URL${filtered.kept.length === 1 ? "" : "s"} to the paste list; ${filtered.removed.length} excluded. Press Create previews when ready.`);
+  }
+
+  async function copyCollectedTabs() {
+    try {
+      await navigator.clipboard.writeText(collectedTabText);
+      setTabCollectorStatus("Tab URL list copied to clipboard (one per line).");
+    } catch { setTabCollectorStatus("Clipboard unavailable; select and copy the text field manually."); }
+  }
 
 
   async function refreshSearxngState() {
@@ -593,10 +633,11 @@ function App() {
   async function handleSubmit(event) {
     event.preventDefault();
     if (processing || !inputText.trim()) return;
-    const parsed = extractUrls(inputText);
-    const existing = new Set(previews.map((item) => item.url.toLowerCase()));
-    const newUrls = parsed.urls.filter((url) => !existing.has(url.toLowerCase()));
-    const duplicateCount = parsed.urls.length - newUrls.length;
+    const parsed = extractVideoUrls(inputText);
+    const filtered = excludeUrls(parsed.urls, excludedDomains);
+    const existing = new Set(previews.map((item) => videoUrlIdentity(item.url)));
+    const newUrls = filtered.kept.filter((url) => !existing.has(videoUrlIdentity(url)));
+    const duplicateCount = filtered.kept.length - newUrls.length;
     const stamp = Date.now();
     const items = newUrls.map((url, index) => ({
       id: `${stamp}-${index}`, url, state: "queued", title: null, description: null,
@@ -612,7 +653,7 @@ function App() {
         lastBatchSize: items.length
       }));
     }
-    setImportSummary({ added: items.length, duplicates: duplicateCount, invalid: parsed.invalid });
+    setImportSummary({ added: items.length, duplicates: duplicateCount, excluded: filtered.removed.length, invalid: parsed.invalid });
     setInputText("");
     if (!items.length) return;
     setPreviews((current) => [...current, ...items]);
@@ -666,15 +707,31 @@ function App() {
     }
   }
 
+  async function recoverPreviewHistory(preview) {
+    patchPreview(preview.id, { historical: { state: "loading" } });
+    const result = await recoverVideoMetadata(preview.url, { privacy });
+    if (!result.clientOk) {
+      patchPreview(preview.id, { historical: { state: "failed", error: result.error || "archive_lookup_failed" } });
+      return;
+    }
+    patchPreview(preview.id, {
+      historical: { ...result, state: "ready" },
+      title: result.titleOrigin === "archived_page" ? result.title : preview.title || null,
+      description: result.description || preview.description || null,
+      durationSeconds: result.durationSeconds || preview.durationSeconds || null,
+      images: result.images?.length ? result.images : preview.images || []
+    });
+  }
+
   function queueSelectedVersionSearches() {
     if (!finderSearchEnabled) { setCopyStatus("Enable a search engine and at least one finder query signal in Privacy & network activity"); setTimeout(() => setCopyStatus(""), 3200); return; }
     const sources = previews.filter((item) => selected.has(item.id));
     if (!sources.length) return;
     const now = Date.now();
     const activeSourceUrls = new Set(
-      finderJobs.filter((job) => ["queued", "running"].includes(job.state)).map((job) => job.source.url.toLowerCase())
+      finderJobs.filter((job) => ["queued", "running"].includes(job.state)).map((job) => videoUrlIdentity(job.source.url))
     );
-    const jobs = sources.filter((source) => !activeSourceUrls.has(source.url.toLowerCase())).map((source, index) => ({
+    const jobs = sources.filter((source) => !activeSourceUrls.has(videoUrlIdentity(source.url))).map((source, index) => ({
       id: `finder-${now}-${index}-${Math.random().toString(36).slice(2, 7)}`,
       source: { ...source }, privacy: { ...privacy }, searxngEndpoint, state: "queued", results: [], lowRelevanceResults: [], error: null, queuedAt: Date.now(),
       note: null, diagnostics: [], queryEvidence: [], candidateCount: 0, rawDiscovered: [], rawDiscoveredCount: 0, evaluatedCount: 0, toolEvaluatedCount: 0, batchCompareState: "idle", batchCompareProgress: null
@@ -737,9 +794,9 @@ function App() {
   function clearCompletedFinderJobs() { setFinderJobs((current) => current.filter((job) => ["queued", "running"].includes(job.state))); }
 
   function addAlternate(jobId, candidate) {
-    const normalized = candidate.url?.toLowerCase();
+    const normalized = candidate.url && videoUrlIdentity(candidate.url);
     if (!normalized) return;
-    const existing = previews.find((item) => item.url.toLowerCase() === normalized);
+    const existing = previews.find((item) => videoUrlIdentity(item.url) === normalized);
     if (!existing) {
       setPreviews((current) => [...current, {
         id: `alternate-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -899,6 +956,29 @@ function App() {
       </header>
 
       <section className="import-panel">
+        <div className="import-tools-grid">
+          <div className="import-tool-box">
+            <h3>Exclude domains before import</h3>
+            <p>Ignore a domain and every subdomain in pasted links; no preview, DNS or Finder work starts for excluded URLs. Rules stay in this session only.</p>
+            <div className="import-inline-actions">
+              <input aria-label="Domain to exclude" placeholder="example1.com or *.example1.com" value={excludedDomainInput} onChange={(event) => setExcludedDomainInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addExcludedDomain(); } }} />
+              <button type="button" onClick={addExcludedDomain}>Exclude domain</button>
+            </div>
+            {exclusionError && <small className="warning-text">{exclusionError}</small>}
+            <div className="excluded-domain-list">{excludedDomains.map((domain) => <button key={domain} type="button" onClick={() => setExcludedDomains((current) => current.filter((value) => value !== domain))} title={`Remove exclusion for ${domain}`}>{domain} ×</button>)}</div>
+          </div>
+          <div className="import-tool-box">
+            <h3>Collect open Sandbox Edge tabs</h3>
+            <p>Requires the included local, unpacked Edge extension. Collects web URLs from all windows in this Sandbox Edge profile, one per line. Cannot inspect the host browser.</p>
+            <div className="import-inline-actions">
+              <button type="button" onClick={collectOpenEdgeTabs} disabled={tabCollectorBusy}>{tabCollectorBusy ? "Collecting…" : "Collect open Edge tabs"}</button>
+              <button type="button" onClick={appendCollectedTabs} disabled={!collectedTabText.trim()}>Add to paste list</button>
+              <button type="button" onClick={copyCollectedTabs} disabled={!collectedTabText.trim()}>Copy URLs</button>
+            </div>
+            <textarea aria-label="Collected tab URLs, one per line" className="tab-collector-text" placeholder="Collected URLs will appear here. You can also paste a list manually." value={collectedTabText} onChange={(event) => setCollectedTabText(event.target.value)} />
+            {tabCollectorStatus && <small>{tabCollectorStatus}</small>}
+          </div>
+        </div>
         <form onSubmit={handleSubmit} className="input-form">
           <textarea placeholder="Paste video URLs here — one per line or separated by whitespace…" value={inputText} onChange={(event) => setInputText(event.target.value)} className="multi-input" disabled={processing} />
           <button type="submit" className="primary-button" disabled={processing || !inputText.trim()}>{processing ? "Processing…" : "Create previews"}</button>
@@ -906,6 +986,7 @@ function App() {
         {importSummary && (
           <div className="import-summary">
             <strong>{importSummary.added}</strong> added <span>·</span> <strong>{importSummary.duplicates}</strong> duplicates skipped
+            {importSummary.excluded > 0 && <><span>·</span> <strong>{importSummary.excluded}</strong> excluded by domain</>}
             {importSummary.invalid > 0 && <><span>·</span> <strong>{importSummary.invalid}</strong> invalid entries ignored</>}
           </div>
         )}
@@ -1067,10 +1148,31 @@ function App() {
                         </div>
                         <h2>{preview.title || (preview.state === "failed" ? "Preview failed" : "Video preview")}</h2>
                         {preview.description && <p>{preview.description}</p>}
-                        {preview.deadLink && (
+                        {(preview.deadLink || preview.state === "failed") && (
                           <div className="challenge-box">
-                            <p className="warning-message">{preview.deadHost ? `Host ${preview.deadHostName || domainFor(preview.url)} was confirmed unreachable after repeated hard network failures; sibling links were suppressed to avoid repeated network traffic.` : "This individual URL returned the same 404/410 twice. The host itself remains eligible for other links."} Version Finder can still use URL and archive clues.</p>
-                            <div className="challenge-actions"><button type="button" onClick={() => recheckDeadPreview(preview)} disabled={processing}>Recheck URL/host</button></div>
+                            <p className="warning-message">{preview.deadHost ? `Host ${preview.deadHostName || domainFor(preview.url)} was confirmed unreachable after repeated hard network failures; sibling links were suppressed to avoid repeated network traffic.` : preview.deadLink ? "This individual URL returned the same 404/410 twice. The host itself remains eligible for other links." : "This preview failed; the site may be unavailable, protected, or temporarily unreachable."} Version Finder can still use URL and archive clues.</p>
+                            <div className="challenge-actions">
+                              <button type="button" onClick={() => recheckDeadPreview(preview)} disabled={processing}>Recheck URL/host</button>
+                              <button type="button" onClick={() => recoverPreviewHistory(preview)} disabled={preview.historical?.state === "loading"} title="On demand: use enabled Wayback/Common Crawl archives; if no title survives and DDG plus media-ID search are enabled, search DuckDuckGo for the exact URL.">{preview.historical?.state === "loading" ? "Searching archives…" : "Recover historical video details"}</button>
+                            </div>
+                            <small>Recovery is on demand. If enabled in Privacy settings, a missing archive title may trigger one DuckDuckGo lookup of this exact URL.</small>
+                            {preview.historical?.state === "failed" && <small>Recovery failed: {preview.historical.error}</small>}
+                            {preview.historical?.state === "ready" && <div className="historical-recovery">
+                              <strong>Historical information · {preview.historical.titleOrigin === "archived_page" ? "archived page" : "URL clue only"}</strong>
+                              <p>{preview.historical.note}</p>
+                              <label>Video title for Finder (editable)
+                                <input type="text" defaultValue={preview.title || preview.historical.title || ""} onChange={(event) => patchPreview(preview.id, { title: event.target.value })} placeholder="Enter known original video title" />
+                              </label>
+                              {preview.historical.uploader && <p>Uploader: {preview.historical.uploader}</p>}
+                              {preview.historical.uploadDate && <p>Published: {preview.historical.uploadDate}</p>}
+                              {preview.historical.archive?.snapshotUrl && <a href={preview.historical.archive.snapshotUrl} target="_blank" rel="noopener noreferrer">Open archived capture ↗</a>}
+                              {preview.historical.archive && <small>Source: {preview.historical.archive.provider || "Archive not found"} · {preview.historical.archive.capture || preview.historical.archive.error || "no snapshot"}</small>}
+                              {preview.historical.urlClues?.ids?.length > 0 && <small>URL IDs: {preview.historical.urlClues.ids.slice(0, 4).join(", ")}</small>}
+                              {preview.historical.archivedOutboundUrls?.length > 0 && <details><summary>Links mentioned by the archived page ({preview.historical.archivedOutboundUrls.length})</summary>{preview.historical.archivedOutboundUrls.map((link) => <div key={link}><a href={link} target="_blank" rel="noopener noreferrer">{link}</a></div>)}</details>}
+                              {preview.historical.historicalSearchDisclosure && <small>{preview.historical.historicalSearchDisclosure}</small>}
+                              {preview.historical.historicalMentions?.length > 0 && <details open><summary>Potential historical mentions ({preview.historical.historicalMentions.length}) — unverified</summary>{preview.historical.historicalMentions.map((mention, index) => <div key={`${mention.url}-${index}`}><a href={mention.url} target="_blank" rel="noopener noreferrer">{mention.title || mention.url}</a>{mention.snippet && <small>{mention.snippet}</small>}</div>)}</details>}
+                              <small>Select this item and queue Version Finder to search by the recovered or edited title.</small>
+                            </div>}
                           </div>
                         )}
                         {siteSessionEligible && preview.state !== "failed" && (
@@ -1209,7 +1311,7 @@ function App() {
                               key={candidate.url}
                               job={job}
                               candidate={candidate}
-                              alreadyInList={previews.some((item) => item.url.toLowerCase() === candidate.url.toLowerCase())}
+                              alreadyInList={previews.some((item) => videoUrlIdentity(item.url) === videoUrlIdentity(candidate.url))}
                               onAdd={(value) => addAlternate(job.id, value)}
                               onCompare={(value) => compareCandidate(job, value)}
                               privacy={job.privacy || privacy}
@@ -1230,7 +1332,7 @@ function App() {
                                 key={`low-${candidate.url}`}
                                 job={job}
                                 candidate={candidate}
-                                alreadyInList={previews.some((item) => item.url.toLowerCase() === candidate.url.toLowerCase())}
+                                alreadyInList={previews.some((item) => videoUrlIdentity(item.url) === videoUrlIdentity(candidate.url))}
                                 onAdd={(value) => addAlternate(job.id, value)}
                                 onCompare={(value) => compareCandidate(job, value)}
                                 privacy={job.privacy || privacy}

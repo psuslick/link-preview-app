@@ -1,10 +1,10 @@
 import http from "node:http";
 import net from "node:net";
-import dns from "node:dns";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { resolveViaDnsGovernor } from "./dns-governor-client.js";
+import { isBlockedAddress as isNonPublicAddress } from "./public-network-policy.js";
 
 const targetUrl = process.argv[2];
 const toolsDir = process.argv[3];
@@ -39,42 +39,8 @@ function hostGate(hostname) {
   return hostGates.get(key);
 }
 
-function isBlockedIPv4(address) {
-  const p = address.split(".").map(Number);
-  if (p.length !== 4 || p.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true;
-  const [a, b, c] = p;
-  if (a === 0 || a === 10 || a === 127) return true;
-  if (a === 100 && b >= 64 && b <= 127) return true;
-  if (a === 169 && b === 254) return true;
-  if (a === 172 && b >= 16 && b <= 31) return true;
-  if (a === 192 && b === 168) return true;
-  if (a === 198 && (b === 18 || b === 19)) return true;
-  if (a >= 224) return true;
-  if (a === 192 && b === 0 && c === 2) return true;
-  if (a === 198 && b === 51 && c === 100) return true;
-  if (a === 203 && b === 0 && c === 113) return true;
-  return false;
-}
-
-function isBlockedIPv6(address) {
-  const lower = String(address || "").toLowerCase();
-  if (lower === "::" || lower === "::1") return true;
-  if (lower.startsWith("fc") || lower.startsWith("fd")) return true;
-  if (/^fe[89ab]/.test(lower)) return true;
-  if (lower.startsWith("ff")) return true;
-  if (lower.startsWith("2001:db8")) return true;
-  if (lower.startsWith("::ffff:")) {
-    const mapped = lower.slice("::ffff:".length);
-    if (net.isIP(mapped) === 4) return isBlockedIPv4(mapped);
-  }
-  return false;
-}
-
 function isBlockedAddress(address) {
-  const family = net.isIP(address);
-  if (family === 4) return isBlockedIPv4(address);
-  if (family === 6) return isBlockedIPv6(address);
-  return true;
+  return isNonPublicAddress(address);
 }
 
 function validateHostname(hostname) {

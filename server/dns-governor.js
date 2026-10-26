@@ -1,7 +1,5 @@
 import dns from "node:dns";
 
-function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
-
 export class DnsGovernor {
   constructor({
     baseRate = 6,
@@ -13,6 +11,7 @@ export class DnsGovernor {
     slowLookupMs = 750,
     healthyLookupMs = 175,
     lookupTimeoutMs = 5_000,
+    lookup = (hostname, options) => dns.promises.lookup(hostname, options),
     validateAddresses = (addresses) => addresses
   } = {}) {
     this.baseRate = baseRate;
@@ -24,6 +23,7 @@ export class DnsGovernor {
     this.slowLookupMs = slowLookupMs;
     this.healthyLookupMs = healthyLookupMs;
     this.lookupTimeoutMs = lookupTimeoutMs;
+    this.lookup = lookup;
     this.validateAddresses = validateAddresses;
 
     this.currentRate = baseRate;
@@ -149,11 +149,11 @@ export class DnsGovernor {
     if (latencyMs >= this.slowLookupMs) {
       this.metrics.slowLookups += 1;
       this._enterPressure(`slow_lookup_${Math.round(latencyMs)}ms`);
-      return;
+      return true;
     }
 
     const now = Date.now();
-    if (!ok || now < this.pressureUntil) return;
+    if (!ok || now < this.pressureUntil) return false;
     if (latencyMs <= this.healthyLookupMs && now - this.lastRampAt >= 10_000 && this.currentRate < this.maxRate) {
       this.currentRate = Math.min(this.maxRate, this.currentRate + 0.5);
       this.lastRampAt = now;
@@ -161,6 +161,7 @@ export class DnsGovernor {
       this.currentRate = Math.min(this.baseRate, this.currentRate + 0.5);
       this.lastRampAt = now;
     }
+    return false;
   }
 
   _isPressureError(error) {
@@ -175,12 +176,15 @@ export class DnsGovernor {
     this.metrics.activeLookups += 1;
     this.metrics.freshLookups += 1;
     this._recordFreshLookup(started);
+    let timeoutHandle;
     try {
-      const lookupPromise = dns.promises.lookup(hostname, { all: true, verbatim: true });
-      const timeoutPromise = sleep(this.lookupTimeoutMs).then(() => {
-        const error = new Error("dns_lookup_timeout");
-        error.code = "ETIMEOUT";
-        throw error;
+      const lookupPromise = this.lookup(hostname, { all: true, verbatim: true });
+      const timeoutPromise = new Promise((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          const error = new Error("dns_lookup_timeout");
+          error.code = "ETIMEOUT";
+          reject(error);
+        }, this.lookupTimeoutMs);
       });
       const raw = await Promise.race([lookupPromise, timeoutPromise]);
       const addresses = this.validateAddresses(raw, hostname);
@@ -194,10 +198,11 @@ export class DnsGovernor {
       this.metrics.errors += 1;
       this.metrics.lastError = String(error?.code || error?.message || "dns_lookup_failed");
       this.metrics.lastErrorAt = Date.now();
-      this._recordLatency(latency, false);
-      if (this._isPressureError(error)) this._enterPressure(this.metrics.lastError);
+      const enteredPressure = this._recordLatency(latency, false);
+      if (!enteredPressure && this._isPressureError(error)) this._enterPressure(this.metrics.lastError);
       throw error;
     } finally {
+      clearTimeout(timeoutHandle);
       this.metrics.activeLookups = Math.max(0, this.metrics.activeLookups - 1);
     }
   }

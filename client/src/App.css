@@ -68,6 +68,26 @@ h1 {
 
 .import-panel { padding: 14px; }
 
+.import-tools-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 13px; }
+.import-tool-box { min-width: 0; border: 1px solid #2a3545; border-radius: 9px; background: #111824; padding: 12px; }
+.import-tool-box h3 { margin: 0 0 5px; font-size: 0.94rem; }
+.import-tool-box p, .import-tool-box small { color: #aab6c6; font-size: 0.79rem; line-height: 1.4; }
+.import-tool-box p { margin: 0 0 10px; }
+.import-inline-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-bottom: 8px; }
+.import-inline-actions input { flex: 1; min-width: 140px; background: #090d13; color: #eef2f7; border: 1px solid #34435a; border-radius: 7px; padding: 8px; }
+.import-inline-actions button, .excluded-domain-list button { border: 1px solid #3c4c65; background: #1b2b3f; color: #e4ebf6; padding: 8px 10px; border-radius: 7px; cursor: pointer; }
+.import-inline-actions button:disabled { opacity: .45; cursor: default; }
+.excluded-domain-list { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.excluded-domain-list button { background: #34242a; border-color: #6a3c43; font-size: .78rem; }
+.tab-collector-text { display: block; resize: vertical; min-height: 68px; max-height: 200px; width: 100%; background: #090d13; color: #eef2f7; border: 1px solid #34435a; border-radius: 7px; padding: 8px; margin: 7px 0; }
+.historical-recovery { margin-top: 10px; padding: 10px; border: 1px solid #3a5269; border-radius: 7px; background: rgba(18, 35, 50, .7); overflow-wrap: anywhere; }
+.historical-recovery p { margin: 7px 0; }
+.historical-recovery small { display: block; color: #b8c9d7; margin: 6px 0; }
+.historical-recovery label { display: block; font-size: .82rem; }
+.historical-recovery input { display: block; width: 100%; margin-top: 5px; padding: 7px; background: #090d13; color: #eef2f7; border: 1px solid #45617c; border-radius: 6px; }
+.historical-recovery details { max-height: 170px; overflow: auto; }
+@media (max-width: 760px) { .import-tools-grid { grid-template-columns: 1fr; } }
+
 .input-form {
   display: grid;
   grid-template-columns: 1fr auto;

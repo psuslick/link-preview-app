@@ -1,0 +1,86 @@
+@echo off
+echo ============================================
+echo  START DIAGNOSTIC (AUTO-INSTALL ENABLED)
+echo ============================================
+echo.
+
+REM --- Paths ---
+set ROOT=C:\Users\WDAGUtilityAccount\Desktop\SandboxBootstrap
+set NODEDIR=%ROOT%\node
+set NPMCMD=%NODEDIR%\npm.cmd
+
+set APP=C:\App
+set SERVER=%APP%\server
+set CLIENT=%APP%\client
+
+REM --- Construct PATH for child windows ---
+set PATH=%NODEDIR%;%PATH%
+
+echo [*] Using portable Node + npm from:
+echo     %NODEDIR%
+echo.
+
+REM ============================================================
+REM  AUTO-INSTALL: SERVER
+REM ============================================================
+echo [*] Checking server dependencies...
+if not exist "%SERVER%\node_modules" (
+    echo     node_modules missing — installing...
+    pushd "%SERVER%"
+    "%NPMCMD%" install
+    popd
+) else (
+    echo     node_modules present.
+)
+echo.
+
+REM ============================================================
+REM  AUTO-INSTALL: CLIENT
+REM ============================================================
+echo [*] Checking client dependencies...
+if not exist "%CLIENT%\node_modules" (
+    echo     node_modules missing — installing...
+    pushd "%CLIENT%"
+    "%NPMCMD%" install
+    popd
+) else (
+    echo     node_modules present.
+)
+echo.
+
+REM ============================================================
+REM  KILL EXISTING NODE PROCESSES
+REM ============================================================
+echo [*] Killing any existing node processes...
+taskkill /IM node.exe /F >nul 2>&1
+echo.
+
+REM ============================================================
+REM  CREATE SERVER LAUNCHER
+REM ============================================================
+echo set PATH=%PATH% > "%TEMP%\server-launch.cmd"
+echo cd /d "%SERVER%" >> "%TEMP%\server-launch.cmd"
+echo "%NPMCMD%" run dev >> "%TEMP%\server-launch.cmd"
+
+REM ============================================================
+REM  CREATE CLIENT LAUNCHER
+REM ============================================================
+echo set PATH=%PATH% > "%TEMP%\client-launch.cmd"
+echo cd /d "%CLIENT%" >> "%TEMP%\client-launch.cmd"
+echo "%NPMCMD%" run dev >> "%TEMP%\client-launch.cmd"
+
+REM ============================================================
+REM  LAUNCH WINDOWS
+REM ============================================================
+echo [*] Launching SERVER window...
+start "SERVER" cmd /k "%TEMP%\server-launch.cmd"
+echo.
+
+echo [*] Launching CLIENT window...
+start "CLIENT" cmd /k "%TEMP%\client-launch.cmd"
+echo.
+
+echo ============================================
+echo  DONE — server and client windows stay open
+echo ============================================
+pause

@@ -1,0 +1,78 @@
+@echo off
+echo === Sandbox App Runner ===
+echo.
+
+REM --- Hard-coded mapped folder path inside Sandbox ---
+set ROOT=C:\Users\WDAGUtilityAccount\Desktop\SandboxBootstrap
+
+REM --- Git paths (portable Git) ---
+set GITDIR=%ROOT%\git
+set GITEXE=%GITDIR%\cmd\git.exe
+
+REM --- Node path (portable Node) ---
+set NODE=%ROOT%\node\node.exe
+set NPM=%ROOT%\node\npm.cmd
+
+REM --- Fix Git environment (required for portable Git) ---
+set HOME=%ROOT%\git\home
+set GIT_HOME=%GITDIR%
+set GIT_EXEC_PATH=%GITDIR%\mingw64\libexec\git-core
+set GIT_SHELL=%GITDIR%\bin\bash.exe
+
+set PATH=%GITDIR%\cmd;%GITDIR%\usr\bin;%GITDIR%\mingw64\bin;%ROOT%\node;%PATH%
+
+echo [+] Git EXE: %GITEXE%
+echo [+] Node:    %NODE%
+echo.
+
+REM --- Verify tools exist ---
+if not exist "%GITEXE%" (
+    echo [!] git.exe not found at %GITEXE%
+    pause
+    exit /b
+)
+
+if not exist "%NODE%" (
+    echo [!] node.exe not found at %NODE%
+    pause
+    exit /b
+)
+
+REM --- Prepare app directory ---
+set APP=C:\App
+if exist "%APP%" rmdir /s /q "%APP%"
+mkdir "%APP%"
+
+echo [+] Cloning app repo fresh...
+"%GITEXE%" clone https://github.com/psuslick/link-preview-app.git "%APP%"
+if errorlevel 1 (
+    echo [!] Git clone failed
+    pause
+    exit /b
+)
+
+REM --- Install backend dependencies ---
+echo [+] Installing backend dependencies...
+cd "%APP%\server"
+"%NPM%" install
+
+REM --- Install frontend dependencies ---
+echo [+] Installing frontend dependencies...
+cd "%APP%\client"
+"%NPM%" install
+
+REM --- Start backend ---
+echo [+] Starting backend...
+start powershell -NoLogo -Command "cd '%APP%\server'; npm run dev"
+
+REM --- Start frontend ---
+echo [+] Starting frontend...
+start powershell -NoLogo -Command "cd '%APP%\client'; npm run dev"
+
+REM --- Launch browser ---
+echo [+] Launching Edge...
+start msedge.exe http://localhost:5173
+
+echo.
+echo === DONE ===
+pause
