@@ -102,6 +102,6 @@ echo [!] Portable Node/npm not found beneath %NODEDIR%
 pause
 exit /b 1
 :CLONE_FAIL
-echo [!] Git clone failed. The published repository must contain the full v2.7.6 app.
+echo [!] Git clone failed. The published repository must contain the full application source.
 pause
 exit /b 1

@@ -17,6 +17,7 @@ import { isBlockedAddress } from "./public-network-policy.js";
 import { checkLocalApiAccess } from "./local-api-access.js";
 import { imageRefererStrategies } from "./image-referer-policy.js";
 import { evaluateCandidateEvidence } from "./finder-relevance.js";
+import { headHasThumbnailMetadata, isGenericGateTitle, isAgeVerificationPage, shouldFetchFullHtml } from "./preview-pass-policy.js";
 
 const PORT = 3000;
 const USER_AGENT =
@@ -578,11 +579,12 @@ function agentFor(url) {
 }
 
 async function readLimitedBody(body, maxBytes, stopAtHeadEnd = false) {
-  if (!body) return { buffer: Buffer.alloc(0), bytes: 0, truncated: false };
+  if (!body) return { buffer: Buffer.alloc(0), bytes: 0, truncated: false, headOnly: false };
   const chunks = [];
   let bytes = 0;
   let truncated = false;
   let asciiProbe = "";
+  let endedAtHead = false;
 
   for await (const rawChunk of body) {
     const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk);
@@ -598,7 +600,17 @@ async function readLimitedBody(body, maxBytes, stopAtHeadEnd = false) {
     if (stopAtHeadEnd) {
       asciiProbe += used.toString("utf8").toLowerCase();
       if (asciiProbe.length > 64 * 1024) asciiProbe = asciiProbe.slice(-64 * 1024);
-      if (asciiProbe.includes("</head>")) break;
+      const headEnd = asciiProbe.indexOf("</head>");
+      if (headEnd >= 0) {
+        // Fast path: stop at metadata-rich <head>. If no poster/image hint is
+        // present, continue streaming the same response instead of throwing
+        // away the connection and fetching the page a second time.
+        if (headHasThumbnailMetadata(asciiProbe.slice(0, headEnd))) {
+          endedAtHead = true;
+          break;
+        }
+        stopAtHeadEnd = false;
+      }
     }
     if (chunk.length > remaining || bytes >= maxBytes) {
       truncated = true;
@@ -606,8 +618,8 @@ async function readLimitedBody(body, maxBytes, stopAtHeadEnd = false) {
     }
   }
 
-  if (truncated || stopAtHeadEnd) body.destroy?.();
-  return { buffer: Buffer.concat(chunks), bytes, truncated };
+  if (truncated || endedAtHead) body.destroy?.();
+  return { buffer: Buffer.concat(chunks), bytes, truncated, headOnly: endedAtHead };
 }
 
 function browserLikeHeaders(kind, extraHeaders = {}) {
@@ -712,6 +724,7 @@ async function fetchBounded(
           buffer: kind === "image" ? body.buffer : null,
           bytes: body.bytes,
           truncated: body.truncated,
+          headOnly: body.headOnly,
           headers: {
             retryAfter: response.headers.get("retry-after") || null,
             server: response.headers.get("server") || null
@@ -908,10 +921,37 @@ function extractDomImageCandidates($) {
   };
 
   $("video[poster]").each((_, element) => add($(element).attr("poster"), 30, "video-poster"));
+  $("video[data-poster], [data-video-poster]").slice(0, 100).each((_, element) => {
+    add($(element).attr("data-poster") || $(element).attr("data-video-poster"), 28, "video-data-poster");
+  });
+  // Responsive/lazy image candidates often carry the only visible poster URL.
+  // Prefer wider variants; URLs remain subject to the existing public-network guard.
+  $("img[srcset], img[data-srcset], source[srcset], source[data-srcset]").slice(0, 250).each((_, element) => {
+    const el = $(element);
+    const context = `${el.attr("class") || ""} ${el.attr("id") || ""} ${el.attr("alt") || ""} ${el.attr("data-testid") || ""}`.toLowerCase();
+    const width = Number.parseInt(el.attr("width") || "", 10);
+    const entries = [];
+    for (const attr of ["srcset", "data-srcset"]) {
+      const srcset = el.attr(attr);
+      if (!srcset) continue;
+      for (const segment of srcset.split(",").slice(0, 14)) {
+        const part = segment.trim().match(/^(\S+)\s*(?:(\d+)(?:w|x))?$/i);
+        if (part) entries.push({ url: part[1], size: Number(part[2]) || 0 });
+      }
+    }
+    entries.sort((a, b) => b.size - a.size);
+    const hint = /poster|thumbnail|thumb|preview|video|player|cover|hero/.test(context);
+    for (const entry of entries.slice(0, 3)) {
+      const imageUrlHint = /poster|thumbnail|thumb|preview|video|player|cover/i.test(entry.url);
+      if (hint || imageUrlHint || (Number.isFinite(width) && width >= 320)) {
+        add(entry.url, hint || imageUrlHint ? 13 : 3, "srcset");
+      }
+    }
+  });
 
   $("img").slice(0, 400).each((_, element) => {
     const el = $(element);
-    const attrs = ["src", "data-src", "data-lazy-src", "data-original", "data-image", "data-thumb", "data-thumbnail", "data-poster"];
+    const attrs = ["src", "data-src", "data-lazy-src", "data-original", "data-image", "data-thumb", "data-thumbnail", "data-poster", "data-background-image", "data-preview", "data-cover"];
     const haystack = [el.attr("id"), el.attr("class"), el.attr("alt")].filter(Boolean).join(" ").toLowerCase();
     const width = Number.parseInt(el.attr("width") || el.attr("data-width") || "", 10);
     const height = Number.parseInt(el.attr("height") || el.attr("data-height") || "", 10);
@@ -978,6 +1018,9 @@ function extractHtmlMetadata(html, pageUrl) {
     ...metas('meta[property="og:image:secure_url"]'),
     ...metas('meta[property="og:image"]'),
     ...metas('meta[property="og:image:url"]'),
+    ...metas('meta[property="og:video:thumbnail"]'),
+    ...metas('meta[property="video:thumbnail"]'),
+    ...metas('meta[name="video:thumbnail"]'),
     ...metas('meta[name="twitter:image"]'),
     ...metas('meta[name="twitter:image:src"]'),
     ...metas('meta[property="twitter:image"]'),
@@ -1006,13 +1049,13 @@ function extractHtmlMetadata(html, pageUrl) {
     .attr("href");
 
   return {
-    title: firstNonEmpty(
+    title: firstNonEmpty(...[
       meta('meta[property="og:title"]'),
       meta('meta[name="twitter:title"]'),
       videoObject?.name,
       videoObject?.headline,
       $("title").first().text()
-    ),
+    ].filter((entry) => !isGenericGateTitle(entry))),
     description: firstNonEmpty(
       meta('meta[property="og:description"]'),
       meta('meta[name="twitter:description"]'),
@@ -1589,10 +1632,35 @@ async function createPreview(rawUrl, { allowBrowserFallback = true, forceReachab
     const confirmationChallenge = detectChallengePage(goneConfirmation.text, goneConfirmation.status);
     if (goneConfirmation.status === htmlResult.status && !confirmationChallenge) confirmedGoneStatus = htmlResult.status;
   }
-  const httpMetadata = htmlResult.ok && !httpChallenge
+  // Parse publicly exposed metadata even on 401/403 interstitial responses.
+  // These pages sometimes include video OG posters while the player is gated;
+  // merely reading those posters does not grant access to the protected player.
+  const httpMetadata = htmlResult.text && !httpChallenge && (htmlResult.ok || [401, 403, 451].includes(htmlResult.status))
     ? extractHtmlMetadata(htmlResult.text, htmlResult.finalUrl || targetUrl)
     : null;
-  let metadata = httpMetadata || {
+  let fullHtmlMetadata = null;
+  let fullHtmlBytes = 0;
+  let fullHtmlRead = false;
+  const isAgeGate = isAgeVerificationPage(htmlResult.text);
+  if (shouldFetchFullHtml({
+    status: htmlResult.status,
+    contentType: htmlResult.contentType,
+    html: htmlResult.text,
+    hasImages: Boolean(httpMetadata?.image),
+    challenge: Boolean(httpChallenge),
+    incomplete: Boolean(htmlResult.truncated || htmlResult.headOnly)
+  })) {
+    // No interactive browser, no cookies or age attestation. A single bounded
+    // follow-up fetch permits body scripts, JSON-LD and lazy DOM posters to be seen.
+    // Retries=0 avoids multiplying requests to throttling-sensitive video hosts.
+    const expanded = await fetchBounded(targetUrl, { kind: "media-page", timeoutMs: 6500, retries: 0 });
+    fullHtmlRead = true;
+    fullHtmlBytes = expanded.bytes || 0;
+    if (expanded.ok && /html|xhtml/i.test(expanded.contentType || "text/html") && !detectChallengePage(expanded.text, expanded.status)) {
+      fullHtmlMetadata = extractHtmlMetadata(expanded.text, expanded.finalUrl || targetUrl);
+    }
+  }
+  let metadata = fullHtmlMetadata || httpMetadata || {
     title: providerMetadata?.title || null,
     description: providerMetadata?.description || null,
     image: null,
@@ -1603,15 +1671,16 @@ async function createPreview(rawUrl, { allowBrowserFallback = true, forceReachab
     extractorStats: null
   };
 
+  metadata = mergeMetadata(metadata, httpMetadata, htmlResult.finalUrl || targetUrl);
   metadata = mergeMetadata(metadata, providerMetadata, htmlResult.finalUrl || targetUrl);
   let discoveredOembedAttempted = false;
 
   // Discovery order matters: try an advertised oEmbed endpoint first, then decide
   // whether a real browser is required. v2.2.1 incorrectly treated the mere
   // presence of an oEmbed link as proof that browser fallback was unnecessary.
-  if (!metadata.image && httpMetadata?.oembedUrl) {
+  if (!metadata.image && metadata?.oembedUrl) {
     discoveredOembedAttempted = true;
-    const discovered = await fetchOEmbed(httpMetadata.oembedUrl, targetUrl, metadata.provider);
+    const discovered = await fetchOEmbed(metadata.oembedUrl, targetUrl, metadata.provider);
     if (discovered) metadata = mergeMetadata(discovered, metadata, targetUrl);
   }
 
@@ -1628,7 +1697,7 @@ async function createPreview(rawUrl, { allowBrowserFallback = true, forceReachab
   const hasAuthorizedSession = Boolean(authorizedProfile || authorizedLiveSession);
   const needsBrowserFallback = Boolean(
     (httpChallenge && hasAuthorizedSession) ||
-    (!httpChallenge && (restrictedStatus || (htmlResult.ok && !metadata.image)))
+    (!httpChallenge && !isAgeGate && (restrictedStatus || (htmlResult.ok && !metadata.image)))
   );
   const shouldTryBrowser = allowBrowserFallback && needsBrowserFallback;
 
@@ -1680,12 +1749,15 @@ async function createPreview(rawUrl, { allowBrowserFallback = true, forceReachab
         ? "edge-rendered-metadata"
         : "edge-no-thumbnail"
       : images.length
-        ? "video-metadata"
+        ? fullHtmlMetadata?.image ? "body-script-metadata" : "video-metadata"
         : htmlResult.ok
           ? "metadata-no-thumbnail"
           : "blocked-no-thumbnail",
     upstreamStatus: htmlResult.status || providerMetadata?.upstreamStatus || null,
-    bytesRead: (htmlResult.bytes || 0) + (providerMetadata?.bytesRead || 0),
+    bytesRead: (htmlResult.bytes || 0) + fullHtmlBytes + (providerMetadata?.bytesRead || 0),
+    passiveBodyRead: Boolean(htmlResult.text && !htmlResult.headOnly),
+    passiveBodyRetry: fullHtmlRead,
+    ageVerificationRequired: Boolean(isAgeGate && !images.length),
     elapsedMs: Date.now() - started,
     cached: false,
     warning,
@@ -1705,6 +1777,7 @@ async function createPreview(rawUrl, { allowBrowserFallback = true, forceReachab
     siteSessionRecommended: Boolean(
       !images.length && (
         httpChallenge ||
+        isAgeGate ||
         browserChallenge ||
         needsBrowserFallback ||
         (browserFallbackAttempted && browserError) ||
@@ -1712,7 +1785,7 @@ async function createPreview(rawUrl, { allowBrowserFallback = true, forceReachab
       )
     ),
     needsBrowserFallback: needsBrowserFallback && !allowBrowserFallback,
-    extractorStats: httpMetadata?.extractorStats || null,
+    extractorStats: fullHtmlMetadata?.extractorStats || httpMetadata?.extractorStats || null,
     browserExtractorStats,
     deadLink: Boolean(confirmedGoneStatus),
     deadHost: false,
@@ -1722,7 +1795,10 @@ async function createPreview(rawUrl, { allowBrowserFallback = true, forceReachab
     goneConfirmationStatus: goneConfirmation?.status || null
   };
 
-  if ((value.image || value.title) && !value.needsBrowserFallback && !value.deadLink) cacheSet(cacheKey, value);
+  // Do not persist a title-only, still-unresolved response. Otherwise a Retry
+  // (including after a user completes a legitimate site session) can replay
+  // stale metadata without ever requesting the actual video page again.
+  if (value.image && !value.needsBrowserFallback && !value.deadLink) cacheSet(cacheKey, value);
   return value;
 }
 
@@ -3263,7 +3339,7 @@ app.get("/api/network-status", (_req, res) => {
 app.get("/api/status", (_req, res) => {
   res.json({
     ok: true,
-    version: "2.7.6",
+    version: "2.7.7",
     limits: {
       globalNetwork: GLOBAL_NETWORK_LIMIT,
       perHostNetwork: PER_HOST_NETWORK_LIMIT,
@@ -3473,7 +3549,7 @@ app.get("/api/preview", previewHandler);
 app.post("/api/preview", previewHandler);
 
 app.listen(PORT, "127.0.0.1", () => {
-  console.log(`Video preview engine v2.7.6 listening on http://127.0.0.1:${PORT}`);
+  console.log(`Video preview engine v2.7.7 listening on http://127.0.0.1:${PORT}`);
   console.log(`Network limits: ${GLOBAL_NETWORK_LIMIT} global / ${PER_HOST_NETWORK_LIMIT} per host.`);
   console.log(`DNS governor: ${DNS_BASE_RATE_PER_SECOND}/s base, ${DNS_MAX_RATE_PER_SECOND}/s max, burst ${DNS_BURST}, ${DNS_CACHE_TTL_MS / 1000}s validated cache.`);
   console.log(`Edge fallback: ${BROWSER_FALLBACK_LIMIT} isolated helper worker; helper proxy limit ${BROWSER_PROXY_NETWORK_LIMIT}.`);

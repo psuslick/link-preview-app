@@ -1178,9 +1178,11 @@ function App() {
                         {siteSessionEligible && preview.state !== "failed" && (
                           <div className="challenge-box">
                             <p className="warning-message">
-                              {preview.challengeDetected
-                                ? "The lightweight preview was blocked or challenged. Open one reusable Sandbox site session."
-                                : "No thumbnail was exposed to the unattended preview. This site may require an Accept/consent/age/cookie prompt in a normal browser. Open one reusable Sandbox site session."}
+                              {preview.ageVerificationRequired
+                                ? "The site appears to require age verification. Public metadata did not expose a thumbnail, so completing the site's verification manually may be necessary."
+                                : preview.challengeDetected
+                                  ? "The lightweight preview was blocked or challenged. Open one reusable Sandbox site session."
+                                  : "No public thumbnail could be recovered from page headers, body metadata or the unattended browser. This site may require a cookie-consent or login step."}
                               {" "}After one successful Retry, other unresolved previews from this same site can reuse the session, but they will not retry automatically.
                             </p>
                             <div className="challenge-actions">
@@ -1219,6 +1221,9 @@ function App() {
                               <div><dt>Thumbnails</dt><dd>{preview.images?.length || (preview.image ? 1 : 0)}</dd></div>
                               <div><dt>HTTP extractor</dt><dd>{preview.extractorStats ? `meta ${preview.extractorStats.meta || 0} · json ${preview.extractorStats.json || 0} · script ${preview.extractorStats.script || 0} · poster ${preview.extractorStats.poster || 0} · dom ${preview.extractorStats.dom || 0}` : "—"}</dd></div>
                               <div><dt>Edge extractor</dt><dd>{preview.browserExtractorStats ? `meta ${preview.browserExtractorStats.meta || 0} · json ${preview.browserExtractorStats.json || 0} · script ${preview.browserExtractorStats.script || 0} · poster ${preview.browserExtractorStats.poster || 0} · dom ${preview.browserExtractorStats.dom || 0}` : "—"}</dd></div>
+                              <div><dt>Body metadata scanned</dt><dd>{preview.passiveBodyRead ? "yes" : "not needed"}</dd></div>
+                              <div><dt>Additional HTML fetch</dt><dd>{preview.passiveBodyRetry ? "yes — bounded" : "no"}</dd></div>
+                              <div><dt>Age-gate indicator</dt><dd>{preview.ageVerificationRequired ? "manual verification may be required" : "none detected"}</dd></div>
                               <div><dt>Browser fallback</dt><dd>{preview.browserFallback ? "used" : preview.browserFallbackAttempted ? "attempted" : "no"}</dd></div>
                               <div><dt>Authorized session</dt><dd>{preview.authorizedBrowserSession ? "live Edge" : preview.authorizedBrowserProfile ? "saved profile" : preview.authorizationState || "no"}</dd></div>
                               <div><dt>Fallback error</dt><dd>{preview.browserFallbackError || "none"}</dd></div>
