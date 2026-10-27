@@ -15,9 +15,11 @@ import {
 import "./App.css";
 import { extractVideoUrls, videoUrlIdentity } from "./url-identity.js";
 import { normalizeExcludedDomain, excludeUrls } from "./domain-exclusions.js";
+import { shouldContinueHostProbes } from "./preview-batch-policy.js";
 
 const CLIENT_CONCURRENCY = 4;
 const BROWSER_FALLBACK_CONCURRENCY = 1;
+const HOST_FALLBACK_SAMPLE_LIMIT = 3; // Cap independent page probes before deferring a uniformly blocked host.
 const AUTHORIZED_SITE_AUTO_RETRIES = 12;
 const FINDER_CONCURRENCY = 1;
 const BATCH_COMPARE_LIMIT = 5;
@@ -579,28 +581,48 @@ function App() {
         }
         const remainingFallbackItems = [];
         for (const [host, hostItems] of fallbackGroups) {
-          const first = hostItems[0];
-          patchPreview(first.id, { state: "loading", error: null, method: "edge-fallback-queued" });
-          const result = await fetchPreview(first.url, { allowBrowserFallback: true, privacy, forceReachability: forceReachability && Boolean(first.deadLink) });
-          patchPreview(first.id, {
-            ...result,
-            browserFallbackQueued: false,
-            state: result.clientOk ? "ready" : "failed",
-            error: result.clientOk ? result.error || null : result.error || `HTTP ${result.clientStatus}`
-          });
-          if (result.clientOk && needsAuthorizedSiteRetry(result)) {
-            // Do not cascade into automatic interactive retries. Mark same-host siblings
-            // as site-session candidates and leave them idle until the user explicitly
-            // opens/reuses the shared Sandbox site session.
-            for (const sibling of hostItems.slice(1)) {
+          // A single difficult page is not proof that every other URL on this host
+          // is behind the same interstitial. Sample a few *distinct* URLs, not
+          // just the first. Stop after a successful public preview; otherwise
+          // defer the remainder to avoid hammering an inaccessible site.
+          let sampleCount = 0;
+          let foundWorkingPublicPreview = false;
+          for (const item of hostItems.slice(0, HOST_FALLBACK_SAMPLE_LIMIT)) {
+            sampleCount += 1;
+            patchPreview(item.id, { state: "loading", error: null, method: "edge-fallback-queued" });
+            const result = await fetchPreview(item.url, { allowBrowserFallback: true, privacy, forceReachability: forceReachability && Boolean(item.deadLink) });
+            patchPreview(item.id, {
+              ...result,
+              browserFallbackQueued: false,
+              state: result.clientOk ? "ready" : "failed",
+              error: result.clientOk ? result.error || null : result.error || `HTTP ${result.clientStatus}`
+            });
+            if (result.clientOk && result.image) {
+              foundWorkingPublicPreview = true;
+              break;
+            }
+            if (result.clientOk && needsAuthorizedSiteRetry(result)) siteSessionItems.push({ ...item, ...result });
+            // Known verification/challenge responses and broken browser tooling
+            // should not trigger more attempts against the same host.
+            if (!shouldContinueHostProbes(result, sampleCount, HOST_FALLBACK_SAMPLE_LIMIT)) break;
+          }
+          const rest = hostItems.slice(sampleCount);
+          if (foundWorkingPublicPreview) {
+            // The host can serve public thumbnails; do not suppress its other
+            // video URLs merely because an earlier page was blocked.
+            remainingFallbackItems.push(...rest);
+          } else {
+            // Bound the cost when several distinct pages on this host could not
+            // expose public metadata, while keeping retries explicitly available.
+            for (const sibling of rest) {
               patchPreview(sibling.id, {
+                browserFallbackQueued: false,
+                browserFallbackSkippedReason: "same_host_public_probe_unresolved",
                 siteSessionRecommended: true,
                 authorizationState: "needs-attention",
-                authorizationMessage: `A reusable site session may be needed for ${host}. Automatic browser retries were skipped to protect Sandbox stability.`
+                authorizationMessage: `No thumbnail found on ${sampleCount} independent ${host} pages. Additional browser probes were paused to protect network responsiveness; open a site session or retry this item.`
               });
             }
-          } else {
-            remainingFallbackItems.push(...hostItems.slice(1));
           }
         }
 

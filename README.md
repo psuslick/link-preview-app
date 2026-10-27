@@ -1,7 +1,7 @@
-# Link Preview App — complete v2.7.8 source tree
+# Link Preview App — complete v2.7.9 source tree
 
 This is the **complete application source tree**, assembled from the supplied
-`link-preview-app.zip` and the v2.7.6 source, followed by the v2.7.7 and v2.7.8 preview improvements. The Git history (`.git/`) and
+`link-preview-app.zip` and the v2.7.6 source, followed by the v2.7.7, v2.7.8 and v2.7.9 preview improvements. The Git history (`.git/`) and
 installed dependencies are intentionally **not** distributed in the ZIP.
 
 ```text
@@ -56,6 +56,15 @@ link lists in this repository or in the host-mapped payload. The app does not
 integrate with HA/Kuma. The launcher allows clipboard redirection because the
 user's workflow involves copying links; it is an intentional host/Sandbox
 interaction.
+
+## v2.7.9 — improved batch preview recovery
+
+The bounded browser fallback now checks up to three distinct video pages per
+site before assuming that all unresolved links need an interactive session.
+It also waits for actual poster metadata instead of treating a completed page
+body as proof that the player has finished loading. A lightweight legacy
+inspection runs only when local browser inspection infrastructure fails.
+Neither the Sandbox network limits nor verification requirements are bypassed.
 
 ## v2.7.8 — consent-aware previews and low-impact networking
 

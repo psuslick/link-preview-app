@@ -1,4 +1,5 @@
 import { EVALUATE_PAGE } from "./edge-dom-policy.js";
+import { shouldStopPassiveScan } from "./preview-browser-policy.js";
 // Read a single public page in an isolated Sandbox Edge profile.
 // Automatically handle only recognizable cookie/privacy consent controls.
 // Never submit authentication, identity, verification, or challenge prompts.
@@ -90,8 +91,10 @@ async function collect() {
       if (action === 'clicked_cookie_control') { await sleep(500); continue; }
       html = String(value.html || '');
       if (action === 'manual_required') break;
-      // Give asynchronous page scripts time to publish metadata and dialogs.
-      if (i >= 3 && html.length > 500 && /<\/body\s*>/i.test(html)) break;
+      // DOM completion is not evidence that the player initialized. Continue
+      // the bounded inspection until a real poster hint appears (or the budget
+      // expires); many sites populate video metadata after DOMContentLoaded.
+      if (shouldStopPassiveScan({ html, iteration: i, action })) break;
     }
     if (!html) throw new Error('empty_browser_dom');
     if (Buffer.byteLength(html) > domLimit) throw new Error('browser_dom_too_large');

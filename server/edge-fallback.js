@@ -6,6 +6,7 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { resolveViaDnsGovernor } from "./dns-governor-client.js";
+import { shouldTryLegacyDomDump } from "./preview-browser-policy.js";
 import { isBlockedAddress as isNonPublicAddress } from "./public-network-policy.js";
 
 const targetUrl = process.argv[2];
@@ -369,7 +370,7 @@ async function run() {
     // The assisted path runs one headless browser only. If DevTools is disabled,
     // retain the older DOM-dump path without silently disabling previews.
     const assisted = await tryPassiveConsentBrowser(edgePath, profileDir, proxy.port);
-    if (assisted !== null) return { ...assisted, networkBytes: proxy.traffic.downloadedBytes };
+    if (!shouldTryLegacyDomDump(assisted)) return { ...assisted, networkBytes: proxy.traffic.downloadedBytes };
     const args = [
       "--headless=new",
       "--disable-gpu",

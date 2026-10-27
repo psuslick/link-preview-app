@@ -18,6 +18,7 @@ import { checkLocalApiAccess } from "./local-api-access.js";
 import { imageRefererStrategies } from "./image-referer-policy.js";
 import { evaluateCandidateEvidence } from "./finder-relevance.js";
 import { headHasThumbnailMetadata, isGenericGateTitle, isManualVerificationPage, shouldFetchFullHtml } from "./preview-pass-policy.js";
+import { inlinePosterUrls } from "./script-poster-policy.js";
 import { passiveBrowserNeeded, outboundRequestSpacingMs } from "./preview-runtime-policy.js";
 
 const PORT = 3000;
@@ -919,7 +920,6 @@ function collectJsonImageCandidates(value, out, depth = 0, videoContext = false)
 
 function extractScriptImageCandidates($) {
   const results = [];
-  const keyPattern = /["'](?:thumbnail(?:Url|_url)?|poster(?:Url|_url)?|posterImage(?:Url)?|preview(?:Image|_image)(?:Url|_url)?|imageUrl|image_url)["']\s*:\s*["']([^"'<>]{4,2048})["']/gi;
 
   $("script").each((_, element) => {
     if (results.length >= 80) return;
@@ -938,11 +938,7 @@ function extractScriptImageCandidates($) {
       }
     }
 
-    let match;
-    keyPattern.lastIndex = 0;
-    while ((match = keyPattern.exec(text)) && results.length < 80) {
-      results.push(decodeEmbeddedValue(match[1]));
-    }
+    results.push(...inlinePosterUrls(text, 80 - results.length).map(decodeEmbeddedValue));
   });
 
   return results;
@@ -3385,7 +3381,7 @@ app.get("/api/network-status", (_req, res) => {
 app.get("/api/status", (_req, res) => {
   res.json({
     ok: true,
-    version: "2.7.8",
+    version: "2.7.9",
     limits: {
       globalNetwork: GLOBAL_NETWORK_LIMIT,
       perHostNetwork: PER_HOST_NETWORK_LIMIT,
@@ -3595,7 +3591,7 @@ app.get("/api/preview", previewHandler);
 app.post("/api/preview", previewHandler);
 
 app.listen(PORT, "127.0.0.1", () => {
-  console.log(`Video preview engine v2.7.8 listening on http://127.0.0.1:${PORT}`);
+  console.log(`Video preview engine v2.7.9 listening on http://127.0.0.1:${PORT}`);
   console.log(`Network limits: ${GLOBAL_NETWORK_LIMIT} global / ${PER_HOST_NETWORK_LIMIT} per host.`);
   console.log(`DNS governor: ${DNS_BASE_RATE_PER_SECOND}/s base, ${DNS_MAX_RATE_PER_SECOND}/s max, burst ${DNS_BURST}, ${DNS_CACHE_TTL_MS / 1000}s validated cache.`);
   console.log(`Edge fallback: ${BROWSER_FALLBACK_LIMIT} isolated helper worker; helper proxy limit ${BROWSER_PROXY_NETWORK_LIMIT}.`);
