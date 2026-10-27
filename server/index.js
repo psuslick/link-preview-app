@@ -17,7 +17,8 @@ import { isBlockedAddress } from "./public-network-policy.js";
 import { checkLocalApiAccess } from "./local-api-access.js";
 import { imageRefererStrategies } from "./image-referer-policy.js";
 import { evaluateCandidateEvidence } from "./finder-relevance.js";
-import { headHasThumbnailMetadata, isGenericGateTitle, isAgeVerificationPage, shouldFetchFullHtml } from "./preview-pass-policy.js";
+import { headHasThumbnailMetadata, isGenericGateTitle, isManualVerificationPage, shouldFetchFullHtml } from "./preview-pass-policy.js";
+import { passiveBrowserNeeded, outboundRequestSpacingMs } from "./preview-runtime-policy.js";
 
 const PORT = 3000;
 const USER_AGENT =
@@ -25,16 +26,16 @@ const USER_AGENT =
   "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0";
 
 // High-throughput but bounded defaults for hundreds of video links.
-const GLOBAL_NETWORK_LIMIT = 16;
-const PER_HOST_NETWORK_LIMIT = 4;
+const GLOBAL_NETWORK_LIMIT = 7;
+const PER_HOST_NETWORK_LIMIT = 2;
 const REQUEST_TIMEOUT_MS = 9000;
 const HTML_LIMIT_BYTES = 512 * 1024;
 const MEDIA_DISCOVERY_HTML_LIMIT_BYTES = 1024 * 1024;
 const JSON_LIMIT_BYTES = 256 * 1024;
-const IMAGE_LIMIT_BYTES = 8 * 1024 * 1024;
-const IMAGE_NETWORK_LIMIT = 6;
+const IMAGE_LIMIT_BYTES = 4 * 1024 * 1024;
+const IMAGE_NETWORK_LIMIT = 2;
 const MAX_REDIRECTS = 5;
-const MAX_RETRIES = 2;
+const MAX_RETRIES = 1;
 const CACHE_TTL_MS = 30 * 60 * 1000;
 const CACHE_MAX_ENTRIES = 1500;
 
@@ -42,10 +43,10 @@ const CACHE_MAX_ENTRIES = 1500;
 // otherwise create a benchmark-like burst of new host resolutions even while
 // socket concurrency remains bounded. Successful public resolutions are cached
 // briefly and concurrent requests for the same hostname share one lookup.
-const DNS_BASE_RATE_PER_SECOND = 6;
-const DNS_MAX_RATE_PER_SECOND = 8;
+const DNS_BASE_RATE_PER_SECOND = 4;
+const DNS_MAX_RATE_PER_SECOND = 6;
 const DNS_MIN_RATE_PER_SECOND = 2;
-const DNS_BURST = 10;
+const DNS_BURST = 6;
 const DNS_CACHE_TTL_MS = 30_000;
 const DNS_PRESSURE_COOLDOWN_MS = 30_000;
 const DNS_GOVERNOR_TOKEN = crypto.randomBytes(24).toString("hex");
@@ -61,7 +62,7 @@ const SEARXNG_JSON_LIMIT_BYTES = 1024 * 1024;
 const ALTERNATE_SEARCH_MAX_RESULTS = 60;
 const ALTERNATE_CANDIDATE_PREVIEW_LIMIT = 72;
 const ALTERNATE_RAW_DISCOVERY_LIMIT = 1000;
-const ALTERNATE_CANDIDATE_CONCURRENCY = 3;
+const ALTERNATE_CANDIDATE_CONCURRENCY = 2;
 const ALTERNATE_CACHE_TTL_MS = 10 * 60 * 1000;
 const ALTERNATE_CACHE_MAX_ENTRIES = 100;
 const ARCHIVE_LOOKUP_TIMEOUT_MS = 8000;
@@ -73,8 +74,8 @@ const HOST_REACHABILITY_TIMEOUT_MS = 6000;
 
 // Browser fallback is deliberately much narrower than metadata fetching.
 const BROWSER_FALLBACK_LIMIT = 1;
-const BROWSER_PROXY_NETWORK_LIMIT = 8;
-const BROWSER_FALLBACK_TIMEOUT_MS = 7_000;
+const BROWSER_PROXY_NETWORK_LIMIT = 3;
+const BROWSER_FALLBACK_TIMEOUT_MS = 10_000;
 const BROWSER_CHALLENGE_COOLDOWN_MS = 10 * 60 * 1000;
 const BROWSER_DOM_LIMIT_BYTES = 2 * 1024 * 1024;
 const BROWSER_HTTP_RESOURCE_LIMIT_BYTES = 4 * 1024 * 1024;
@@ -111,6 +112,41 @@ const browserFallback = new Semaphore(BROWSER_FALLBACK_LIMIT);
 const frameCompare = new Semaphore(1);
 const archiveRecoveryGate = new Semaphore(2);
 const bingSearchGate = new Semaphore(1);
+// In-memory traffic counters and a global connection-start pacer. Neither
+// writes to disk nor records hostnames or link content.
+let nextOutboundStartAt = 0;
+
+const aggregateTraffic = { totalBytes: 0, imageBytes: 0, browserBytes: 0, recent: [] };
+function trackResponseTraffic(byteCount, kind) {
+  const bytes = Math.max(0, Number(byteCount) || 0);
+  if (!bytes) return;
+  const now = Date.now();
+  aggregateTraffic.totalBytes += bytes;
+  if (kind === "image") aggregateTraffic.imageBytes += bytes;
+  if (kind === "edge") aggregateTraffic.browserBytes += bytes;
+  aggregateTraffic.recent.push([now, bytes]);
+  while (aggregateTraffic.recent.length > 3600 || (aggregateTraffic.recent[0] && now - aggregateTraffic.recent[0][0] > 60000)) {
+    aggregateTraffic.recent.shift();
+  }
+}
+function trafficSnapshot() {
+  const now = Date.now();
+  while (aggregateTraffic.recent[0] && now - aggregateTraffic.recent[0][0] > 60000) aggregateTraffic.recent.shift();
+  return {
+    backendResponseBytesTotal: aggregateTraffic.totalBytes,
+    backendImageBytesTotal: aggregateTraffic.imageBytes,
+    browserProxyBytesTotal: aggregateTraffic.browserBytes,
+    outboundStartGapMs: outboundRequestSpacingMs(dnsGovernor.pressureState()),
+    observedBytesLastMinute: aggregateTraffic.recent.reduce((sum, entry) => sum + entry[1], 0),
+    note: "Aggregate backend HTTP and isolated headless-browser proxy bytes only; separate live Edge and local search traffic excluded. Memory-only."
+  };
+}
+async function paceOutboundStart() {
+  const now = Date.now();
+  const startAt = Math.max(now, nextOutboundStartAt);
+  nextOutboundStartAt = startAt + outboundRequestSpacingMs(dnsGovernor.pressureState());
+  if (startAt > now) await new Promise((resolve) => setTimeout(resolve, startAt - now));
+}
 const hostSemaphores = new Map();
 const hostThrottleState = new Map();
 const previewCache = new Map();
@@ -662,6 +698,7 @@ async function fetchBounded(
 
     for (let attempt = 0; attempt <= retries; attempt += 1) {
       await waitForHostCooldown(hostname);
+      await paceOutboundStart();
       const releaseImage = kind === "image" ? await imageNetwork.acquire() : null;
       const releaseGlobal = await globalNetwork.acquire();
       const releaseHost = await getHostSemaphore(hostname).acquire();
@@ -693,7 +730,8 @@ async function fetchBounded(
           const delay = markHostThrottled(hostname, response.headers.get("retry-after"));
           lastError = new Error(`upstream_throttled_${response.status}`);
           if (attempt < retries) {
-            await sleep(delay);
+            // The next attempt waits on the shared host cooldown before acquiring
+            // any network slots, rather than holding them idle during backoff.
             continue;
           }
           return {
@@ -712,6 +750,7 @@ async function fetchBounded(
           kind === "image" ? IMAGE_LIMIT_BYTES :
           kind === "media-page" ? MEDIA_DISCOVERY_HTML_LIMIT_BYTES : HTML_LIMIT_BYTES;
         const body = await readLimitedBody(response.body, maxBytes, kind === "html");
+        trackResponseTraffic(body.bytes, kind);
         const text = kind === "image" ? null : body.buffer.toString("utf8");
 
         if (response.ok) markHostHealthy(hostname);
@@ -1527,6 +1566,8 @@ async function renderMetadataWithEdge(targetUrl) {
       });
     });
 
+    // Count isolated browser-proxy traffic without retaining any request URL.
+    trackResponseTraffic(helperResult.networkBytes || 0, "edge");
     if (!helperResult.ok) {
       if (helperResult.challenge) markChallengeCircuit(targetUrl);
       return helperResult;
@@ -1641,7 +1682,7 @@ async function createPreview(rawUrl, { allowBrowserFallback = true, forceReachab
   let fullHtmlMetadata = null;
   let fullHtmlBytes = 0;
   let fullHtmlRead = false;
-  const isAgeGate = isAgeVerificationPage(htmlResult.text);
+  const isVerificationPage = isManualVerificationPage(htmlResult.text);
   if (shouldFetchFullHtml({
     status: htmlResult.status,
     contentType: htmlResult.contentType,
@@ -1650,7 +1691,7 @@ async function createPreview(rawUrl, { allowBrowserFallback = true, forceReachab
     challenge: Boolean(httpChallenge),
     incomplete: Boolean(htmlResult.truncated || htmlResult.headOnly)
   })) {
-    // No interactive browser, no cookies or age attestation. A single bounded
+    // No interactive browser, no cookies or interactive verification. A single bounded
     // follow-up fetch permits body scripts, JSON-LD and lazy DOM posters to be seen.
     // Retries=0 avoids multiplying requests to throttling-sensitive video hosts.
     const expanded = await fetchBounded(targetUrl, { kind: "media-page", timeoutMs: 6500, retries: 0 });
@@ -1695,10 +1736,14 @@ async function createPreview(rawUrl, { allowBrowserFallback = true, forceReachab
   const authorizedProfile = authorizationProfileFor(targetUrl);
   const authorizedLiveSession = authorizationLiveSessionFor(targetUrl);
   const hasAuthorizedSession = Boolean(authorizedProfile || authorizedLiveSession);
-  const needsBrowserFallback = Boolean(
-    (httpChallenge && hasAuthorizedSession) ||
-    (!httpChallenge && !isAgeGate && (restrictedStatus || (htmlResult.ok && !metadata.image)))
-  );
+  const needsBrowserFallback = passiveBrowserNeeded({
+    challenge: Boolean(httpChallenge),
+    verification: Boolean(isVerificationPage),
+    approvedSession: hasAuthorizedSession,
+    restrictedStatus,
+    httpOk: htmlResult.ok,
+    hasImage: Boolean(metadata.image)
+  });
   const shouldTryBrowser = allowBrowserFallback && needsBrowserFallback;
 
   if (shouldTryBrowser) {
@@ -1757,7 +1802,7 @@ async function createPreview(rawUrl, { allowBrowserFallback = true, forceReachab
     bytesRead: (htmlResult.bytes || 0) + fullHtmlBytes + (providerMetadata?.bytesRead || 0),
     passiveBodyRead: Boolean(htmlResult.text && !htmlResult.headOnly),
     passiveBodyRetry: fullHtmlRead,
-    ageVerificationRequired: Boolean(isAgeGate && !images.length),
+    manualVerificationRequired: Boolean(isVerificationPage && !images.length),
     elapsedMs: Date.now() - started,
     cached: false,
     warning,
@@ -1777,7 +1822,7 @@ async function createPreview(rawUrl, { allowBrowserFallback = true, forceReachab
     siteSessionRecommended: Boolean(
       !images.length && (
         httpChallenge ||
-        isAgeGate ||
+        isVerificationPage ||
         browserChallenge ||
         needsBrowserFallback ||
         (browserFallbackAttempted && browserError) ||
@@ -3325,6 +3370,7 @@ app.get("/api/network-status", (_req, res) => {
   res.json({
     ok: true,
     dns: dnsGovernor.status(),
+    traffic: trafficSnapshot(),
     http: {
       active: globalNetwork.active,
       queued: globalNetwork.waiters.length,
@@ -3339,7 +3385,7 @@ app.get("/api/network-status", (_req, res) => {
 app.get("/api/status", (_req, res) => {
   res.json({
     ok: true,
-    version: "2.7.7",
+    version: "2.7.8",
     limits: {
       globalNetwork: GLOBAL_NETWORK_LIMIT,
       perHostNetwork: PER_HOST_NETWORK_LIMIT,
@@ -3470,7 +3516,7 @@ app.post("/api/authorize-host", async (req, res) => {
     return res.json({
       ...result,
       reusableForHost: result.host || null,
-      note: "A reusable site session was opened inside Windows Sandbox. The app will automatically retry one refresh and may accept recognized cookie/privacy consent controls. CAPTCHA/anti-bot challenges, age attestations, logins, and other access-control prompts remain manual. Once the real site is reachable, one successful Retry can reuse this session for other previews on the same host."
+      note: "A reusable site session was opened inside Windows Sandbox. The app will automatically retry one refresh and may accept recognized cookie/privacy consent controls. CAPTCHA/anti-bot challenges, logins, and other access-control prompts remain manual. Once the real site is reachable, one successful Retry can reuse this session for other previews on the same host."
     });
   } catch (error) {
     return res.status(400).json({ error: error?.message || "authorization_launch_failed" });
@@ -3549,7 +3595,7 @@ app.get("/api/preview", previewHandler);
 app.post("/api/preview", previewHandler);
 
 app.listen(PORT, "127.0.0.1", () => {
-  console.log(`Video preview engine v2.7.7 listening on http://127.0.0.1:${PORT}`);
+  console.log(`Video preview engine v2.7.8 listening on http://127.0.0.1:${PORT}`);
   console.log(`Network limits: ${GLOBAL_NETWORK_LIMIT} global / ${PER_HOST_NETWORK_LIMIT} per host.`);
   console.log(`DNS governor: ${DNS_BASE_RATE_PER_SECOND}/s base, ${DNS_MAX_RATE_PER_SECOND}/s max, burst ${DNS_BURST}, ${DNS_CACHE_TTL_MS / 1000}s validated cache.`);
   console.log(`Edge fallback: ${BROWSER_FALLBACK_LIMIT} isolated helper worker; helper proxy limit ${BROWSER_PROXY_NETWORK_LIMIT}.`);

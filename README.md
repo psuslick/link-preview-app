@@ -1,7 +1,7 @@
-# Link Preview App — complete v2.7.7 source tree
+# Link Preview App — complete v2.7.8 source tree
 
 This is the **complete application source tree**, assembled from the supplied
-`link-preview-app.zip` and the v2.7.6 source, followed by the v2.7.7 preview improvements. The Git history (`.git/`) and
+`link-preview-app.zip` and the v2.7.6 source, followed by the v2.7.7 and v2.7.8 preview improvements. The Git history (`.git/`) and
 installed dependencies are intentionally **not** distributed in the ZIP.
 
 ```text
@@ -57,23 +57,56 @@ integrate with HA/Kuma. The launcher allows clipboard redirection because the
 user's workflow involves copying links; it is an intentional host/Sandbox
 interaction.
 
+## v2.7.8 — consent-aware previews and low-impact networking
+
+The first preview pass stays lightweight. For pages with no exposed thumbnail,
+a single bounded Sandbox Edge fallback can now inspect the rendered page and
+handle **recognizable cookie/privacy consent controls only**, before extracting
+poster metadata. It does not submit login, identity, verification, or challenge
+prompts. The older DOM-dump fallback remains available if Edge's local debugger
+is unavailable. Large video/media requests are suppressed in the new headless
+browser path; no site/domain allowlist or content filtering is introduced.
+
+When the user has already opened a reusable site session and a manual Retry
+succeeds, the app can reuse that approved session for **up to 12** unresolved
+same-site previews in one sequential, non-recursive batch. Further attempts
+remain user-initiated. The fast HTTP pass now labels pending browser work as
+"queued" rather than incorrectly suggesting it was never scheduled.
+
+Large imports use conservative networking defaults: **4 frontend preview
+workers, 7 concurrent backend HTTP requests, 2 per host, 2 images,
+3 connections in the isolated browser proxy, 1 Finder job**, and dynamic
+HTTP request-start pacing based on DNS pressure. Retry backoff no longer holds
+network slots idle. Maximum proxy image response size is 4 MiB.
+
+The Sandbox UI now shows **aggregate response MB/minute** and the manual
+snapshot includes backend HTTP and isolated headless-browser proxy bytes.
+These counters stay in RAM only and exclude separate visible Edge windows and
+local metasearch traffic; they are not total interface bandwidth measurements.
+No URLs, domains, titles, media identifiers or search content are recorded in
+these counters. No HA/Kuma integration exists.
+
+**Limit:** real verification, account authentication and access challenges
+still require normal user interaction; a thumbnail not exposed publicly or to
+an already approved session may remain unavailable. Network impact is
+substantially bounded by these changes, but the cause of a specific home-network
+slowdown cannot be proven from source inspection alone. Live Windows Sandbox
+and Edge behavior must be tested on the user's system.
+
 ## v2.7.7 — unattended public thumbnail recovery
 
 The preview pipeline now avoids stopping at `</head>` if no image/poster evidence
 is available. It continues reading **the same bounded page response** to find
 video posters embedded in JSON-LD, framework script data, `video[poster]`, and
 lazy/responsive image markup. If a truncated page is still missing metadata,
-only one additional capped public HTML read is attempted. No per-site allowlist
-or adult-content filter has been introduced.
+only one additional capped public HTML read is attempted. No per-site allowlist or content-based exclusion rules were introduced.
 
 The parser now recognizes responsive `srcset`/`data-srcset`, video data-poster
 attributes and additional Open Graph thumbnail fields. Public meta tags can be
 recovered even from a 401/403/451 interstitial response where present, without
-performing login, challenge solving, or age attestation.
+performing login or solving access challenges.
 
-Clearly recognized age-verification pages skip the unattended headless Edge
-attempt (which cannot legally/meaningfully complete verification) and show a
-specific explanation when no public image exists. No-thumbnail results are
+Clearly recognized verification interstitials skip unattended browser attempts that cannot complete user-required checks. A generic explanation is shown when no public thumbnail exists. No-thumbnail results are
 not retained as successful preview-cache entries, so legitimate subsequent
 manual retries are not frozen on a stale title-only response.
 
@@ -83,7 +116,7 @@ No launcher or bootstrap update is needed beyond deploying Git source; existing
 `BOOTSTRAP/` and `LAUNCHER/` files are included for a complete repository layout.
 
 **Limit:** some sites offer neither public poster metadata nor a publicly
-accessible thumbnail. Real age verification, authentication, DRM, and CAPTCHA
+accessible thumbnail. Verification, authentication, DRM, and CAPTCHA
 still require the site's normal authorized flow, and not every link can be
 previewed unattended. Live Windows/Edge integration remains unverified here.
 

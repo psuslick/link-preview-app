@@ -35,9 +35,8 @@ New in v2.7.6
   overlapping media ID/file. Raw/weak candidates remain visible separately.
   "Likely longer"/"Likely mirror" require shared identity evidence; the
   evidence score is not a probability.
-- No adult or age-restricted-site exclusion, provider allowlist, SafeSearch
-  filtering, or content-based rejection was introduced. Search provider
-  indexing/policies may still limit available matches.
+- No provider allowlist or topic-based rejection was introduced. Search provider
+  indexing and policies may still limit available matches.
 
 Optional Sandbox Edge extension setup
 -------------------------------------

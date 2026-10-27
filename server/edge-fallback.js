@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { resolveViaDnsGovernor } from "./dns-governor-client.js";
 import { isBlockedAddress as isNonPublicAddress } from "./public-network-policy.js";
 
@@ -132,6 +133,7 @@ async function findEdgeExecutable() {
 
 async function startSafetyProxy() {
   const sockets = new Set();
+  const traffic = { downloadedBytes: 0 };
   const proxy = http.createServer(async (req, res) => {
     let url;
     try {
@@ -186,6 +188,7 @@ async function startSafetyProxy() {
         let bytes = 0;
         upstreamRes.on("data", (chunk) => {
           bytes += chunk.length;
+          traffic.downloadedBytes += chunk.length;
           if (bytes > HTTP_RESOURCE_LIMIT_BYTES) {
             upstreamRes.destroy();
             res.end();
@@ -238,6 +241,7 @@ async function startSafetyProxy() {
         };
 
         const upstream = net.connect({ host: resolved.address, port, family: resolved.family });
+        upstream.on("data", (chunk) => { traffic.downloadedBytes += chunk.length; });
         upstream.on("error", () => clientSocket.destroy());
         upstream.setTimeout(EDGE_TIMEOUT_MS + 4000, () => upstream.destroy());
         clientSocket.setTimeout(EDGE_TIMEOUT_MS + 4000, () => clientSocket.destroy());
@@ -264,6 +268,7 @@ async function startSafetyProxy() {
   const address = proxy.address();
   return {
     server: proxy,
+    traffic,
     port: typeof address === "object" && address ? address.port : null,
     async close() {
       for (const socket of sockets) socket.destroy();
@@ -285,6 +290,71 @@ async function killTree(child) {
   }
 }
 
+// Try a bounded, disposable DevTools-controlled page read first. This can handle
+// ordinary cookie/privacy dialogs and suppress large media payload requests.
+// A missing DevTools interface falls back to the old DOM-dump method.
+async function tryPassiveConsentBrowser(edgePath, profileDir, proxyPort) {
+  if (typeof WebSocket !== "function") return null;
+  const portFile = path.join(profileDir, "DevToolsActivePort");
+  await fs.rm(portFile, { force: true }).catch(() => {});
+  const browser = spawn(edgePath, [
+    "--headless=new", "--disable-gpu", "--disable-quic", "--disable-extensions",
+    "--disable-background-networking", "--disable-component-update", "--disable-default-apps",
+    "--disable-sync", "--no-first-run", "--no-default-browser-check",
+    "--mute-audio", "--autoplay-policy=user-gesture-required",
+    "--blink-settings=imagesEnabled=false", "--disable-features=Prerender2,MediaRouter",
+    `--proxy-server=http://127.0.0.1:${proxyPort}`, "--proxy-bypass-list=<-loopback>",
+    `--user-data-dir=${profileDir}`, "--remote-debugging-port=0", "about:blank"
+  ], { windowsHide: true, stdio: "ignore" });
+  browser.once("error", () => {});
+  let worker = null;
+  try {
+    let port = 0;
+    for (let i = 0; i < 28; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 110));
+      const contents = await fs.readFile(portFile, "utf8").catch(() => "");
+      const candidate = Number(contents.split(/\r?\n/)[0]);
+      if (Number.isInteger(candidate) && candidate > 1023 && candidate <= 65535) { port = candidate; break; }
+    }
+    if (!port) return null;
+    const result = await new Promise((resolve) => {
+      worker = spawn(process.execPath, [
+        path.join(path.dirname(fileURLToPath(import.meta.url)), "edge-headless-cdp.js"),
+        targetUrl, String(port), String(DOM_LIMIT_BYTES)
+      ], { windowsHide: true, stdio: ["ignore", "pipe", "ignore"] });
+      const chunks = [];
+      let bytes = 0;
+      let settled = false;
+      const finish = (answer) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(answer);
+      };
+      const timer = setTimeout(() => { try { worker.kill(); } catch {} finish({ ok: false, error: "passive_browser_timeout" }); }, EDGE_TIMEOUT_MS);
+      worker.stdout.on("data", (chunk) => {
+        bytes += chunk.length;
+        if (bytes > DOM_LIMIT_BYTES + 4096) {
+          try { worker.kill(); } catch {}
+          finish({ ok: false, error: "passive_browser_output_too_large" });
+        } else chunks.push(chunk);
+      });
+      worker.once("error", () => finish({ ok: false, error: "passive_browser_worker_error" }));
+      worker.once("close", () => {
+        try { finish(JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}")); }
+        catch { finish({ ok: false, error: "passive_browser_bad_output" }); }
+      });
+    });
+    if (!result?.ok) return { ok: false, error: result?.error || "passive_browser_failed" };
+    const challenge = detectChallengePage(result.html);
+    if (challenge) return { ok: false, error: "edge_challenge_page", challenge: true, challengeTitle: challenge.title, challengeProvider: challenge.provider };
+    return { ok: true, html: result.html, passiveConsent: true };
+  } finally {
+    if (worker && worker.exitCode === null) { try { worker.kill(); } catch {} }
+    await killTree(browser).catch(() => {});
+  }
+}
+
 async function run() {
   validateUrl(targetUrl);
   const edgePath = await findEdgeExecutable();
@@ -296,6 +366,10 @@ async function run() {
   try {
     profileDir = AUTH_PROFILE_DIR || await fs.mkdtemp(path.join(os.tmpdir(), "link-preview-edge-helper-"));
     if (AUTH_PROFILE_DIR) await fs.mkdir(profileDir, { recursive: true });
+    // The assisted path runs one headless browser only. If DevTools is disabled,
+    // retain the older DOM-dump path without silently disabling previews.
+    const assisted = await tryPassiveConsentBrowser(edgePath, profileDir, proxy.port);
+    if (assisted !== null) return { ...assisted, networkBytes: proxy.traffic.downloadedBytes };
     const args = [
       "--headless=new",
       "--disable-gpu",
@@ -379,7 +453,7 @@ async function run() {
         }
       });
     });
-    return result;
+    return { ...result, networkBytes: proxy.traffic.downloadedBytes };
   } finally {
     await killTree(edge).catch(() => {});
     await proxy.close().catch(() => {});

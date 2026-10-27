@@ -16,9 +16,10 @@ import "./App.css";
 import { extractVideoUrls, videoUrlIdentity } from "./url-identity.js";
 import { normalizeExcludedDomain, excludeUrls } from "./domain-exclusions.js";
 
-const CLIENT_CONCURRENCY = 12;
+const CLIENT_CONCURRENCY = 4;
 const BROWSER_FALLBACK_CONCURRENCY = 1;
-const FINDER_CONCURRENCY = 2;
+const AUTHORIZED_SITE_AUTO_RETRIES = 12;
+const FINDER_CONCURRENCY = 1;
 const BATCH_COMPARE_LIMIT = 5;
 const PRIVACY_STORAGE_KEY = "linkPreviewPrivacyV1";
 const SEARXNG_ENDPOINT_STORAGE_KEY = "linkPreviewSearxngEndpointV1";
@@ -125,7 +126,7 @@ function LazyThumbnail({ sources, sourceUrl, title, allowRemoteImages = true }) 
         setShouldLoad(true);
         observer.disconnect();
       }
-    }, { rootMargin: "700px 0px" });
+    }, { rootMargin: "250px 0px" });
     observer.observe(node);
     return () => observer.disconnect();
   }, [candidates, allowRemoteImages]);
@@ -259,6 +260,7 @@ function App() {
   const [tabCollectorStatus, setTabCollectorStatus] = useState("");
   const [tabCollectorBusy, setTabCollectorBusy] = useState(false);
   const pendingTabRequestRef = useRef(null);
+  const authorizedSiteAutoRetryRef = useRef(new Set());
   const [previews, setPreviews] = useState([]);
   const [selected, setSelected] = useState(() => new Set());
   const [processing, setProcessing] = useState(false);
@@ -415,6 +417,7 @@ function App() {
   async function copySessionSnapshot() {
     const dns = networkState?.dns || {};
     const http = networkState?.http || {};
+    const traffic = networkState?.traffic || {};
     const lines = [
       "Video Link Preview — memory-only session snapshot",
       `Session started: ${formatSessionTime(sessionTelemetry.startedAt)}`,
@@ -428,6 +431,11 @@ function App() {
       `Current DNS queue: ${dns.queued ?? 0}`,
       `Current DNS avg latency: ${dns.averageLatencyMs ?? 0} ms`,
       `Current HTTP active/queued: ${http.active ?? 0}/${http.queued ?? 0}`,
+      `Observed response MB (last minute): ${((traffic.observedBytesLastMinute || 0) / 1048576).toFixed(2)}`,
+      `Backend HTTP MB (session): ${((traffic.backendResponseBytesTotal || 0) / 1048576).toFixed(2)}`,
+      `Backend image MB (session): ${((traffic.backendImageBytesTotal || 0) / 1048576).toFixed(2)}`,
+      `Headless browser proxy MB (session): ${((traffic.browserProxyBytesTotal || 0) / 1048576).toFixed(2)}`,
+      'Traffic counters exclude separate visible Edge windows and local search service.',
       `Peak DNS rate: ${sessionTelemetry.peakDnsRate}/s`,
       `Peak DNS queue: ${sessionTelemetry.peakDnsQueue}`,
       `Peak DNS latency: ${sessionTelemetry.peakDnsLatencyMs} ms`,
@@ -550,6 +558,7 @@ function App() {
         const result = await fetchPreview(item.url, { allowBrowserFallback: false, privacy, forceReachability: forceReachability && Boolean(item.deadLink) });
         patchPreview(item.id, {
           ...result,
+          browserFallbackQueued: Boolean(result.clientOk && result.needsBrowserFallback && privacy.browserFallback),
           state: result.clientOk ? "ready" : "failed",
           error: result.clientOk ? result.error || null : result.error || `HTTP ${result.clientStatus}`
         });
@@ -575,6 +584,7 @@ function App() {
           const result = await fetchPreview(first.url, { allowBrowserFallback: true, privacy, forceReachability: forceReachability && Boolean(first.deadLink) });
           patchPreview(first.id, {
             ...result,
+            browserFallbackQueued: false,
             state: result.clientOk ? "ready" : "failed",
             error: result.clientOk ? result.error || null : result.error || `HTTP ${result.clientStatus}`
           });
@@ -600,6 +610,7 @@ function App() {
             const result = await fetchPreview(item.url, { allowBrowserFallback: true, privacy, forceReachability: forceReachability && Boolean(item.deadLink) });
             patchPreview(item.id, {
               ...result,
+              browserFallbackQueued: false,
               state: result.clientOk ? "ready" : "failed",
               error: result.clientOk ? result.error || null : result.error || `HTTP ${result.clientStatus}`
             });
@@ -866,7 +877,7 @@ function App() {
     }
     patchPreview(preview.id, {
       authorizationState: "authorizing",
-      authorizationMessage: `Reusable site session opened for ${siteKeyFor(preview.url)}. The site-session helper may refresh once and handle recognized cookie/privacy consent buttons. CAPTCHA/challenge, age confirmation, login, or other access-control prompts remain manual. Once the real video is visible, click Retry. Nothing else on this site will retry automatically.`
+      authorizationMessage: `Reusable site session opened for ${siteKeyFor(preview.url)}. The site-session helper may refresh once and handle recognized cookie/privacy consent buttons. CAPTCHA/challenge, login, and other access-control prompts remain manual. Once the real video is visible, click Retry. Nothing else on this site will retry automatically.`
     });
   }
 
@@ -894,9 +905,31 @@ function App() {
     patchPreview(preview.id, {
       authorizationState: "site-ready",
       authorizationMessage: siblingCount
-        ? `Site session active for ${siteKey}. ${siblingCount} other unresolved preview${siblingCount === 1 ? "" : "s"} can reuse it. They will not retry automatically.`
-        : `Site session active for ${siteKey}. Other previews from this site can reuse it.`
+        ? `Site session active. Retrying up to ${Math.min(AUTHORIZED_SITE_AUTO_RETRIES, siblingCount)} unresolved same-site previews sequentially.`
+        : `Site session active for ${siteKey}.`
     });
+    // Only after a successful user-authorized Retry: one bounded, sequential
+    // same-site wave. Never start recursive or unlimited retries.
+    if (!siblingCount || authorizedSiteAutoRetryRef.current.has(siteKey)) return;
+    authorizedSiteAutoRetryRef.current.add(siteKey);
+    const targets = previews.filter((item) =>
+      item.id !== preview.id && siteKeyFor(item.url) === siteKey && needsAuthorizedSiteRetry(item)
+    ).slice(0, AUTHORIZED_SITE_AUTO_RETRIES);
+    try {
+      for (const target of targets) {
+        await processSinglePreview(target, {
+          authorizationState: "site-retry",
+          authorizationMessage: "Reusing your approved Sandbox site session…"
+        });
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+    } finally {
+      authorizedSiteAutoRetryRef.current.delete(siteKey);
+      patchPreview(preview.id, {
+        authorizationState: "site-ready",
+        authorizationMessage: `Finished ${targets.length} bounded same-site retries. Further retries remain manual to protect network responsiveness.`
+      });
+    }
   }
 
   async function retrySiteBatch(preview, limit = 3) {
@@ -950,6 +983,7 @@ function App() {
         </div>
         <div className="topbar-statuses">
           <div className="limit-badge">{CLIENT_CONCURRENCY} preview workers · {BROWSER_FALLBACK_CONCURRENCY} browser fallback</div>
+          {networkState?.traffic && <div className="limit-badge" title="Aggregate backend HTTP and headless Edge proxy response bytes in the previous 60 seconds, excluding visible Edge windows and local search service">Observed {((networkState.traffic.observedBytesLastMinute || 0) / 1048576).toFixed(1)} MB/min</div>}
           {networkState?.dns && <div className={`limit-badge dns-badge ${networkState.dns.pressure || "normal"}`} title={`DNS: ${networkState.dns.active} active, ${networkState.dns.queued} queued, ${networkState.dns.averageLatencyMs} ms average, ${networkState.dns.errors} errors`}>DNS {networkState.dns.pressure || "normal"} · {networkState.dns.recentFreshLookupsPerSecond ?? 0}/s · cache {networkState.dns.cacheHitPercent ?? 0}%</div>}
           {finderStats.total > 0 && <div className="limit-badge finder-badge">Finder: {finderStats.running} running · {finderStats.queued} queued</div>}
         </div>
@@ -1038,7 +1072,7 @@ function App() {
               <div className="privacy-group"><h3>Preview browsing</h3>
                 <PrivacyToggle checked={privacy.remoteThumbnails} onChange={(v) => setPrivacyOption("remoteThumbnails", v)} title="Load remote thumbnails" detail="Downloads discovered poster/thumbnail images through the localhost safety proxy." />
                 <PrivacyToggle checked={privacy.browserFallback} onChange={(v) => setPrivacyOption("browserFallback", v)} title="Edge browser fallback" detail="Lets Sandbox Edge load difficult video pages when lightweight metadata is insufficient." />
-                <PrivacyToggle checked={privacy.interactiveAuthorization} onChange={(v) => setPrivacyOption("interactiveAuthorization", v)} title="Interactive site sessions" detail="Allows you to open one reusable Sandbox Edge session for difficult sites. Sessions never open or retry previews automatically; explicit site batches are capped at 3." />
+                <PrivacyToggle checked={privacy.interactiveAuthorization} onChange={(v) => setPrivacyOption("interactiveAuthorization", v)} title="Interactive site sessions" detail="Allows one reusable Sandbox Edge session. After you authorize and successfully Retry once, up to 12 same-site previews can retry sequentially; further batches require a click." />
               </div>
               <div className="privacy-group"><h3>Version Finder — destinations</h3>
                 <PrivacyToggle checked={privacy.mediaTools} onChange={(v) => setPrivacyOption("mediaTools", v)} title="Media-tool probing" detail="Allows yt-dlp/Deno to inspect selected and candidate public video pages/CDNs inside Sandbox." />
@@ -1178,8 +1212,8 @@ function App() {
                         {siteSessionEligible && preview.state !== "failed" && (
                           <div className="challenge-box">
                             <p className="warning-message">
-                              {preview.ageVerificationRequired
-                                ? "The site appears to require age verification. Public metadata did not expose a thumbnail, so completing the site's verification manually may be necessary."
+                              {preview.manualVerificationRequired
+                                ? "This site appears to require user verification. Public metadata did not expose a thumbnail; opening the site manually may be necessary."
                                 : preview.challengeDetected
                                   ? "The lightweight preview was blocked or challenged. Open one reusable Sandbox site session."
                                   : "No public thumbnail could be recovered from page headers, body metadata or the unattended browser. This site may require a cookie-consent or login step."}
@@ -1223,8 +1257,8 @@ function App() {
                               <div><dt>Edge extractor</dt><dd>{preview.browserExtractorStats ? `meta ${preview.browserExtractorStats.meta || 0} · json ${preview.browserExtractorStats.json || 0} · script ${preview.browserExtractorStats.script || 0} · poster ${preview.browserExtractorStats.poster || 0} · dom ${preview.browserExtractorStats.dom || 0}` : "—"}</dd></div>
                               <div><dt>Body metadata scanned</dt><dd>{preview.passiveBodyRead ? "yes" : "not needed"}</dd></div>
                               <div><dt>Additional HTML fetch</dt><dd>{preview.passiveBodyRetry ? "yes — bounded" : "no"}</dd></div>
-                              <div><dt>Age-gate indicator</dt><dd>{preview.ageVerificationRequired ? "manual verification may be required" : "none detected"}</dd></div>
-                              <div><dt>Browser fallback</dt><dd>{preview.browserFallback ? "used" : preview.browserFallbackAttempted ? "attempted" : "no"}</dd></div>
+                              <div><dt>Verification indicator</dt><dd>{preview.manualVerificationRequired ? "manual verification may be required" : "none detected"}</dd></div>
+                              <div><dt>Browser fallback</dt><dd>{preview.browserFallbackQueued ? "queued" : preview.browserFallback ? "used" : preview.browserFallbackAttempted ? "attempted" : "no"}</dd></div>
                               <div><dt>Authorized session</dt><dd>{preview.authorizedBrowserSession ? "live Edge" : preview.authorizedBrowserProfile ? "saved profile" : preview.authorizationState || "no"}</dd></div>
                               <div><dt>Fallback error</dt><dd>{preview.browserFallbackError || "none"}</dd></div>
                               <div><dt>Challenge</dt><dd>{preview.challengeDetected ? (preview.challengeProvider || "detected") : "none"}</dd></div>

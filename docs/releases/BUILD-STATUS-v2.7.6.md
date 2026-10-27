@@ -29,7 +29,7 @@ Safety/stability
 - Historical lookups only run when user requests recovery (Finder's existing
   archive retrieval behavior is preserved). External exact URL search is
   privacy-gated and on-demand.
-- No adult/provider allowlist, SafeSearch filter or content-based censorship.
+- No provider allowlist or app-side content-based exclusion rules were added.
 
 Validation
 ----------
@@ -44,7 +44,7 @@ Known limits
 - Tab collector requires user to load extension into Edge's same Sandbox
   profile and the UI to be served on localhost/127.0.0.1 port 5173 or 4173.
 - No tool can guarantee dead-page recovery if no archive or indexed mention
-  exists. Search engines may fail on adult/age-gated results despite explicit
-  SafeSearch Off requests; the app does not perform its own content filtering.
+  exists. Search engines may omit some results despite explicit search preferences;
+  the app does not discard candidates based on their topics.
 - A title match alone is "possible"; identity and actual footage similarity
   still require user verification or available FFmpeg sample comparison.

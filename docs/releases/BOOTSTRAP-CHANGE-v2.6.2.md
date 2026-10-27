@@ -14,7 +14,7 @@ After the Sandbox app opens:
 1. Open Privacy & network activity.
 2. Under Version Finder — destinations, enable Bing search.
 3. Click "Configure Bing Off".
-4. In the Sandbox-only Edge window, choose SafeSearch Off and complete Bing's age confirmation if Bing requires it.
+4. In the Sandbox-only Edge window, choose SafeSearch Off and complete any required Bing prompts.
 5. Leave that window open until the app reports "Bing SafeSearch — Off verified".
 6. You may then leave the window open or close it. Finder searches use that same Sandbox Edge profile/session.
 

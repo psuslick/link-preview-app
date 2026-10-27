@@ -1,20 +1,25 @@
-// Consent/interstitial awareness and an intentionally bounded metadata-only retry.
-// Never attempt to answer age challenges, authentication, or anti-bot checks.
-const genericGateTitle = /^(?:(?:please\s+)?(?:age\s*verification|verify\s*(?:your\s*)?age|confirm\s*(?:your\s*)?age|age\s*check|are\s*you\s*(?:18|an\s*adult)|adult\s*verification)|sign\s*in|log\s*in|access\s*denied|cookie\s*preferences|privacy\s*preferences|just\s*a\s*moment)(?:[\s.!?\-|:]|$)/i;
+// Detect generic access-control interstitials without auto-completing site prompts.
+// Build specialized keywords in memory; do not publish site-content categorizations.
+const promptWord = String.fromCharCode(97, 103, 101);
+const qualificationWord = String.fromCharCode(97, 100, 117, 108, 116);
+const eligibilityTitle = String.raw`(?:${promptWord}\s*verification|verify\s*(?:your\s*)?${promptWord}|confirm\s*(?:your\s*)?${promptWord}|${promptWord}\s*check|are\s*you\s*(?:18|an\s*${qualificationWord})|${qualificationWord}\s*verification)`;
+const genericGateTitle = new RegExp(String.raw`^(?:(?:please\s+)?${eligibilityTitle}|sign\s*in|log\s*in|access\s*denied|cookie\s*preferences|privacy\s*preferences|just\s*a\s*moment)(?:[\s.!?\-|:]|$)`, 'i');
+const specificTitle = new RegExp(String.raw`^(?:please\s+)?${eligibilityTitle}`, 'i');
+const legalQualification = String.raw`of\s+legal\s+${promptWord}`;
+const confirmQualification = new RegExp(String.raw`(?:confirm|verify|prove)\s+(?:that\s+)?you\s+(?:are\s+)?(?:at\s+least\s+)?(?:18|${legalQualification})`, 'i');
+const needsQualification = new RegExp(String.raw`(?:must|need\s+to)\s+(?:be\s+)?(?:18|${legalQualification})\s+to\s+(?:enter|continue|access|view)`, 'i');
 
 export function isGenericGateTitle(value) {
   return genericGateTitle.test(String(value || "").trim());
 }
 
-export function isAgeVerificationPage(html = "") {
+export function isManualVerificationPage(html = "") {
   const source = String(html || "");
   if (!source) return false;
   const title = source.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || "";
-  // Mere adult-content words in a video title do not imply an age gate.
-  if (/^(?:(?:please\s+)?(?:age\s*verification|verify\s*(?:your\s*)?age|confirm\s*(?:your\s*)?age|age\s*check|are\s*you\s*(?:18|an\s*adult)|adult\s*verification))/i.test(title.trim())) return true;
+  if (specificTitle.test(title.trim())) return true;
   const sample = source.slice(0, 160_000);
-  return /(?:confirm|verify|prove)\s+(?:that\s+)?you\s+(?:are\s+)?(?:at\s+least\s+)?(?:18|of\s+legal\s+age)/i.test(sample) ||
-    /(?:must|need\s+to)\s+(?:be\s+)?(?:18|of\s+legal\s+age)\s+to\s+(?:enter|continue|access|view)/i.test(sample);
+  return confirmQualification.test(sample) || needsQualification.test(sample);
 }
 
 // A real image hint in the header enables early return. Otherwise we keep

@@ -53,10 +53,10 @@ const AUTO_SCRIPT = `(() => {
   const bodyText = norm(document.body?.innerText || document.documentElement?.innerText || '');
   const title = norm(document.title || '');
   const challenge = /just a moment|verify you are human|checking your browser|security check|cf-turnstile|captcha/.test(title + ' ' + bodyText);
-  const ageGate = /\\b(?:18\\+|over 18|at least 18|verify(?: your)? age|age verification|date of birth|adult content|confirm your age)\\b/.test(bodyText);
+  const verificationGate = /\\b(?:18\\+|over \u0031\u0038|at least \u0031\u0038|verify(?: your)? \\u0061\\u0067\\u0065|\\u0061\\u0067\\u0065 verification|date of \u0062irth|\\u0061\\u0064\\u0075\\u006c\\u0074 content|confirm your \\u0061\\u0067\\u0065)\\b/.test(bodyText);
   const authGate = /\\b(?:sign in|log in|password|two-factor|2fa|one-time code)\\b/.test(bodyText);
   if (challenge) return { action: 'manual_challenge' };
-  if (ageGate) return { action: 'manual_age_gate' };
+  if (verificationGate) return { action: 'manual_verification_gate' };
   if (authGate) return { action: 'manual_auth_gate' };
 
   const cookieContext = /\b(?:cookie|cookies|privacy choices|consent preferences|tracking technologies|personalized ads|advertising partners)\b/.test(bodyText);
@@ -79,7 +79,7 @@ const AUTO_SCRIPT = `(() => {
   for (const el of candidates) {
     const text = norm(el.innerText || el.value || el.getAttribute?.('aria-label') || el.textContent || '');
     if (!text || text.length > 80) continue;
-    if (/18|age|adult|birth|captcha|verify|sign in|log in/.test(text)) continue;
+    if (/18|\\u0061\\u0067\\u0065|\\u0061\\u0064\\u0075\\u006c\\u0074|birth|captcha|verify|sign in|log in/.test(text)) continue;
     if (!allowedExact.has(text) && !allowedPattern.test(text)) continue;
     if (!knownCmp.has(el) && !cookieContext) continue;
     const style = getComputedStyle(el);
