@@ -198,3 +198,22 @@ export async function networkStatus() {
     return { ok: false, clientOk: false, error: error?.message || "Failed to fetch" };
   }
 }
+
+// Workspace snapshots are transferred only between this Sandbox UI and its
+// loopback-bound server. The server holds them in RAM; no disk/browser persistence.
+export async function readWorkspace() {
+  try {
+    const response = await fetch(`${API_BASE}/workspace`, { cache: "no-store" });
+    return response.ok ? await response.json() : { ok: false };
+  } catch { return { ok: false }; }
+}
+
+export async function writeWorkspace(state, revision) {
+  try {
+    const response = await fetch(`${API_BASE}/workspace`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ state, revision }), cache: "no-store", keepalive: false
+    });
+    return { ...(await response.json()), status: response.status };
+  } catch { return { ok: false, error: "workspace_unavailable" }; }
+}

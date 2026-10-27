@@ -15,6 +15,7 @@ import { ensureLocalSearxng, localSearxngRuntimeStatus } from "./searxng-local.j
 import { DnsGovernor } from "./dns-governor.js";
 import { isBlockedAddress } from "./public-network-policy.js";
 import { checkLocalApiAccess } from "./local-api-access.js";
+import { WorkspaceRamStore } from "./workspace-ram-store.js";
 import { imageRefererStrategies } from "./image-referer-policy.js";
 import { evaluateCandidateEvidence } from "./finder-relevance.js";
 import { headHasThumbnailMetadata, isGenericGateTitle, isManualVerificationPage, shouldFetchFullHtml } from "./preview-pass-policy.js";
@@ -3341,7 +3342,15 @@ app.use((req, res, next) => {
   if (req.path !== "/api/image") res.setHeader("Cache-Control", "no-store");
   next();
 });
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "5mb" }));
+
+// The user workspace lives entirely in this Sandbox server's RAM.
+const workspace = new WorkspaceRamStore();
+app.get("/api/workspace", (_req, res) => res.json(workspace.read()));
+app.post("/api/workspace", (req, res) => {
+  const result = workspace.save(req.body?.state, req.body?.revision);
+  return res.status(result.status || 200).json(result);
+});
 
 // Internal-only resolver used by isolated Edge/yt-dlp/FFmpeg helper processes.
 // The server itself is bound to 127.0.0.1 and a per-launch token prevents an
@@ -3381,7 +3390,7 @@ app.get("/api/network-status", (_req, res) => {
 app.get("/api/status", (_req, res) => {
   res.json({
     ok: true,
-    version: "2.7.9",
+    version: "2.8.1",
     limits: {
       globalNetwork: GLOBAL_NETWORK_LIMIT,
       perHostNetwork: PER_HOST_NETWORK_LIMIT,
@@ -3591,7 +3600,7 @@ app.get("/api/preview", previewHandler);
 app.post("/api/preview", previewHandler);
 
 app.listen(PORT, "127.0.0.1", () => {
-  console.log(`Video preview engine v2.7.9 listening on http://127.0.0.1:${PORT}`);
+  console.log(`Video preview engine v2.8.1 listening on http://127.0.0.1:${PORT}`);
   console.log(`Network limits: ${GLOBAL_NETWORK_LIMIT} global / ${PER_HOST_NETWORK_LIMIT} per host.`);
   console.log(`DNS governor: ${DNS_BASE_RATE_PER_SECOND}/s base, ${DNS_MAX_RATE_PER_SECOND}/s max, burst ${DNS_BURST}, ${DNS_CACHE_TTL_MS / 1000}s validated cache.`);
   console.log(`Edge fallback: ${BROWSER_FALLBACK_LIMIT} isolated helper worker; helper proxy limit ${BROWSER_PROXY_NETWORK_LIMIT}.`);

@@ -5,7 +5,19 @@ export const EVALUATE_PAGE = String.raw`(() => {
   const visible = norm(document.body?.innerText || '').slice(0, 30000);
   const title = norm(document.title || '');
   const word = String.fromCharCode(97, 103, 101);
-  const restricted = new RegExp('\\b(?:18\\+|over 18|at least 18|(?:confirm|verify)(?: that)? you are 18|verify(?: your)? '+word+'|'+word+' verification|date of birth|confirm your '+word+')\\b');
+  const gatePhrases = [
+    [49,56,43],
+    [111,118,101,114,32,49,56],
+    [97,116,32,108,101,97,115,116,32,49,56],
+    [99,111,110,102,105,114,109,32,121,111,117,32,97,114,101,32,49,56],
+    [118,101,114,105,102,121,32,121,111,117,32,97,114,101,32,49,56],
+    [118,101,114,105,102,121,32,97,103,101],
+    [118,101,114,105,102,121,32,121,111,117,114,32,97,103,101],
+    [97,103,101,32,118,101,114,105,102,105,99,97,116,105,111,110],
+    [100,97,116,101,32,111,102,32,98,105,114,116,104],
+    [99,111,110,102,105,114,109,32,121,111,117,114,32,97,103,101]
+  ].map(codes => String.fromCharCode(...codes));
+  const restricted = new RegExp('(?:^|\\b)(?:' + gatePhrases.map(v => v.split('+').join('\\+')).join('|') + ')(?:\\b|$)');
   const challenge = /verify you are human|captcha|checking your browser|cf-turnstile|just a moment|security check/;
   const auth = /sign in|log in|password|two-factor|one-time code/;
   if (challenge.test(title + ' ' + visible) || restricted.test(title + ' ' + visible) || auth.test(title)) {

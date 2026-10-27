@@ -10,17 +10,23 @@ import {
   imageProxyUrl,
   networkStatus,
   recoverVideoMetadata,
+  readWorkspace,
+  writeWorkspace,
   searxngStatus
 } from "./api.js";
 import "./App.css";
 import { extractVideoUrls, videoUrlIdentity } from "./url-identity.js";
 import { normalizeExcludedDomain, excludeUrls } from "./domain-exclusions.js";
 import { shouldContinueHostProbes } from "./preview-batch-policy.js";
+import { buildSafePreviewDiagnosticReport } from "./safe-preview-diagnostics.js";
+import { pendingSiteRecoveryItems, siteRecoveryDelayMs, recoveryFailureCount } from "./site-recovery-policy.js";
 
 const CLIENT_CONCURRENCY = 4;
 const BROWSER_FALLBACK_CONCURRENCY = 1;
 const HOST_FALLBACK_SAMPLE_LIMIT = 3; // Cap independent page probes before deferring a uniformly blocked host.
-const AUTHORIZED_SITE_AUTO_RETRIES = 12;
+const SITE_RECOVERY_BASE_DELAY_MS = 850; // A single sequential site session, paced between attempts.
+const SITE_RECOVERY_MAX_CONSECUTIVE_FAILURES = 3;
+const WORKSPACE_SAVE_DELAY_MS = 650;
 const FINDER_CONCURRENCY = 1;
 const BATCH_COMPARE_LIMIT = 5;
 const PRIVACY_STORAGE_KEY = "linkPreviewPrivacyV1";
@@ -263,6 +269,8 @@ function App() {
   const [tabCollectorBusy, setTabCollectorBusy] = useState(false);
   const pendingTabRequestRef = useRef(null);
   const authorizedSiteAutoRetryRef = useRef(new Set());
+  const siteRecoveryStopRef = useRef(new Set());
+  const [siteRecoveryProgress, setSiteRecoveryProgress] = useState({});
   const [previews, setPreviews] = useState([]);
   const [selected, setSelected] = useState(() => new Set());
   const [processing, setProcessing] = useState(false);
@@ -271,6 +279,16 @@ function App() {
   const [activeTab, setActiveTab] = useState("previews");
   const [finderJobs, setFinderJobs] = useState([]);
   const finderRunningRef = useRef(new Set());
+  const [workspaceLoaded, setWorkspaceLoaded] = useState(false);
+  const [workspaceStatus, setWorkspaceStatus] = useState("Connecting to Sandbox memory…");
+  const workspaceRevisionRef = useRef(0);
+  const workspaceReadStartedRef = useRef(false);
+  const workspaceSaveInFlightRef = useRef(Promise.resolve());
+  const latestWorkspaceSnapshotRef = useRef(null);
+  const pendingSiteReturnRef = useRef(null);
+  const siteReturnAttemptRef = useRef(false);
+  const siteSessionLeftAppRef = useRef(false);
+
   const [privacy, setPrivacy] = useState(loadPrivacySettings);
   const [privacyOpen, setPrivacyOpen] = useState(false);
   const [bingState, setBingState] = useState({ state: "unverified", browserStatus: "none", live: false, evidence: null });
@@ -297,6 +315,79 @@ function App() {
     lastPressureAt: null,
     lastPressureReason: null
   }));
+
+  // Restore from a RAM-only backend snapshot after a discarded/reloaded app tab.
+  // Never restart unattended network requests from a stale snapshot.
+  useEffect(() => {
+    if (workspaceReadStartedRef.current) return;
+    workspaceReadStartedRef.current = true;
+    // One in-flight read also survives React StrictMode effect cleanup/replay.
+    readWorkspace().then((result) => {
+      if (result?.ok) workspaceRevisionRef.current = result.revision || 0;
+      const state = result?.state;
+      if (state?.schema === 1) {
+        const restored = (state.previews || []).map((item) =>
+          item.state === "loading" || item.state === "queued"
+            ? { ...item, state: "failed", browserFallbackQueued: false, error: "Interrupted by app-tab reload; use Retry failed to resume." }
+            : item
+        );
+        setPreviews(restored);
+        setFinderJobs((state.finderJobs || []).map((job) =>
+          job.state === "queued" || job.state === "running"
+            ? { ...job, state: "failed", error: "Interrupted by app-tab reload. Select Search again to resume." }
+            : job
+        ));
+        setSelected(new Set((state.selectedIds || []).filter((id) => restored.some((item) => item.id === id))));
+        if (Array.isArray(state.excludedDomains)) setExcludedDomains(state.excludedDomains);
+        if (typeof state.inputText === "string") setInputText(state.inputText);
+        if (typeof state.collectedTabText === "string") setCollectedTabText(state.collectedTabText);
+        if (["previews", "dead", "finder"].includes(state.activeTab)) setActiveTab(state.activeTab);
+        if (state.sessionTelemetry && typeof state.sessionTelemetry === "object") setSessionTelemetry(state.sessionTelemetry);
+        setWorkspaceStatus(`Restored ${restored.length} links from Sandbox memory`);
+      } else {
+        setWorkspaceStatus(result?.ok ? "Workspace protected in Sandbox memory" : "Workspace memory unavailable — this tab only");
+      }
+      setWorkspaceLoaded(true);
+    }).catch(() => { setWorkspaceStatus("Workspace memory unavailable — this tab only"); setWorkspaceLoaded(true); });
+  }, []);
+
+  // Debounced RAM-only snapshots: no localStorage, sessionStorage, IndexedDB,
+  // filesystem, remote telemetry, or cross-process history.
+  useEffect(() => {
+    if (!workspaceLoaded) return;
+    const snapshot = {
+      schema: 1, previews, finderJobs, selectedIds: [...selected], excludedDomains,
+      inputText, collectedTabText, activeTab, sessionTelemetry
+    };
+    latestWorkspaceSnapshotRef.current = snapshot;
+    const timer = window.setTimeout(() => saveWorkspaceSnapshot(snapshot), WORKSPACE_SAVE_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }, [workspaceLoaded, previews, finderJobs, selected, excludedDomains, inputText, collectedTabText, activeTab, sessionTelemetry]);
+
+  function saveWorkspaceSnapshot(snapshot) {
+    if (!snapshot) return;
+    workspaceSaveInFlightRef.current = workspaceSaveInFlightRef.current.then(async () => {
+      const result = await writeWorkspace(snapshot, workspaceRevisionRef.current);
+      if (result.ok) workspaceRevisionRef.current = result.revision;
+      else if (result.status === 409) {
+        const current = await readWorkspace();
+        if (current.ok) workspaceRevisionRef.current = current.revision || 0;
+        const retry = await writeWorkspace(snapshot, workspaceRevisionRef.current);
+        if (retry.ok) workspaceRevisionRef.current = retry.revision;
+      }
+      if (!result.ok && result.status !== 409) setWorkspaceStatus("Workspace snapshot unavailable or too large — current tab only");
+    }).catch(() => { setWorkspaceStatus("Workspace snapshot unavailable — current tab only"); });
+  }
+
+  useEffect(() => {
+    if (!workspaceLoaded) return undefined;
+    const flushOnHide = () => {
+      if (document.visibilityState === "hidden") saveWorkspaceSnapshot(latestWorkspaceSnapshotRef.current);
+    };
+    document.addEventListener("visibilitychange", flushOnHide);
+    window.addEventListener("pagehide", flushOnHide);
+    return () => { document.removeEventListener("visibilitychange", flushOnHide); window.removeEventListener("pagehide", flushOnHide); };
+  }, [workspaceLoaded]);
 
   useEffect(() => {
     try { localStorage.setItem(PRIVACY_STORAGE_KEY, JSON.stringify(privacy)); } catch {}
@@ -399,7 +490,7 @@ function App() {
         const errors = Math.max(0, (Number(dns.errors) || 0) - baseline.errors);
         const pressureActive = dns.pressure && dns.pressure !== "normal";
         const pressureAdvanced = pressureEvents > current.dnsPressureEvents;
-        return {
+        const next = {
           ...current,
           peakDnsQueue: Math.max(current.peakDnsQueue, Number(dns.queued) || 0),
           peakDnsRate: Math.max(current.peakDnsRate, Number(dns.recentFreshLookupsPerSecond) || 0),
@@ -411,9 +502,19 @@ function App() {
           lastPressureAt: pressureAdvanced || (pressureActive && !current.lastPressureAt) ? Date.now() : current.lastPressureAt,
           lastPressureReason: pressureActive && dns.lastPressureReason ? dns.lastPressureReason : current.lastPressureReason
         };
+        return Object.keys(next).every((key) => Object.is(next[key], current[key])) ? current : next;
       });
     }
     return result;
+  }
+
+  async function copySafePreviewDiagnostics() {
+    const report = buildSafePreviewDiagnosticReport({ previews, networkState, workspaceLoaded, processing });
+    try {
+      await navigator.clipboard.writeText(report);
+      setCopyStatus("Copied privacy-safe diagnostic report — no links or content");
+    } catch { setCopyStatus("Could not copy diagnostic summary"); }
+    window.setTimeout(() => setCopyStatus(""), 4000);
   }
 
   async function copySessionSnapshot() {
@@ -446,7 +547,7 @@ function App() {
       `DNS pressure events this UI session: ${sessionTelemetry.dnsPressureEvents}`,
       `DNS errors this UI session: ${sessionTelemetry.dnsErrors}`,
       `Last pressure time: ${formatSessionTime(sessionTelemetry.lastPressureAt)}`,
-      `Last pressure reason: ${sessionTelemetry.lastPressureReason || "none"}`,
+      `Last pressure category: ${/^slow_lookup_/.test(sessionTelemetry.lastPressureReason || "") ? "slow_lookup" : ["EAI_AGAIN", "ETIMEOUT", "SERVFAIL", "dns_pressure", "dns_lookup_timeout"].includes(sessionTelemetry.lastPressureReason) ? sessionTelemetry.lastPressureReason : "other_or_none"}`,
       "Privacy: aggregate counters/timestamps only; no URLs, hostnames, titles, IDs, or search terms included."
     ];
     try {
@@ -665,7 +766,7 @@ function App() {
 
   async function handleSubmit(event) {
     event.preventDefault();
-    if (processing || !inputText.trim()) return;
+    if (!workspaceLoaded || processing || !inputText.trim()) return;
     const parsed = extractVideoUrls(inputText);
     const filtered = excludeUrls(parsed.urls, excludedDomains);
     const existing = new Set(previews.map((item) => videoUrlIdentity(item.url)));
@@ -887,6 +988,9 @@ function App() {
   }
 
   async function authorizeSite(preview) {
+    pendingSiteReturnRef.current = preview.id;
+    siteReturnAttemptRef.current = false;
+    siteSessionLeftAppRef.current = false;
     patchPreview(preview.id, { authorizationState: "launching", authorizationMessage: null });
     if (!privacy.interactiveAuthorization || !privacy.browserFallback) {
       patchPreview(preview.id, { authorizationState: "disabled", authorizationMessage: "Enable Edge fallback and interactive authorization in Privacy & network activity." });
@@ -894,13 +998,128 @@ function App() {
     }
     const result = await authorizePreviewHost(preview.url, { privacy });
     if (!result.clientOk) {
+      pendingSiteReturnRef.current = null;
       patchPreview(preview.id, { authorizationState: "failed", authorizationMessage: result.error || "Unable to open authorization browser" });
       return;
     }
     patchPreview(preview.id, {
       authorizationState: "authorizing",
-      authorizationMessage: `Reusable site session opened for ${siteKeyFor(preview.url)}. The site-session helper may refresh once and handle recognized cookie/privacy consent buttons. CAPTCHA/challenge, login, and other access-control prompts remain manual. Once the real video is visible, click Retry. Nothing else on this site will retry automatically.`
+      authorizationMessage: "Finish any required on-site confirmation in Sandbox Edge, then return to this app. One automatic Retry will run and, if successful, recover all remaining previews from that site sequentially."
     });
+  }
+
+  const latestPreviewsRef = useRef(previews);
+  latestPreviewsRef.current = previews;
+  const latestPrivacyRef = useRef(privacy);
+  latestPrivacyRef.current = privacy;
+  const retryAuthorizedRef = useRef(null);
+  useEffect(() => {
+    const onAway = () => {
+      if (pendingSiteReturnRef.current) siteSessionLeftAppRef.current = true;
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") onAway();
+      else void onReturn();
+    };
+    const onReturn = async () => {
+      if (document.visibilityState === "hidden" || !document.hasFocus() || !siteSessionLeftAppRef.current || siteReturnAttemptRef.current) return;
+      const id = pendingSiteReturnRef.current;
+      if (!id || !latestPrivacyRef.current.browserFallback) return;
+      const item = latestPreviewsRef.current.find((preview) => preview.id === id);
+      if (!item) { pendingSiteReturnRef.current = null; return; }
+      // Wait for the site's own page transition and confirm the authorized
+      // Sandbox Edge process exists before spending one bounded preview retry.
+      siteReturnAttemptRef.current = true;
+      await new Promise((resolve) => window.setTimeout(resolve, 1200));
+      if (!document.hasFocus() || document.visibilityState === "hidden") { siteReturnAttemptRef.current = false; return; }
+      const status = await authorizationStatus(item.url);
+      if (!status.clientOk || (!status.live && !status.ready)) { siteReturnAttemptRef.current = false; return; }
+      pendingSiteReturnRef.current = null;
+      // Only user-initiated site sessions receive one automatic retry on return.
+      // Actual site verification remains a user's action in the visible window.
+      await retryAuthorizedRef.current?.(item);
+    };
+    window.addEventListener("blur", onAway);
+    window.addEventListener("focus", onReturn);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => { window.removeEventListener("blur", onAway); window.removeEventListener("focus", onReturn); document.removeEventListener("visibilitychange", onVisibility); };
+  }, []);
+
+  async function runAuthorizedSiteRecovery(preview) {
+    const siteKey = siteKeyFor(preview.url);
+    if (!siteKey || authorizedSiteAutoRetryRef.current.has(siteKey)) return;
+    const items = pendingSiteRecoveryItems(
+      latestPreviewsRef.current, siteKey, preview.id, siteKeyFor, needsAuthorizedSiteRetry
+    );
+    if (!items.length) {
+      patchPreview(preview.id, {
+        authorizationState: "site-ready", authorizationMessage: "All eligible previews for this site have been processed."
+      });
+      return;
+    }
+    authorizedSiteAutoRetryRef.current.add(siteKey);
+    siteRecoveryStopRef.current.delete(siteKey);
+    const total = items.length;
+    let completed = 0;
+    let succeeded = 0;
+    let consecutiveFailures = 0;
+    let stopReason = "completed";
+    setSiteRecoveryProgress((current) => ({ ...current, [siteKey]: { status: "running", completed, total, succeeded } }));
+    patchPreview(preview.id, {
+      authorizationState: "site-recovering",
+      authorizationMessage: `Recovering all ${total} unresolved previews for this site sequentially. Network pacing remains active.`
+    });
+    try {
+      for (const target of items) {
+        if (siteRecoveryStopRef.current.has(siteKey)) { stopReason = "stopped"; break; }
+        if (!latestPrivacyRef.current.browserFallback || !latestPrivacyRef.current.interactiveAuthorization) {
+          stopReason = "settings";
+          break;
+        }
+        const latest = latestPreviewsRef.current.find((item) => item.id === target.id);
+        if (!latest || !needsAuthorizedSiteRetry(latest)) {
+          completed += 1;
+          setSiteRecoveryProgress((current) => ({ ...current, [siteKey]: { status: "running", completed, total, succeeded } }));
+          continue;
+        }
+        const result = await processSinglePreview(latest, {
+          authorizationState: "site-retry",
+          authorizationMessage: "Using the existing approved Sandbox site session…"
+        });
+        completed += 1;
+        if (result?.clientOk && result.image) succeeded += 1;
+        consecutiveFailures = recoveryFailureCount(consecutiveFailures, Boolean(result?.clientOk && result.image));
+        setSiteRecoveryProgress((current) => ({ ...current, [siteKey]: { status: "running", completed, total, succeeded } }));
+        if (completed < total && consecutiveFailures >= SITE_RECOVERY_MAX_CONSECUTIVE_FAILURES) {
+          stopReason = "repeated-failures";
+          break;
+        }
+        if (completed < total) {
+          await new Promise((resolve) => window.setTimeout(resolve, siteRecoveryDelayMs(consecutiveFailures, SITE_RECOVERY_BASE_DELAY_MS)));
+        }
+      }
+    } finally {
+      authorizedSiteAutoRetryRef.current.delete(siteKey);
+      siteRecoveryStopRef.current.delete(siteKey);
+      const status = stopReason === "completed" ? "completed" : "paused";
+      setSiteRecoveryProgress((current) => ({ ...current, [siteKey]: { status, completed, total, succeeded, reason: stopReason } }));
+      const summary = stopReason === "completed"
+        ? `Finished all ${total} eligible same-site previews: ${succeeded} recovered.`
+        : stopReason === "repeated-failures"
+          ? `Paused after ${SITE_RECOVERY_MAX_CONSECUTIVE_FAILURES} consecutive unsuccessful previews (${completed}/${total} attempted). Resume remaining items when the site is responsive.`
+          : stopReason === "settings"
+            ? `Paused at ${completed}/${total} because site-session previewing was disabled.`
+            : `Stopped at ${completed}/${total}. The remaining items can be resumed using the same session.`;
+      patchPreview(preview.id, { authorizationState: "site-ready", authorizationMessage: summary });
+    }
+  }
+
+  function stopSiteRecovery(siteKey) {
+    if (!authorizedSiteAutoRetryRef.current.has(siteKey)) return;
+    siteRecoveryStopRef.current.add(siteKey);
+    setSiteRecoveryProgress((current) => ({
+      ...current, [siteKey]: { ...(current[siteKey] || {}), status: "stopping" }
+    }));
   }
 
   async function retryAuthorizedPreview(preview) {
@@ -916,79 +1135,23 @@ function App() {
 
     const result = await processSinglePreview(preview);
     if (!result?.clientOk || !result.image) return;
-
-    const siteKey = siteKeyFor(preview.url);
-    if (!siteKey) return;
-    const siblingCount = previews.filter((item) =>
-      item.id !== preview.id &&
-      siteKeyFor(item.url) === siteKey &&
-      needsAuthorizedSiteRetry(item)
-    ).length;
-    patchPreview(preview.id, {
-      authorizationState: "site-ready",
-      authorizationMessage: siblingCount
-        ? `Site session active. Retrying up to ${Math.min(AUTHORIZED_SITE_AUTO_RETRIES, siblingCount)} unresolved same-site previews sequentially.`
-        : `Site session active for ${siteKey}.`
-    });
-    // Only after a successful user-authorized Retry: one bounded, sequential
-    // same-site wave. Never start recursive or unlimited retries.
-    if (!siblingCount || authorizedSiteAutoRetryRef.current.has(siteKey)) return;
-    authorizedSiteAutoRetryRef.current.add(siteKey);
-    const targets = previews.filter((item) =>
-      item.id !== preview.id && siteKeyFor(item.url) === siteKey && needsAuthorizedSiteRetry(item)
-    ).slice(0, AUTHORIZED_SITE_AUTO_RETRIES);
-    try {
-      for (const target of targets) {
-        await processSinglePreview(target, {
-          authorizationState: "site-retry",
-          authorizationMessage: "Reusing your approved Sandbox site session…"
-        });
-        await new Promise((resolve) => setTimeout(resolve, 500));
-      }
-    } finally {
-      authorizedSiteAutoRetryRef.current.delete(siteKey);
-      patchPreview(preview.id, {
-        authorizationState: "site-ready",
-        authorizationMessage: `Finished ${targets.length} bounded same-site retries. Further retries remain manual to protect network responsiveness.`
-      });
-    }
+    await runAuthorizedSiteRecovery(preview);
   }
 
-  async function retrySiteBatch(preview, limit = 3) {
+  retryAuthorizedRef.current = retryAuthorizedPreview;
+
+  async function retrySiteBatch(preview) {
     const siteKey = siteKeyFor(preview.url);
-    if (!siteKey) return;
+    if (!siteKey || authorizedSiteAutoRetryRef.current.has(siteKey)) return;
     const status = await authorizationStatus(preview.url);
     if (!status.clientOk || (!status.live && !status.ready)) {
       patchPreview(preview.id, {
         authorizationState: "needs-attention",
-        authorizationMessage: `Open the reusable ${siteKey} site session first, then retry this preview successfully before running a site batch.`
+        authorizationMessage: "The reusable site session is not available. Open the site session and finish any required confirmation before recovering the remaining previews."
       });
       return;
     }
-    const targets = previews.filter((item) =>
-      item.id !== preview.id &&
-      siteKeyFor(item.url) === siteKey &&
-      needsAuthorizedSiteRetry(item)
-    ).slice(0, limit);
-    if (!targets.length) {
-      patchPreview(preview.id, { authorizationMessage: `No unresolved previews remain for ${siteKey}.` });
-      return;
-    }
-    patchPreview(preview.id, {
-      authorizationState: "site-batch",
-      authorizationMessage: `Retrying ${targets.length} ${siteKey} preview${targets.length === 1 ? "" : "s"} sequentially. No additional automatic batch will start.`
-    });
-    for (const target of targets) {
-      await processSinglePreview(target, {
-        authorizationState: "site-retry",
-        authorizationMessage: `Reusing ${siteKey} site session in an explicit bounded batch…`
-      });
-      await new Promise((resolve) => setTimeout(resolve, 350));
-    }
-    patchPreview(preview.id, {
-      authorizationState: "site-ready",
-      authorizationMessage: `Finished explicit batch of ${targets.length} for ${siteKey}. If unresolved previews remain, run another batch only when you want to.`
-    });
+    await runAuthorizedSiteRecovery(preview);
   }
 
   function handleCardClick(event, id) {
@@ -1074,6 +1237,7 @@ function App() {
               <div><dt>Pressure events</dt><dd>{sessionTelemetry.dnsPressureEvents}</dd></div>
             </dl>
             <button type="button" className="telemetry-copy-button" onClick={copySessionSnapshot}>Copy aggregate snapshot</button>
+            <button type="button" className="telemetry-copy-button" onClick={copySafePreviewDiagnostics}>Copy preview diagnostic report (no links)</button>
           </div>
           {networkState.dns.lastPressureReason && networkState.dns.pressure !== "normal" && <p>Adaptive throttle reason: {networkState.dns.lastPressureReason}. The app will ramp back up automatically after DNS recovers.</p>}
         </section>
@@ -1094,7 +1258,7 @@ function App() {
               <div className="privacy-group"><h3>Preview browsing</h3>
                 <PrivacyToggle checked={privacy.remoteThumbnails} onChange={(v) => setPrivacyOption("remoteThumbnails", v)} title="Load remote thumbnails" detail="Downloads discovered poster/thumbnail images through the localhost safety proxy." />
                 <PrivacyToggle checked={privacy.browserFallback} onChange={(v) => setPrivacyOption("browserFallback", v)} title="Edge browser fallback" detail="Lets Sandbox Edge load difficult video pages when lightweight metadata is insufficient." />
-                <PrivacyToggle checked={privacy.interactiveAuthorization} onChange={(v) => setPrivacyOption("interactiveAuthorization", v)} title="Interactive site sessions" detail="Allows one reusable Sandbox Edge session. After you authorize and successfully Retry once, up to 12 same-site previews can retry sequentially; further batches require a click." />
+                <PrivacyToggle checked={privacy.interactiveAuthorization} onChange={(v) => setPrivacyOption("interactiveAuthorization", v)} title="Interactive site sessions" detail="Allows one reusable Sandbox Edge session. After one successful approved-session Retry, recover all eligible unresolved same-site previews sequentially. Pause automatically after repeated failures." />
               </div>
               <div className="privacy-group"><h3>Version Finder — destinations</h3>
                 <PrivacyToggle checked={privacy.mediaTools} onChange={(v) => setPrivacyOption("mediaTools", v)} title="Media-tool probing" detail="Allows yt-dlp/Deno to inspect selected and candidate public video pages/CDNs inside Sandbox." />
@@ -1150,6 +1314,7 @@ function App() {
         </button>
       </nav>
 
+      <div className="workspace-memory-status" role="status">{workspaceStatus}. Session-only; cleared when the Sandbox server stops.</div>
       {copyStatus && <div className="copy-toast workspace-toast">{copyStatus}</div>}
 
       {(activeTab === "previews" || activeTab === "dead") && (
@@ -1239,7 +1404,7 @@ function App() {
                                 : preview.challengeDetected
                                   ? "The lightweight preview was blocked or challenged. Open one reusable Sandbox site session."
                                   : "No public thumbnail could be recovered from page headers, body metadata or the unattended browser. This site may require a cookie-consent or login step."}
-                              {" "}After one successful Retry, other unresolved previews from this same site can reuse the session, but they will not retry automatically.
+                              {" "}After on-site confirmation, returning to the app automatically retries this item once. A successful result starts paced, sequential recovery of all eligible unresolved same-site previews.
                             </p>
                             <div className="challenge-actions">
                               <button type="button" onClick={() => authorizeSite(preview)} disabled={!privacy.browserFallback || !privacy.interactiveAuthorization || preview.authorizationState === "launching" || preview.authorizationState === "authorizing"}>
@@ -1250,11 +1415,17 @@ function App() {
                             {preview.authorizationMessage && <small>{preview.authorizationMessage}</small>}
                           </div>
                         )}
-                        {preview.authorizationState === "site-ready" && siteUnresolvedCount > 0 && (
+                        {(preview.authorizationState === "site-ready" || preview.authorizationState === "site-recovering") && (siteUnresolvedCount > 0 || siteRecoveryProgress[previewSiteKey]?.status === "running") && (
                           <div className="challenge-box">
-                            <p className="warning-message">Reusable site session active for {previewSiteKey}. {siteUnresolvedCount} unresolved preview{siteUnresolvedCount === 1 ? "" : "s"} can reuse it. Nothing runs automatically.</p>
+                            <p className="warning-message">
+                              {siteRecoveryProgress[previewSiteKey]?.status === "running" || siteRecoveryProgress[previewSiteKey]?.status === "stopping"
+                                ? `Sequential site recovery: ${siteRecoveryProgress[previewSiteKey]?.completed || 0}/${siteRecoveryProgress[previewSiteKey]?.total || 0} attempted, ${siteRecoveryProgress[previewSiteKey]?.succeeded || 0} recovered.`
+                                : `Approved session available. ${siteUnresolvedCount} unresolved preview${siteUnresolvedCount === 1 ? "" : "s"} remain for this site.`}
+                            </p>
                             <div className="challenge-actions">
-                              <button type="button" onClick={() => retrySiteBatch(preview, 3)} disabled={!privacy.browserFallback}>Retry next {Math.min(3, siteUnresolvedCount)} from site</button>
+                              {siteRecoveryProgress[previewSiteKey]?.status === "running" || siteRecoveryProgress[previewSiteKey]?.status === "stopping"
+                                ? <button type="button" onClick={() => stopSiteRecovery(previewSiteKey)} disabled={siteRecoveryProgress[previewSiteKey]?.status === "stopping"}>Stop after current preview</button>
+                                : <button type="button" onClick={() => retrySiteBatch(preview)} disabled={!privacy.browserFallback || !privacy.interactiveAuthorization}>Recover all remaining from site</button>}
                             </div>
                             {preview.authorizationMessage && <small>{preview.authorizationMessage}</small>}
                           </div>

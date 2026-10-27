@@ -1,7 +1,7 @@
-# Link Preview App — complete v2.7.9 source tree
+# Link Preview App — complete v2.8.1 source tree
 
 This is the **complete application source tree**, assembled from the supplied
-`link-preview-app.zip` and the v2.7.6 source, followed by the v2.7.7, v2.7.8 and v2.7.9 preview improvements. The Git history (`.git/`) and
+`link-preview-app.zip` and the v2.7.6 source, followed by the v2.7.7, v2.7.8 and v2.7.9 preview improvements, v2.8.0 workspace recovery, and v2.8.1 full same-site recovery. The Git history (`.git/`) and
 installed dependencies are intentionally **not** distributed in the ZIP.
 
 ```text
@@ -76,10 +76,8 @@ prompts. The older DOM-dump fallback remains available if Edge's local debugger
 is unavailable. Large video/media requests are suppressed in the new headless
 browser path; no site/domain allowlist or content filtering is introduced.
 
-When the user has already opened a reusable site session and a manual Retry
-succeeds, the app can reuse that approved session for **up to 12** unresolved
-same-site previews in one sequential, non-recursive batch. Further attempts
-remain user-initiated. The fast HTTP pass now labels pending browser work as
+In v2.7.8, an approved session could recover only the next 12 unresolved
+same-site previews. **This historical limit was removed in v2.8.1.** The fast HTTP pass now labels pending browser work as
 "queued" rather than incorrectly suggesting it was never scheduled.
 
 Large imports use conservative networking defaults: **4 frontend preview
@@ -140,3 +138,52 @@ node --test tests/*.test.mjs
 Run the React build separately after installing the client dependencies. A true
 Windows Sandbox startup and Edge extension auto-load must still be verified in
 the real Windows environment.
+
+## v2.8.0: Preview recovery and workspace resilience
+
+- When you manually open a reusable Sandbox site session, complete any required
+  website confirmation yourself, then return to the app. The app performs one
+  automatic preview retry and, on success, reuses the approved profile.
+  (The v2.8.0 group was limited to 12; v2.8.1 removes that cap.) No automatic site
+  verification is attempted; actual verification and sign-in remain manual.
+- The preview list, selected items, Finder jobs, draft input, exclusion rules,
+  and completed thumbnail metadata are mirrored into **Sandbox server RAM**.
+  If the app tab reloads or is discarded, the UI can restore that workspace.
+  Interrupted network jobs remain available for explicit retry, not unbounded
+  automatic replay. Server restart or Sandbox close clears the snapshot.
+- `Copy preview diagnostic report (no links)` produces a strictly allowlisted
+  aggregate report of counters, timing, and recovery states. It contains no
+  source URLs, domains, titles, media IDs, snippets, or raw error strings.
+  Nothing is sent outside the Sandbox unless you explicitly copy and share it.
+- The older aggregate network snapshot has also been hardened to avoid copying
+  untrusted free-text error reasons.
+
+The workspace is never written to localStorage, sessionStorage, IndexedDB,
+filesystem logs, or host-mounted folders. The app does not contact any monitoring
+server or Home Assistant integration. This behavior assumes the local Sandbox
+backend remains running; no memory-only design can preserve data across a full
+backend/Sandbox restart.
+
+
+## v2.8.1: recover all remaining previews from an approved site session
+
+- After completing any required confirmation in visible Sandbox Edge, return to
+  the app. It retries the original link and, when that preview succeeds, starts
+  **every eligible unresolved link on the same website host** sequentially.
+  There is no hard 12-link limit and no need to repeat a three-item batch.
+- A single recovery wave runs per host; there are no recursive retry chains.
+  The worker waits at least 850 ms between requests and backs off after
+  unsuccessful attempts. Three consecutive unsuccessful previews pause the wave
+  rather than repeatedly requesting inaccessible pages.
+- Progress includes attempted/recovered counts and a **Stop after current
+  preview** control. **Recover all remaining from site** resumes a paused wave
+  using the existing approved site session when it is still available.
+- Separate subdomains are not presumed to share site-session state.
+- Browser reloads still restore the RAM-only workspace, but interrupted
+  recovery work is **not automatically replayed** from a possibly stale
+  snapshot; resume from the approved session if necessary.
+- Ordinary cookie controls may be handled automatically. Prompts requiring
+  a personal confirmation or sign-in still require the website's normal
+  user interaction; the app does not submit those decisions unattended.
+- DNS, HTTP, thumbnail and browser limits remain unchanged. Nothing new is
+  logged to disk or transmitted to monitoring systems.
