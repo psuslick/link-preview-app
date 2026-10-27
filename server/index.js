@@ -1394,7 +1394,7 @@ async function renderMetadataFromAuthorizedSession(targetUrl, debugPort) {
     const timer = setTimeout(() => {
       try { child.kill(); } catch {}
       finish({ ok: false, error: "authorized_session_probe_timeout" });
-    }, 9000);
+    }, 13200);
     child.stdout.on("data", (chunk) => {
       outBytes += chunk.length;
       if (outBytes > BROWSER_DOM_LIMIT_BYTES * 2 + 256 * 1024) {
@@ -1813,7 +1813,7 @@ async function createPreview(rawUrl, { allowBrowserFallback = true, forceReachab
     challengeProvider: httpChallenge?.provider || null,
     browserFallbackSkippedReason: httpChallenge && !hasAuthorizedSession ? "challenge_page_detected" : null,
     // Some video hosts do not present an anti-bot challenge at all. Instead, the
-    // real player/thumbnail is hidden behind an interactive consent, age, cookie,
+    // real player/thumbnail is hidden behind an interactive confirmation, cookie,
     // or "accept" overlay. A headless timeout/no-thumbnail is therefore also a
     // valid reason to offer the reusable visible Sandbox site session.
     siteSessionRecommended: Boolean(
@@ -3390,7 +3390,7 @@ app.get("/api/network-status", (_req, res) => {
 app.get("/api/status", (_req, res) => {
   res.json({
     ok: true,
-    version: "2.8.1",
+    version: "2.8.2",
     limits: {
       globalNetwork: GLOBAL_NETWORK_LIMIT,
       perHostNetwork: PER_HOST_NETWORK_LIMIT,
@@ -3600,7 +3600,7 @@ app.get("/api/preview", previewHandler);
 app.post("/api/preview", previewHandler);
 
 app.listen(PORT, "127.0.0.1", () => {
-  console.log(`Video preview engine v2.8.1 listening on http://127.0.0.1:${PORT}`);
+  console.log(`Video preview engine v2.8.2 listening on http://127.0.0.1:${PORT}`);
   console.log(`Network limits: ${GLOBAL_NETWORK_LIMIT} global / ${PER_HOST_NETWORK_LIMIT} per host.`);
   console.log(`DNS governor: ${DNS_BASE_RATE_PER_SECOND}/s base, ${DNS_MAX_RATE_PER_SECOND}/s max, burst ${DNS_BURST}, ${DNS_CACHE_TTL_MS / 1000}s validated cache.`);
   console.log(`Edge fallback: ${BROWSER_FALLBACK_LIMIT} isolated helper worker; helper proxy limit ${BROWSER_PROXY_NETWORK_LIMIT}.`);

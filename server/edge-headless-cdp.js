@@ -1,3 +1,4 @@
+import { appendLivePosterHints } from "./browser-poster-hints.js";
 import { EVALUATE_PAGE } from "./edge-dom-policy.js";
 import { shouldStopPassiveScan } from "./preview-browser-policy.js";
 // Read a single public page in an isolated Sandbox Edge profile.
@@ -89,7 +90,7 @@ async function collect() {
       const value = evaluated?.result?.value || {};
       action = value.action || 'none';
       if (action === 'clicked_cookie_control') { await sleep(500); continue; }
-      html = String(value.html || '');
+      html = appendLivePosterHints(value.html, value.posterHints);
       if (action === 'manual_required') break;
       // DOM completion is not evidence that the player initialized. Continue
       // the bounded inspection until a real poster hint appears (or the budget

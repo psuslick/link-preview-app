@@ -1,4 +1,4 @@
-# Link Preview App — complete v2.8.1 source tree
+# Link Preview App — complete v2.8.2 source tree
 
 This is the **complete application source tree**, assembled from the supplied
 `link-preview-app.zip` and the v2.7.6 source, followed by the v2.7.7, v2.7.8 and v2.7.9 preview improvements, v2.8.0 workspace recovery, and v2.8.1 full same-site recovery. The Git history (`.git/`) and
@@ -187,3 +187,18 @@ backend/Sandbox restart.
   user interaction; the app does not submit those decisions unattended.
 - DNS, HTTP, thumbnail and browser limits remain unchanged. Nothing new is
   logged to disk or transmitted to monitoring systems.
+
+
+## v2.8.2: delayed player-image readiness and safer diagnostics
+
+The live authorized-session browser now waits for real poster evidence, not just
+`document.readyState`. It checks the rendered `video.poster`, loaded
+`img.currentSrc`, and CSS player-cover backgrounds with a bounded wait, then
+feeds the discovered candidates into the normal thumbnail extractor. Browser
+inspection remains sequential and Sandbox-only; it does not automate required
+website verification. Some iframe-only or session-protected images may still
+not be accessible.
+
+The copied diagnostic report now categorizes browser fallback errors and upstream
+HTTP statuses using fixed, non-identifying labels. It never contains link URLs,
+domains, titles, extracted page text, media IDs or raw exception messages.

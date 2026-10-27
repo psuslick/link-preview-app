@@ -1,3 +1,6 @@
+import { BROWSER_POSTER_SNAPSHOT, appendLivePosterHints } from "./browser-poster-hints.js";
+import { hasPosterEvidence } from "./preview-browser-policy.js";
+
 const targetUrl = process.argv[2];
 const debugPort = Number(process.argv[3] || 0);
 const domLimit = Math.max(256 * 1024, Number(process.argv[4] || 2 * 1024 * 1024));
@@ -74,45 +77,28 @@ async function inspectExactUrl(browserWsUrl) {
     await cdp.send('Runtime.enable', {}, sessionId, 2500).catch(() => {});
     await cdp.send('Page.navigate', { url: targetUrl }, sessionId, 4000);
 
-    const expression = `(async () => {
-      const sleep = ms => new Promise(r => setTimeout(r, ms));
-      const deadline = Date.now() + 4200;
-      let previousLength = -1;
-      let stableCount = 0;
-      while (Date.now() < deadline) {
-        const html = document.documentElement ? document.documentElement.outerHTML : '';
-        const length = html.length;
-        if ((document.readyState === 'interactive' || document.readyState === 'complete') && length > 300) {
-          if (length === previousLength) stableCount += 1; else stableCount = 0;
-          if (document.readyState === 'complete' || stableCount >= 1) {
-            await sleep(250);
-            return {
-              html: document.documentElement ? document.documentElement.outerHTML : '',
-              pageUrl: location.href,
-              title: document.title || ''
-            };
-          }
-        }
-        previousLength = length;
-        await sleep(250);
-      }
-      return {
-        html: document.documentElement ? document.documentElement.outerHTML : '',
-        pageUrl: location.href,
-        title: document.title || ''
-      };
-    })()`;
-
-    const evaluated = await cdp.send('Runtime.evaluate', {
-      expression,
-      returnByValue: true,
-      awaitPromise: true
-    }, sessionId, 6500);
-    const value = evaluated?.result?.value || {};
-    const html = String(value.html || '');
-    if (!html) throw new Error('devtools_empty_dom');
-    if (Buffer.byteLength(html) > domLimit) throw new Error('devtools_dom_too_large');
-    return { html, pageUrl: value.pageUrl || targetUrl, title: value.title || null };
+    // A completed document may still show a blank player: poster assets and
+    // player-state metadata are often populated several seconds afterward.
+    // Poll only the already approved browser profile, with a hard time budget.
+    const deadline = Date.now() + 7500;
+    let best = null;
+    let sampleCount = 0;
+    while (Date.now() < deadline) {
+      sampleCount += 1;
+      const evaluated = await cdp.send('Runtime.evaluate', {
+        expression: BROWSER_POSTER_SNAPSHOT,
+        returnByValue: true
+      }, sessionId, 1600).catch(() => null);
+      const value = evaluated?.result?.value || {};
+      const html = appendLivePosterHints(value.html, value.posterHints);
+      if (html && Buffer.byteLength(html) > domLimit) throw new Error('devtools_dom_too_large');
+      if (html) best = { html, pageUrl: value.pageUrl || targetUrl, title: value.title || null, sampleCount };
+      // Do not accept document.readyState alone as evidence of a ready player.
+      if (sampleCount >= 2 && hasPosterEvidence(html)) break;
+      await new Promise((resolve) => setTimeout(resolve, 350));
+    }
+    if (!best?.html) throw new Error('devtools_empty_dom');
+    return best;
   } finally {
     if (targetId) await cdp.send('Target.closeTarget', { targetId }, null, 1800).catch(() => {});
     cdp.close();

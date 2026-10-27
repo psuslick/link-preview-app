@@ -1,3 +1,4 @@
+import { BROWSER_POSTER_SNAPSHOT } from "./browser-poster-hints.js";
 // Browser-memory-only handling for routine cookie consent. Does not perform
 // authentication, verification or challenge responses.
 export const EVALUATE_PAGE = String.raw`(() => {
@@ -42,5 +43,5 @@ export const EVALUATE_PAGE = String.raw`(() => {
       return { action: 'clicked_cookie_control' };
     }
   }
-  return { action: 'none', html: document.documentElement?.outerHTML || '' };
+  return { action: 'none', ...(${BROWSER_POSTER_SNAPSHOT}) };
 })()`;
