@@ -64,7 +64,7 @@ export function buildSafePreviewDiagnosticReport({ previews = [], networkState =
   }
   const dns = networkState?.dns || {}, http = networkState?.http || {}, traffic = networkState?.traffic || {};
   return [
-    "Link Preview App v2.8.2 — privacy-safe diagnostic summary",
+    "Link Preview App v2.8.3 — privacy-safe diagnostic summary",
     `Capture time: ${capturedAt.toISOString()}`,
     `Workspace: ${workspaceLoaded ? "ready" : "restoring"}`,
     `Processing: ${processing ? "active" : "idle"}`,

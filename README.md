@@ -1,4 +1,4 @@
-# Link Preview App — complete v2.8.2 source tree
+# Link Preview App — complete v2.8.3 source tree
 
 This is the **complete application source tree**, assembled from the supplied
 `link-preview-app.zip` and the v2.7.6 source, followed by the v2.7.7, v2.7.8 and v2.7.9 preview improvements, v2.8.0 workspace recovery, and v2.8.1 full same-site recovery. The Git history (`.git/`) and
@@ -202,3 +202,21 @@ not be accessible.
 The copied diagnostic report now categorizes browser fallback errors and upstream
 HTTP statuses using fixed, non-identifying labels. It never contains link URLs,
 domains, titles, extracted page text, media IDs or raw exception messages.
+
+
+## v2.8.3: hide links without thumbnails
+
+The **Previews** tab includes a **Hide links without thumbnails** checkbox.
+With it enabled, cards with no discovered thumbnail candidates, and cards whose
+image candidates all failed to load through the safe image proxy, are hidden
+from the grid. All links remain in Sandbox memory, and processing and recovery
+continue normally. Disabling the filter reveals the full list again. The
+**Dead Links** tab and diagnostic totals remain unchanged.
+
+The choice is saved only in the disposable Sandbox backend's RAM workspace so
+it survives a browser-tab reload but not a Sandbox restart. No new disk writes,
+search requests, or external telemetry are introduced by this feature.
+
+If an image candidate was reported but failed to load, the grid may initially
+show the card until all candidates have been attempted. This keeps lazy-loaded
+images working correctly without issuing new requests just to evaluate a filter.

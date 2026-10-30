@@ -20,6 +20,7 @@ import { normalizeExcludedDomain, excludeUrls } from "./domain-exclusions.js";
 import { shouldContinueHostProbes } from "./preview-batch-policy.js";
 import { buildSafePreviewDiagnosticReport } from "./safe-preview-diagnostics.js";
 import { pendingSiteRecoveryItems, siteRecoveryDelayMs, recoveryFailureCount } from "./site-recovery-policy.js";
+import { filterPreviewsByThumbnail, thumbnailCandidates, thumbnailSourceKey } from "./preview-visibility.js";
 
 const CLIENT_CONCURRENCY = 4;
 const BROWSER_FALLBACK_CONCURRENCY = 1;
@@ -113,12 +114,12 @@ function formatDuration(seconds) {
   return `${minutes}:${String(secs).padStart(2, "0")}`;
 }
 
-function LazyThumbnail({ sources, sourceUrl, title, allowRemoteImages = true }) {
+function LazyThumbnail({ sources, sourceUrl, title, allowRemoteImages = true, onExhausted, onLoaded }) {
   const holderRef = useRef(null);
-  const candidates = useMemo(() => {
-    const values = Array.isArray(sources) ? sources : sources ? [sources] : [];
-    return [...new Set(values.filter(Boolean))];
-  }, [sources]);
+  // Parents may pass a new array object every render. Depend on values so
+  // unrelated status updates don't reset loading or restart image requests.
+  const sourcesKey = thumbnailSourceKey(sources);
+  const candidates = useMemo(() => thumbnailCandidates(sources), [sourcesKey]);
   const [shouldLoad, setShouldLoad] = useState(false);
   const [candidateIndex, setCandidateIndex] = useState(0);
 
@@ -152,7 +153,11 @@ function LazyThumbnail({ sources, sourceUrl, title, allowRemoteImages = true }) 
           loading="lazy"
           decoding="async"
           referrerPolicy="origin"
-          onError={() => setCandidateIndex((index) => index + 1)}
+          onLoad={(event) => { if (event.currentTarget.naturalWidth > 0) onLoaded?.(); }}
+          onError={() => {
+            if (candidateIndex + 1 >= candidates.length) onExhausted?.();
+            setCandidateIndex((index) => index + 1);
+          }}
         />
       ) : (
         <div className="thumbnail-placeholder">
@@ -272,6 +277,10 @@ function App() {
   const siteRecoveryStopRef = useRef(new Set());
   const [siteRecoveryProgress, setSiteRecoveryProgress] = useState({});
   const [previews, setPreviews] = useState([]);
+  // Display-only preference, saved in RAM-only workspace so tab reloads retain it.
+  const [hideMissingThumbnails, setHideMissingThumbnails] = useState(false);
+  // Failure of all image proxy candidates, memory-only and cleared when retried.
+  const [exhaustedThumbnailKeys, setExhaustedThumbnailKeys] = useState({});
   const [selected, setSelected] = useState(() => new Set());
   const [processing, setProcessing] = useState(false);
   const [importSummary, setImportSummary] = useState(null);
@@ -339,6 +348,7 @@ function App() {
         ));
         setSelected(new Set((state.selectedIds || []).filter((id) => restored.some((item) => item.id === id))));
         if (Array.isArray(state.excludedDomains)) setExcludedDomains(state.excludedDomains);
+        if (typeof state.hideMissingThumbnails === "boolean") setHideMissingThumbnails(state.hideMissingThumbnails);
         if (typeof state.inputText === "string") setInputText(state.inputText);
         if (typeof state.collectedTabText === "string") setCollectedTabText(state.collectedTabText);
         if (["previews", "dead", "finder"].includes(state.activeTab)) setActiveTab(state.activeTab);
@@ -357,12 +367,12 @@ function App() {
     if (!workspaceLoaded) return;
     const snapshot = {
       schema: 1, previews, finderJobs, selectedIds: [...selected], excludedDomains,
-      inputText, collectedTabText, activeTab, sessionTelemetry
+      inputText, collectedTabText, activeTab, sessionTelemetry, hideMissingThumbnails
     };
     latestWorkspaceSnapshotRef.current = snapshot;
     const timer = window.setTimeout(() => saveWorkspaceSnapshot(snapshot), WORKSPACE_SAVE_DELAY_MS);
     return () => window.clearTimeout(timer);
-  }, [workspaceLoaded, previews, finderJobs, selected, excludedDomains, inputText, collectedTabText, activeTab, sessionTelemetry]);
+  }, [workspaceLoaded, previews, finderJobs, selected, excludedDomains, inputText, collectedTabText, activeTab, sessionTelemetry, hideMissingThumbnails]);
 
   function saveWorkspaceSnapshot(snapshot) {
     if (!snapshot) return;
@@ -608,6 +618,18 @@ function App() {
   const livePreviews = useMemo(() => previews.filter((item) => !item.deadLink), [previews]);
   const deadPreviews = useMemo(() => previews.filter((item) => item.deadLink), [previews]);
   const visiblePreviews = activeTab === "dead" ? deadPreviews : livePreviews;
+  // Keep the full list for jobs, retries, recovery, diagnostics and clearing.
+  // Only the ordinary preview grid is filtered; the Dead Links tab stays usable.
+  const displayedPreviews = useMemo(() => activeTab === "previews"
+    ? filterPreviewsByThumbnail(livePreviews, hideMissingThumbnails, exhaustedThumbnailKeys, privacy.remoteThumbnails)
+    : visiblePreviews,
+  [activeTab, livePreviews, visiblePreviews, hideMissingThumbnails, exhaustedThumbnailKeys, privacy.remoteThumbnails]);
+  const hiddenMissingCount = visiblePreviews.length - displayedPreviews.length;
+  const selectedNotShownCount = useMemo(() => {
+    if (!hideMissingThumbnails || activeTab !== "previews") return 0;
+    const visibleIds = new Set(displayedPreviews.map((item) => item.id));
+    return [...selected].filter((id) => !visibleIds.has(id)).length;
+  }, [hideMissingThumbnails, activeTab, displayedPreviews, selected]);
   const visibleStats = useMemo(() => {
     let queued = 0, loading = 0, ready = 0, failed = 0;
     for (const item of visiblePreviews) {
@@ -637,6 +659,15 @@ function App() {
   }, [finderJobs]);
 
   function patchPreview(id, patch) {
+    // A retry or new metadata can make a previously failed thumbnail accessible.
+    if (patch.state === "loading" || Object.hasOwn(patch, "image") || Object.hasOwn(patch, "images")) {
+      setExhaustedThumbnailKeys((current) => {
+        if (!Object.hasOwn(current, id)) return current;
+        const updated = { ...current };
+        delete updated[id];
+        return updated;
+      });
+    }
     setPreviews((current) => current.map((item) => item.id === id ? { ...item, ...patch } : item));
   }
   function patchFinderJob(id, patch) {
@@ -801,12 +832,14 @@ function App() {
       return next;
     });
   }
-  function selectAll() { setSelected(new Set(visiblePreviews.map((item) => item.id))); }
+  function selectAll() { setSelected(new Set(displayedPreviews.map((item) => item.id))); }
   function clearSelection() { setSelected(new Set()); }
   function invertSelection() {
     setSelected((current) => {
-      const next = new Set();
-      for (const item of visiblePreviews) if (!current.has(item.id)) next.add(item.id);
+      // Invert only the cards shown by the current filter; preserve hidden selections.
+      const shownIds = new Set(displayedPreviews.map((item) => item.id));
+      const next = new Set([...current].filter((id) => !shownIds.has(id)));
+      for (const item of displayedPreviews) if (!current.has(item.id)) next.add(item.id);
       return next;
     });
   }
@@ -824,7 +857,7 @@ function App() {
   }
   function clearAll() {
     if (processing) return;
-    setPreviews([]); setSelected(new Set()); setImportSummary(null);
+    setPreviews([]); setSelected(new Set()); setImportSummary(null); setExhaustedThumbnailKeys({});
   }
   async function retryFailed() {
     if (processing) return;
@@ -1319,6 +1352,20 @@ function App() {
 
       {(activeTab === "previews" || activeTab === "dead") && (
         <>
+          {activeTab === "previews" && (
+            <section className="preview-visibility-toolbar" aria-label="Preview display filter">
+              <label className="preview-visibility-switch">
+                <input type="checkbox" checked={hideMissingThumbnails} onChange={(event) => setHideMissingThumbnails(event.target.checked)} />
+                <span>Hide links without thumbnails</span>
+              </label>
+              <span className="preview-visibility-count" role="status">
+                {hideMissingThumbnails
+                  ? `Showing ${displayedPreviews.length} of ${livePreviews.length} · ${hiddenMissingCount} hidden`
+                  : `${livePreviews.length} links · show all`}
+              </span>
+              {hideMissingThumbnails && <small>View only: hidden links remain eligible for recovery. Turn off to see or retry them. Clear all links still clears the full workspace.</small>}
+            </section>
+          )}
           {visiblePreviews.length > 0 && (
             <>
               <section className="status-strip">
@@ -1332,7 +1379,7 @@ function App() {
               </section>
 
               <section className="actionbar">
-                <div className="selection-count">{selected.size} selected</div>
+                <div className="selection-count">{selected.size} selected{selectedNotShownCount > 0 && <small title="Selections that are currently hidden by the filter or on another tab"> · {selectedNotShownCount} not shown</small>}</div>
                 <div className="action-buttons">
                   <button type="button" onClick={selectAll}>Select all</button>
                   <button type="button" onClick={clearSelection}>Deselect</button>
@@ -1341,12 +1388,19 @@ function App() {
                   <button type="button" onClick={queueSelectedVersionSearches} disabled={!selected.size || !finderSearchEnabled} title={finderSearchEnabled ? "Queue selected videos for independent background version searches" : "Enable a search engine and finder query signal in Privacy & network activity"}>Queue version search{selected.size > 1 ? ` (${selected.size})` : ""}</button>
                   <button type="button" onClick={removeSelected} disabled={!selected.size || processing}>Remove selected</button>
                   {visibleStats.failed > 0 && <button type="button" onClick={retryFailed} disabled={processing}>Retry failed</button>}
-                  <button type="button" onClick={clearAll} disabled={processing}>Clear all</button>
+                  <button type="button" onClick={clearAll} disabled={processing} title="Clears every link in the current workspace, including links hidden by the thumbnail filter">Clear all links</button>
                 </div>
               </section>
 
+              {hideMissingThumbnails && activeTab === "previews" && displayedPreviews.length === 0 && (
+                <section className="empty-workspace" role="status">
+                  <strong>No thumbnail previews to show</strong>
+                  <p>All {hiddenMissingCount} links are still in the workspace. Turn off the filter to see their details and use site recovery. In-progress previews can appear here once an image becomes available.</p>
+                </section>
+              )}
+
               <section className="preview-grid">
-                {visiblePreviews.map((preview) => {
+                {displayedPreviews.map((preview) => {
                   const isSelected = selected.has(preview.id);
                   const duration = formatDuration(preview.durationSeconds);
                   const siteSessionEligible = needsAuthorizedSiteRetry(preview);
@@ -1358,7 +1412,19 @@ function App() {
                       {preview.state === "queued" || preview.state === "loading" ? (
                         <div className="thumbnail-shell"><div className="thumbnail-placeholder pulse"><span>{preview.state === "queued" ? "Queued…" : "Finding video thumbnail…"}</span></div></div>
                       ) : (
-                        <LazyThumbnail sources={preview.images?.length ? preview.images : preview.image ? [preview.image] : []} sourceUrl={preview.url} title={preview.title} allowRemoteImages={privacy.remoteThumbnails} />
+                        <LazyThumbnail
+                          sources={preview.images?.length ? preview.images : preview.image ? [preview.image] : []}
+                          sourceUrl={preview.url}
+                          title={preview.title}
+                          allowRemoteImages={privacy.remoteThumbnails}
+                          onExhausted={() => setExhaustedThumbnailKeys((current) => ({ ...current, [preview.id]: thumbnailSourceKey(preview.images?.length ? preview.images : preview.image ? [preview.image] : []) }))}
+                          onLoaded={() => setExhaustedThumbnailKeys((current) => {
+                            if (!Object.hasOwn(current, preview.id)) return current;
+                            const updated = { ...current };
+                            delete updated[preview.id];
+                            return updated;
+                          })}
+                        />
                       )}
                       <div className="preview-content">
                         <div className="meta-row">
